@@ -23,7 +23,7 @@
 # Configuration
 # -----------------------------------------------------------------------------
 
-VERSION := $(shell cargo metadata --format-version 1 2>/dev/null | \
+VERSION := $(shell cargo metadata --format-version 1 --no-deps 2>/dev/null | \
 	grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4 || echo "dev")
 
 BIN_DIR := $(CURDIR)/bin
@@ -490,7 +490,7 @@ version-sync: ## Sync VERSION file to Cargo.toml and package.json
 version-check: ## Validate version consistency across files
 	@echo "Checking version consistency..."
 	@file_ver=$$(cat $(VERSION_FILE) | tr -d '[:space:]'); \
-	cargo_ver=$$($(CARGO) metadata --format-version 1 2>/dev/null | \
+	cargo_ver=$$($(CARGO) metadata --format-version 1 --no-deps 2>/dev/null | \
 		grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4); \
 	if [ "$$file_ver" != "$$cargo_ver" ]; then \
 		echo "[!!] VERSION file ($$file_ver) != Cargo.toml ($$cargo_ver)"; \
