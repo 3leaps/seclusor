@@ -1,0 +1,12 @@
+formatter:
+  type: basic
+  indent: 2
+  line_ending: lf
+
+exclude:
+  - node_modules/**
+  - vendor/**
+  - .git/**
+  - dist/**
+  - bin/**
+  - target/**

@@ -1,0 +1,16 @@
+[package]
+name = "seclusor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "seclusor"
+path = "src/main.rs"
+
+[dependencies]
+seclusor-core = { workspace = true }
+seclusor-crypto = { workspace = true }
+seclusor-codec = { workspace = true }
+seclusor-keyring = { workspace = true }

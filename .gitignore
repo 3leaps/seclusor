@@ -1,0 +1,188 @@
+# =============================================================================
+# seclusor .gitignore
+# Rust library with Go, TypeScript bindings + CLI
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Rust
+# -----------------------------------------------------------------------------
+target/
+**/*.rs.bk
+*.pdb
+
+# Cargo.lock is committed for reproducible CI builds.
+# Cargo.lock
+
+# -----------------------------------------------------------------------------
+# Planning and Local Configuration (NEVER COMMIT)
+# -----------------------------------------------------------------------------
+# Session planning documents - always local, never committed
+.plans/
+
+# Local agent instructions - per-session tactical guidance
+AGENTS.local.md
+
+# Local overrides
+*.local.yaml
+*.local.yml
+*.local.json
+*.local.toml
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# -----------------------------------------------------------------------------
+# Go (bindings/go/)
+# -----------------------------------------------------------------------------
+# Local build outputs (prebuilt libs may be committed under bindings/go/lib/<platform>/)
+bindings/go/lib/local/
+bindings/go/**/lib/local/
+
+# Go workspace
+go.work.sum
+
+# -----------------------------------------------------------------------------
+# TypeScript/Node.js (bindings/typescript/)
+# -----------------------------------------------------------------------------
+node_modules/
+*.node
+.npm/
+*.tsbuildinfo
+.eslintcache
+.pnpm-debug.log*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Root-level npm lockfile (repo tooling only)
+package-lock.json
+
+# NAPI-RS build artifacts
+bindings/typescript/target/
+bindings/typescript/*.node
+
+# -----------------------------------------------------------------------------
+# Python (bindings/python/ - future)
+# -----------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg
+*.egg-info/
+build/
+eggs/
+.eggs/
+*.whl
+.venv/
+venv/
+.python-version
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+# Maturin (Python-Rust bindings)
+bindings/python/target/
+
+# -----------------------------------------------------------------------------
+# IDE and Editors
+# -----------------------------------------------------------------------------
+.vscode/
+.idea/
+.cursor/
+*.swp
+*.swo
+*~
+*.sublime-workspace
+*.sublime-project
+
+# -----------------------------------------------------------------------------
+# OS Generated
+# -----------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# -----------------------------------------------------------------------------
+# Build and Distribution
+# -----------------------------------------------------------------------------
+dist/
+bin/
+/build/
+*.exe
+*.exe~
+*.dll
+*.dylib
+*.so
+*.lib
+
+# Allow shipping prebuilt shared libraries for Go bindings.
+!bindings/go/seclusor/lib-shared/**/*.dll
+!bindings/go/seclusor/lib-shared/**/*.dylib
+!bindings/go/seclusor/lib-shared/**/*.so
+
+# Do not commit locally-built shared libraries.
+bindings/go/seclusor/lib-shared/local/
+
+# Workflow scratch directory (downloaded artifacts).
+ffi-libs/
+
+# Generated headers
+crates/seclusor-ffi/seclusor.h
+*.h.tmp
+
+# -----------------------------------------------------------------------------
+# Testing and Coverage
+# -----------------------------------------------------------------------------
+coverage/
+coverage.html
+coverage.out
+coverage.xml
+*.gcno
+*.gcda
+*.gcov
+lcov.info
+tarpaulin-report.html
+tarpaulin-report.json
+
+test_temp/
+test_output/
+*.test
+
+# -----------------------------------------------------------------------------
+# SBOM and Generated Docs
+# -----------------------------------------------------------------------------
+/sbom/
+third_party_notices.tmp
+
+# -----------------------------------------------------------------------------
+# Logs and Temporary Files
+# -----------------------------------------------------------------------------
+*.log
+*.tmp
+*.temp
+.scratchpad/
+tmp/
+.tmp/
+
+# -----------------------------------------------------------------------------
+# Environment and Secrets (NEVER COMMIT)
+# -----------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+secrets.yaml
+secrets.yml
+
+# -----------------------------------------------------------------------------
+# goneat (if used for quality checks)
+# -----------------------------------------------------------------------------
+.goneat/hooks/
+.goneat/*.backup

@@ -1,0 +1,55 @@
+# goneat assess configuration for seclusor
+# Rust project with FFI bindings (Go + TypeScript)
+#
+# NOTE: goneat does not have native Rust support.
+# Rust checks (cargo fmt, clippy, deny) are handled via Makefile.
+# This config handles ancillary files (YAML, shell, GitHub Actions, Makefile).
+version: 1
+lint:
+  # YAML linting (CI workflows, configs)
+  yamllint:
+    enabled: true
+    strict: true
+    paths:
+      - ".github/workflows/**/*.yml"
+      - ".github/workflows/**/*.yaml"
+      - ".goneat/**/*.yaml"
+    ignore: []
+  # Shell script linting
+  shell:
+    shfmt:
+      enabled: true
+      fix: true
+    shellcheck:
+      enabled: false
+      path: ""
+    paths:
+      - "**/*.sh"
+      - "scripts/**/*.sh"
+    ignore:
+      - "**/target/**"
+      - "**/.git/**"
+      - ".plans/**"
+  # GitHub Actions linting
+  github_actions:
+    actionlint:
+      enabled: true
+      paths:
+        - ".github/workflows/**/*.yml"
+        - ".github/workflows/**/*.yaml"
+      ignore: []
+  # Makefile linting
+  make:
+    checkmake:
+      enabled: true
+      config:
+        max_body_length: 70
+        min_phony_targets:
+          - all
+          - clean
+          - test
+          - check
+          - build
+    paths:
+      - "**/Makefile"
+    ignore: []

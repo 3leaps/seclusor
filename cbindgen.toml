@@ -1,0 +1,13 @@
+language = "C"
+include_guard = "SECLUSOR_H"
+pragma_once = true
+documentation = true
+style = "both"
+
+[parse]
+parse_deps = false
+include = ["seclusor-ffi"]
+
+[export]
+include = []
+

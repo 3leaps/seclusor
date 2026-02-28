@@ -1,0 +1,44 @@
+# cargo-deny configuration (bootstrap)
+#
+# Goal: keep a permissive license posture (MIT/Apache-2.0/BSD/ISC/etc) and
+# fail fast if GPL-family deps appear.
+
+[graph]
+all-features = true
+
+[advisories]
+db-path = "target/advisory-dbs"
+db-urls = ["https://github.com/RustSec/advisory-db"]
+
+[licenses]
+allow = [
+  "Apache-2.0",
+  "MIT",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-DFS-2016",
+]
+confidence-threshold = 0.8
+exceptions = []
+
+[licenses.private]
+ignore = false
+registries = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[sources.allow-org]
+github = []
+gitlab = []
+bitbucket = []

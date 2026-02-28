@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/seclusor-core",
+  "crates/seclusor-crypto",
+  "crates/seclusor-codec",
+  "crates/seclusor-keyring",
+  "crates/seclusor-ffi",
+  "crates/seclusor",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/3leaps/seclusor"
+
+[workspace.dependencies]
+seclusor-core = { path = "crates/seclusor-core", version = "0.1.0" }
+seclusor-crypto = { path = "crates/seclusor-crypto", version = "0.1.0" }
+seclusor-codec = { path = "crates/seclusor-codec", version = "0.1.0" }
+seclusor-keyring = { path = "crates/seclusor-keyring", version = "0.1.0" }
