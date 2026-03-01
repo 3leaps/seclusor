@@ -9,6 +9,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
 
+use age::secrecy::ExposeSecret;
 use age::secrecy::SecretString;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
@@ -17,6 +18,8 @@ use seclusor_core::constants::{
     MAX_INLINE_CIPHERTEXT_BYTES, MAX_INLINE_PLAINTEXT_BYTES,
 };
 
+const MAX_IDENTITY_FILE_BYTES: u64 = 1024 * 1024;
+
 pub use error::{CryptoError, Result};
 
 /// Type alias for X25519 recipient.
@@ -24,6 +27,11 @@ pub type Recipient = age::x25519::Recipient;
 
 /// Type alias for X25519 identity.
 pub type Identity = age::x25519::Identity;
+
+/// Render an identity as plaintext string for identity-file persistence.
+pub fn identity_to_string(identity: &Identity) -> String {
+    identity.to_string().expose_secret().to_owned()
+}
 
 /// Parse recipient strings into X25519 recipients.
 pub fn parse_recipients<I, S>(recipients: I) -> Result<Vec<Recipient>>
@@ -108,7 +116,7 @@ pub fn parse_identity_file_contents(contents: &str) -> Result<Vec<Identity>> {
 pub fn load_identity_file(path: impl AsRef<Path>) -> Result<Vec<Identity>> {
     let path = path.as_ref();
     assert_secure_permissions(path)?;
-    let contents = fs::read_to_string(path)?;
+    let contents = read_identity_file_with_limit(path, MAX_IDENTITY_FILE_BYTES)?;
     parse_identity_file_contents(&contents)
 }
 
@@ -317,6 +325,27 @@ fn assert_secure_permissions(path: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn read_identity_file_with_limit(path: &Path, max: u64) -> Result<String> {
+    let actual = fs::metadata(path)?.len();
+    if actual > max {
+        return Err(CryptoError::IdentityFileTooLarge { actual, max });
+    }
+
+    let mut file = std::fs::File::open(path)?;
+    let mut limited = std::io::Read::by_ref(&mut file).take(max + 1);
+    let mut contents = String::new();
+    limited.read_to_string(&mut contents)?;
+
+    if contents.len() as u64 > max {
+        return Err(CryptoError::IdentityFileTooLarge {
+            actual: contents.len() as u64,
+            max,
+        });
+    }
+
+    Ok(contents)
 }
 
 #[cfg(test)]
@@ -531,5 +560,28 @@ mod tests {
 
         let identities = load_identity_file(&path).expect("load should succeed");
         assert_eq!(identities.len(), 1);
+    }
+
+    #[test]
+    fn load_identity_file_rejects_oversized_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("identity.txt");
+        let file = std::fs::File::create(&path).expect("create file");
+        file.set_len(MAX_IDENTITY_FILE_BYTES + 1)
+            .expect("set file length");
+        drop(file);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("set permissions");
+        }
+
+        let err = match load_identity_file(&path) {
+            Ok(_) => panic!("must fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, CryptoError::IdentityFileTooLarge { .. }));
     }
 }

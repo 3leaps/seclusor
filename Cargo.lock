@@ -973,6 +973,9 @@ version = "0.1.0"
 dependencies = [
  "seclusor-core",
  "seclusor-crypto",
+ "serde_json",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]
@@ -1011,6 +1014,8 @@ version = "0.1.0"
 dependencies = [
  "seclusor-core",
  "seclusor-crypto",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

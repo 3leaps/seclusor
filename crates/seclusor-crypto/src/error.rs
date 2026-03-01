@@ -30,6 +30,10 @@ pub enum CryptoError {
     #[error("identity file contains no identities")]
     EmptyIdentityFile,
 
+    /// Identity file exceeded maximum allowed size.
+    #[error("identity file exceeds maximum size of {max} bytes (actual: {actual})")]
+    IdentityFileTooLarge { actual: u64, max: u64 },
+
     /// Identity file permissions are not secure enough.
     #[error("identity file permissions must be 0600 on unix (actual: {actual:o})")]
     InsecureIdentityFilePermissions { actual: u32 },

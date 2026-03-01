@@ -77,11 +77,18 @@ pub fn export_env(
         .as_deref()
         .or(sf.env_prefix.as_deref())
         .unwrap_or("");
+    validate_export_prefix(prefix)?;
 
     let mut vars = Vec::new();
 
     for (key, cred) in &project.credentials {
         let env_key = format!("{}{}", prefix, key);
+        if !is_safe_env_key(&env_key) {
+            return Err(SeclusorError::Validation(format!(
+                "invalid environment variable key {:?}",
+                env_key
+            )));
+        }
 
         if !opts.filter.matches(&env_key) {
             continue;
@@ -226,6 +233,37 @@ fn needs_quoting(value: &str) -> bool {
         || value.contains('\t')
         || value.contains('#')
         || value.contains('=')
+}
+
+fn validate_export_prefix(prefix: &str) -> Result<()> {
+    if prefix.is_empty() {
+        return Ok(());
+    }
+
+    if !is_safe_env_key(prefix) {
+        return Err(SeclusorError::Validation(format!(
+            "invalid env prefix {:?}; allowed pattern: ^[A-Z_][A-Z0-9_]*$",
+            prefix
+        )));
+    }
+
+    Ok(())
+}
+
+fn is_safe_env_key(key: &str) -> bool {
+    if key.is_empty() {
+        return false;
+    }
+
+    let bytes = key.as_bytes();
+    let first = bytes[0];
+    if !(first.is_ascii_uppercase() || first == b'_') {
+        return false;
+    }
+
+    bytes[1..]
+        .iter()
+        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_')
 }
 
 /// Remove surrounding quotes from a value.
@@ -383,6 +421,42 @@ mod tests {
         };
         let vars = export_env(&sf, None, &opts).unwrap();
         assert!(vars.iter().any(|v| v.key == "MY_API_KEY"));
+    }
+
+    #[test]
+    fn export_invalid_prefix_newline_rejected() {
+        let sf = test_file();
+        let opts = EnvExportOptions {
+            prefix: Some("BAD_\nexport PWN=1".to_string()),
+            ..Default::default()
+        };
+        let err = export_env(&sf, None, &opts).expect_err("must fail");
+        assert!(matches!(err, SeclusorError::Validation(_)));
+        assert!(err.to_string().contains("invalid env prefix"));
+    }
+
+    #[test]
+    fn export_invalid_prefix_shell_metachar_rejected() {
+        let sf = test_file();
+        let opts = EnvExportOptions {
+            prefix: Some("BAD;".to_string()),
+            ..Default::default()
+        };
+        let err = export_env(&sf, None, &opts).expect_err("must fail");
+        assert!(matches!(err, SeclusorError::Validation(_)));
+        assert!(err.to_string().contains("invalid env prefix"));
+    }
+
+    #[test]
+    fn export_invalid_prefix_leading_digit_rejected() {
+        let sf = test_file();
+        let opts = EnvExportOptions {
+            prefix: Some("1BAD_".to_string()),
+            ..Default::default()
+        };
+        let err = export_env(&sf, None, &opts).expect_err("must fail");
+        assert!(matches!(err, SeclusorError::Validation(_)));
+        assert!(err.to_string().contains("invalid env prefix"));
     }
 
     #[test]

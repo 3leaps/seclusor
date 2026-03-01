@@ -11,3 +11,7 @@ path = "src/lib.rs"
 [dependencies]
 seclusor-core = { workspace = true }
 seclusor-crypto = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
