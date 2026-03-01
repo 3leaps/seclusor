@@ -11,6 +11,10 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use seclusor_core::constants::INLINE_CIPHERTEXT_PREFIX;
+use seclusor_core::validate::validate_strict;
+use seclusor_core::SecretsFile;
+
 pub use error::{KeyringError, Result};
 pub use seclusor_crypto::{Identity, Recipient};
 
@@ -144,6 +148,76 @@ pub fn discover_recipients(opts: &RecipientDiscoveryOptions) -> Result<Vec<Recip
     Ok(recipients)
 }
 
+/// Rekey bundle ciphertext by decrypting with old identities and encrypting with new recipients.
+pub fn rekey_bundle_ciphertext(
+    ciphertext: &[u8],
+    old_identities: &[Identity],
+    new_recipients: &[Recipient],
+) -> Result<Vec<u8>> {
+    let plaintext = seclusor_crypto::decrypt(ciphertext, old_identities)?;
+    Ok(seclusor_crypto::encrypt(&plaintext, new_recipients)?)
+}
+
+/// Rekey a single inline ciphertext value (`sec:age:v1:<base64>`).
+pub fn rekey_inline_value(
+    inline_ciphertext: &str,
+    old_identities: &[Identity],
+    new_recipients: &[Recipient],
+) -> Result<String> {
+    let plaintext = seclusor_crypto::decrypt_inline_value(inline_ciphertext, old_identities)?;
+    Ok(seclusor_crypto::encrypt_inline_value(
+        &plaintext,
+        new_recipients,
+    )?)
+}
+
+/// Rekey all inline ciphertext values in a secrets document.
+///
+/// Plaintext values and `ref` credentials are preserved as-is.
+pub fn rekey_inline_document(
+    secrets: &SecretsFile,
+    old_identities: &[Identity],
+    new_recipients: &[Recipient],
+) -> Result<SecretsFile> {
+    validate_strict(secrets)?;
+
+    let mut out = secrets.clone();
+    for project in &mut out.projects {
+        for (key, credential) in &mut project.credentials {
+            match (&credential.value, &credential.reference) {
+                (Some(value), None) => {
+                    if !value.starts_with(INLINE_CIPHERTEXT_PREFIX) {
+                        continue;
+                    }
+
+                    let plaintext = seclusor_crypto::decrypt_inline_value(value, old_identities)?;
+                    let plaintext = String::from_utf8(plaintext).map_err(|_| {
+                        KeyringError::NonUtf8InlineValue {
+                            project: project.project_slug.clone(),
+                            key: key.clone(),
+                        }
+                    })?;
+                    let rekeyed = seclusor_crypto::encrypt_inline_value(
+                        plaintext.as_bytes(),
+                        new_recipients,
+                    )?;
+                    credential.value = Some(rekeyed);
+                }
+                (None, Some(_)) => {}
+                (Some(_), Some(_)) | (None, None) => {
+                    return Err(KeyringError::InvalidCredentialShape {
+                        project: project.project_slug.clone(),
+                        key: key.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    validate_strict(&out)?;
+    Ok(out)
+}
+
 fn parse_recipients_env_value(value: &str) -> Result<Vec<Recipient>> {
     let mut recipients = Vec::new();
 
@@ -228,10 +302,6 @@ fn canonicalize_target_path(path: &Path) -> Result<PathBuf> {
 }
 
 fn detect_repo_root(start: &Path) -> Result<Option<PathBuf>> {
-    let boundary = std::env::var_os("FULMEN_WORKSPACE_ROOT")
-        .map(PathBuf::from)
-        .and_then(|path| fs::canonicalize(path).ok());
-
     let mut current = start.to_path_buf();
     for _ in 0..=MAX_REPO_ROOT_SEARCH_DEPTH {
         if is_repo_root_marker(&current)? {
@@ -241,15 +311,7 @@ fn detect_repo_root(start: &Path) -> Result<Option<PathBuf>> {
         let Some(parent) = current.parent() else {
             break;
         };
-        let parent = parent.to_path_buf();
-
-        if let Some(boundary) = &boundary {
-            if !parent.starts_with(boundary) {
-                break;
-            }
-        }
-
-        current = parent;
+        current = parent.to_path_buf();
     }
 
     Ok(None)
@@ -350,6 +412,7 @@ fn read_utf8_file_with_limit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use seclusor_core::Credential;
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -371,6 +434,27 @@ mod tests {
         PathBuf::from(format!("{prefix}-{}-{now}.txt", std::process::id()))
     }
 
+    fn fixture_rekey_document(old_recipient: &Recipient) -> SecretsFile {
+        let mut sf = SecretsFile::new("demo");
+        sf.projects[0].credentials.insert(
+            "PLAIN".to_string(),
+            Credential::with_value("secret", "plain-value"),
+        );
+        sf.projects[0].credentials.insert(
+            "REF_ONLY".to_string(),
+            Credential::with_ref("ref", "vault://path"),
+        );
+        let inline = seclusor_crypto::encrypt_inline_value(
+            b"encrypted-value",
+            std::slice::from_ref(old_recipient),
+        )
+        .expect("inline encryption");
+        sf.projects[0]
+            .credentials
+            .insert("ENC".to_string(), Credential::with_value("secret", &inline));
+        sf
+    }
+
     #[test]
     fn generate_identity_produces_parseable_material() {
         let generated = generate_identity();
@@ -386,6 +470,7 @@ mod tests {
 
     #[test]
     fn generate_identity_file_writes_expected_content() {
+        let _guard = cwd_lock().lock().expect("lock cwd");
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("identity.txt");
 
@@ -400,6 +485,7 @@ mod tests {
 
     #[test]
     fn generate_identity_file_rejects_path_under_repo_root() {
+        let _guard = cwd_lock().lock().expect("lock cwd");
         let path = unique_repo_relative_path("identity-pathguard-test");
 
         let err = match generate_identity_file(&path) {
@@ -414,6 +500,7 @@ mod tests {
 
     #[test]
     fn generate_identity_file_allows_path_outside_repo_root() {
+        let _guard = cwd_lock().lock().expect("lock cwd");
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("identity.txt");
         let result = generate_identity_file(&path);
@@ -447,6 +534,7 @@ mod tests {
 
     #[test]
     fn generate_identity_file_fails_if_exists() {
+        let _guard = cwd_lock().lock().expect("lock cwd");
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("identity.txt");
         fs::write(&path, "already-present\n").expect("create file");
@@ -464,6 +552,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn generate_identity_file_sets_unix_0600_permissions() {
+        let _guard = cwd_lock().lock().expect("lock cwd");
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().expect("temp dir");
@@ -546,5 +635,80 @@ mod tests {
         let err =
             discover_recipients(&RecipientDiscoveryOptions::default()).expect_err("must fail");
         assert!(matches!(err, KeyringError::MissingRecipientSources));
+    }
+
+    #[test]
+    fn rekey_bundle_ciphertext_rotates_recipient_set() {
+        let old_identity = Identity::generate();
+        let old_recipient = old_identity.to_public();
+        let new_identity = Identity::generate();
+        let new_recipient = new_identity.to_public();
+        let plaintext = b"bundle secret payload";
+
+        let ciphertext = seclusor_crypto::encrypt(plaintext, std::slice::from_ref(&old_recipient))
+            .expect("encrypt");
+        let rekeyed = rekey_bundle_ciphertext(
+            &ciphertext,
+            std::slice::from_ref(&old_identity),
+            std::slice::from_ref(&new_recipient),
+        )
+        .expect("rekey bundle");
+
+        let decrypted_new = seclusor_crypto::decrypt(&rekeyed, std::slice::from_ref(&new_identity))
+            .expect("decrypt new");
+        assert_eq!(decrypted_new, plaintext);
+
+        let err = seclusor_crypto::decrypt(&rekeyed, std::slice::from_ref(&old_identity))
+            .expect_err("old identity should fail after rekey");
+        assert!(matches!(
+            err,
+            seclusor_crypto::CryptoError::DecryptionFailed
+        ));
+    }
+
+    #[test]
+    fn rekey_inline_document_rotates_inline_values_only() {
+        let old_identity = Identity::generate();
+        let old_recipient = old_identity.to_public();
+        let new_identity = Identity::generate();
+        let new_recipient = new_identity.to_public();
+        let secrets = fixture_rekey_document(&old_recipient);
+
+        let rekeyed = rekey_inline_document(
+            &secrets,
+            std::slice::from_ref(&old_identity),
+            std::slice::from_ref(&new_recipient),
+        )
+        .expect("rekey inline document");
+
+        let enc_value = rekeyed.projects[0].credentials["ENC"]
+            .value
+            .as_ref()
+            .expect("rekeyed value");
+        assert!(enc_value.starts_with(INLINE_CIPHERTEXT_PREFIX));
+
+        let decrypted_new =
+            seclusor_crypto::decrypt_inline_value(enc_value, std::slice::from_ref(&new_identity))
+                .expect("new identity decrypts");
+        assert_eq!(decrypted_new, b"encrypted-value");
+
+        let err =
+            seclusor_crypto::decrypt_inline_value(enc_value, std::slice::from_ref(&old_identity))
+                .expect_err("old identity should fail");
+        assert!(matches!(
+            err,
+            seclusor_crypto::CryptoError::DecryptionFailed
+        ));
+
+        assert_eq!(
+            rekeyed.projects[0].credentials["PLAIN"].value.as_deref(),
+            Some("plain-value")
+        );
+        assert_eq!(
+            rekeyed.projects[0].credentials["REF_ONLY"]
+                .reference
+                .as_deref(),
+            Some("vault://path")
+        );
     }
 }

@@ -50,6 +50,18 @@ pub enum KeyringError {
     #[error("no recipients found in configured sources")]
     EmptyRecipientSet,
 
+    /// A credential had an invalid shape at runtime.
+    #[error("credential {key:?} in project {project:?} must set exactly one of value or ref")]
+    InvalidCredentialShape { project: String, key: String },
+
+    /// Rekeyed inline payload was not valid UTF-8.
+    #[error("credential {key:?} in project {project:?} decrypted to non-utf8 data")]
+    NonUtf8InlineValue { project: String, key: String },
+
+    /// Core-domain validation or model error.
+    #[error(transparent)]
+    Core(#[from] seclusor_core::SeclusorError),
+
     /// Crypto-layer error.
     #[error(transparent)]
     Crypto(#[from] seclusor_crypto::CryptoError),
