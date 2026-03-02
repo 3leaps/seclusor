@@ -36,6 +36,8 @@ Tooling guardrails:
 - seclusor tooling must refuse to write private keys / identity files anywhere
   under the detected repository root.
 - Do not treat gitignored paths as safe; `.gitignore` can change or be removed.
+- Secret input channels for CLI/key-unseal paths are governed by
+  [SDR-0002](SDR-0002-secret-input-channels-and-cli-arg-policy.md).
 
 ## Rationale
 

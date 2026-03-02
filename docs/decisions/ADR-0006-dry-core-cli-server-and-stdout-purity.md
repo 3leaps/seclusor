@@ -34,6 +34,8 @@ CLI output must support automation:
 - Data output goes to stdout.
 - Logs/diagnostics/prompts go to stderr.
 - `--format json` outputs JSON to stdout and nothing else.
+- Secret-bearing CLI argument policy is defined in
+  [SDR-0002](SDR-0002-secret-input-channels-and-cli-arg-policy.md).
 
 ## Rationale
 
@@ -48,6 +50,8 @@ CLI output must support automation:
 - Library crates must not depend on transport code (CLI/FFI/server).
 - Transport layers must avoid stdout writes outside the data payload.
 - Error messages surfaced across FFI and CLI must be safe (no plaintext secrets).
+- Transport adapters must not introduce secret-bearing CLI argument paths that
+  violate [SDR-0002](SDR-0002-secret-input-channels-and-cli-arg-policy.md).
 
 ## Notes
 

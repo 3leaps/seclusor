@@ -40,6 +40,9 @@ Rust implementation:
   documented operational concern.
 - If we need compatibility with other encryption schemes, it is an explicit
   migration/import feature.
+- CLI secret input channel constraints (for passphrases and private identities)
+  are defined in
+  [SDR-0002](SDR-0002-secret-input-channels-and-cli-arg-policy.md).
 
 ## Notes
 
