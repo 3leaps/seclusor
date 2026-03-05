@@ -1118,6 +1118,9 @@ dependencies = [
  "seclusor-core",
  "seclusor-crypto",
  "seclusor-keyring",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
