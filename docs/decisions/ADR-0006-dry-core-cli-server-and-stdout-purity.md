@@ -33,9 +33,32 @@ CLI output must support automation:
 
 - Data output goes to stdout.
 - Logs/diagnostics/prompts go to stderr.
+- Structured/JSON logging (when enabled) goes to stderr — never stdout, even
+  though it is structured data. Stdout is exclusively for programmatic command
+  output.
 - `--format json` outputs JSON to stdout and nothing else.
 - Secret-bearing CLI argument policy is defined in
   [SDR-0002](SDR-0002-secret-input-channels-and-cli-arg-policy.md).
+- Stdout purity must be verified by integration tests that assert, in default
+  (non-verbose) mode, stderr is empty on successful commands and stdout
+  contains no diagnostics.
+
+### Context path logging (design requirement)
+
+When diagnostic logging is enabled (e.g., `--verbose`, `SECLUSOR_LOG_LEVEL`),
+the CLI and library crates must log the actual resolved filesystem path for
+every significant file access:
+
+- Secrets document loaded/written
+- Identity file read
+- Recipient file read
+- Bundle ciphertext input/output
+- Convert input/output
+
+This supports debugging "which file did it actually resolve?" without requiring
+the user to strace or instrument their own tooling. All path logging goes to
+stderr via the `tracing` crate (implementation deferred to v0.1.1 alongside
+server mode and structured logging infrastructure).
 
 ## Rationale
 
@@ -52,6 +75,9 @@ CLI output must support automation:
 - Error messages surfaced across FFI and CLI must be safe (no plaintext secrets).
 - Transport adapters must not introduce secret-bearing CLI argument paths that
   violate [SDR-0002](SDR-0002-secret-input-channels-and-cli-arg-policy.md).
+- Stdout purity must have integration test coverage before v0.1.0 release (D8).
+- Context path logging implementation requires `tracing` dependency wired
+  through all library crates (v0.1.1).
 
 ## Notes
 
