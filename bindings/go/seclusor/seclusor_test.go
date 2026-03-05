@@ -39,3 +39,23 @@ func TestSecretsHandleListGetExport(t *testing.T) {
 		t.Fatalf("unexpected env vars: %#v", vars)
 	}
 }
+
+func TestKeyringHandleStatusAndValidation(t *testing.T) {
+	h, err := NewKeyringHandle()
+	if err != nil {
+		t.Fatalf("NewKeyringHandle: %v", err)
+	}
+	defer h.Close()
+
+	status, err := h.Status()
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if status.IdentityCount != 0 || status.RecipientCount != 0 {
+		t.Fatalf("unexpected initial status: %#v", status)
+	}
+
+	if err := h.AddRecipient("not-a-recipient"); err == nil {
+		t.Fatalf("expected add recipient to fail for invalid input")
+	}
+}

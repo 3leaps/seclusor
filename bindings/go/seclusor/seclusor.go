@@ -47,6 +47,10 @@ type SecretsHandle struct {
 	ptr *C.SeclusorSecretsHandle
 }
 
+type KeyringHandle struct {
+	ptr *C.SeclusorKeyringHandle
+}
+
 type CredentialView struct {
 	Type     string  `json:"type"`
 	Value    *string `json:"value,omitempty"`
@@ -57,6 +61,11 @@ type CredentialView struct {
 type EnvVar struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
+}
+
+type KeyringStatus struct {
+	IdentityCount  int `json:"identity_count"`
+	RecipientCount int `json:"recipient_count"`
 }
 
 func lastErrorMessage() string {
@@ -238,4 +247,77 @@ func DecryptBundle(inputCipherPath, outputJSONPath, identityFilePath string) err
 	defer C.free(unsafe.Pointer(cIdentity))
 
 	return toError(C.seclusor_decrypt_bundle(cInput, cOutput, cIdentity))
+}
+
+func NewKeyringHandle() (*KeyringHandle, error) {
+	var handle *C.SeclusorKeyringHandle
+	if err := toError(C.seclusor_keyring_handle_new(&handle)); err != nil {
+		return nil, err
+	}
+	return &KeyringHandle{ptr: handle}, nil
+}
+
+func (h *KeyringHandle) Close() {
+	if h == nil || h.ptr == nil {
+		return
+	}
+	C.seclusor_keyring_handle_free(h.ptr)
+	h.ptr = nil
+}
+
+func (h *KeyringHandle) ensureOpen() error {
+	if h == nil || h.ptr == nil {
+		return errors.New("keyring handle is nil or closed")
+	}
+	return nil
+}
+
+func (h *KeyringHandle) AddRecipient(recipient string) error {
+	if err := h.ensureOpen(); err != nil {
+		return err
+	}
+	if recipient == "" {
+		return errors.New("recipient must not be empty")
+	}
+	cRecipient := C.CString(recipient)
+	defer C.free(unsafe.Pointer(cRecipient))
+	return toError(C.seclusor_keyring_handle_add_recipient(h.ptr, cRecipient))
+}
+
+func (h *KeyringHandle) AddIdentityFile(identityFilePath string) error {
+	if err := h.ensureOpen(); err != nil {
+		return err
+	}
+	if identityFilePath == "" {
+		return errors.New("identityFilePath must not be empty")
+	}
+	cPath := C.CString(identityFilePath)
+	defer C.free(unsafe.Pointer(cPath))
+	return toError(C.seclusor_keyring_handle_add_identity_file(h.ptr, cPath))
+}
+
+func (h *KeyringHandle) Status() (*KeyringStatus, error) {
+	if err := h.ensureOpen(); err != nil {
+		return nil, err
+	}
+	var out *C.char
+	if err := toError(C.seclusor_keyring_handle_status(h.ptr, &out)); err != nil {
+		return nil, err
+	}
+	var status KeyringStatus
+	if err := fromJSONString(out, &status); err != nil {
+		return nil, err
+	}
+	return &status, nil
+}
+
+func (h *KeyringHandle) RekeyBundle(inputCipherPath, outputCipherPath string) error {
+	if err := h.ensureOpen(); err != nil {
+		return err
+	}
+	cInput := C.CString(inputCipherPath)
+	defer C.free(unsafe.Pointer(cInput))
+	cOutput := C.CString(outputCipherPath)
+	defer C.free(unsafe.Pointer(cOutput))
+	return toError(C.seclusor_keyring_rekey_bundle(h.ptr, cInput, cOutput))
 }

@@ -15,7 +15,7 @@ use seclusor_core::crud::{get_credential, list_credential_keys};
 use seclusor_core::env::{export_env, EnvExportOptions};
 use seclusor_core::validate::validate_strict;
 use seclusor_core::{SeclusorError, SecretsFile};
-use seclusor_crypto::{load_identity_file, parse_recipients, CryptoError};
+use seclusor_crypto::{load_identity_file, parse_recipients, CryptoError, Identity};
 use seclusor_keyring::{KeyringError, Recipient};
 use serde::Serialize;
 
@@ -46,7 +46,8 @@ pub struct SeclusorSecretsHandle {
 
 /// Opaque keyring handle (reserved for D6 key management APIs).
 pub struct SeclusorKeyringHandle {
-    _reserved: (),
+    identities: Vec<Identity>,
+    recipients: Vec<Recipient>,
 }
 
 #[derive(Debug)]
@@ -72,6 +73,12 @@ struct FfiCredentialView {
 struct FfiEnvVar {
     key: String,
     value: String,
+}
+
+#[derive(Serialize)]
+struct FfiKeyringStatus {
+    identity_count: usize,
+    recipient_count: usize,
 }
 
 fn clear_last_error() {
@@ -339,7 +346,10 @@ pub unsafe extern "C" fn seclusor_keyring_handle_new(
         require_non_null(out_handle, "out_handle")?;
         // SAFETY: out_handle validated non-null.
         unsafe { *out_handle = ptr::null_mut() };
-        let boxed = Box::new(SeclusorKeyringHandle { _reserved: () });
+        let boxed = Box::new(SeclusorKeyringHandle {
+            identities: Vec::new(),
+            recipients: Vec::new(),
+        });
         // SAFETY: out_handle validated non-null and points to caller-owned pointer slot.
         unsafe { *out_handle = Box::into_raw(boxed) };
         Ok(())
@@ -361,6 +371,125 @@ pub unsafe extern "C" fn seclusor_keyring_handle_free(handle: *mut SeclusorKeyri
     }
     // SAFETY: handle must be allocated by Box::into_raw in this library.
     drop(unsafe { Box::from_raw(handle) });
+}
+
+/// Add one recipient string (`age1...`) to a keyring handle.
+///
+/// # Safety
+/// `handle` must be a valid mutable keyring handle pointer from this library.
+/// `recipient` must be a valid non-null C string.
+#[no_mangle]
+pub unsafe extern "C" fn seclusor_keyring_handle_add_recipient(
+    handle: *mut SeclusorKeyringHandle,
+    recipient: *const c_char,
+) -> SeclusorResult {
+    match with_ffi_boundary(|| {
+        require_non_null(handle, "handle")?;
+        let recipient = cstr_required(recipient, "recipient")?;
+        let mut parsed = parse_recipients(std::iter::once(recipient))?;
+        // SAFETY: handle validated non-null; mutable access is exclusive per C caller contract.
+        let keyring = unsafe { &mut *handle };
+        keyring.recipients.append(&mut parsed);
+        Ok(())
+    }) {
+        Ok(()) => SeclusorResult::Ok,
+        Err(code) => code,
+    }
+}
+
+/// Load identities from an age identity file and append to a keyring handle.
+///
+/// # Safety
+/// `handle` must be a valid mutable keyring handle pointer from this library.
+/// `identity_file_path` must be a valid non-null C string path.
+#[no_mangle]
+pub unsafe extern "C" fn seclusor_keyring_handle_add_identity_file(
+    handle: *mut SeclusorKeyringHandle,
+    identity_file_path: *const c_char,
+) -> SeclusorResult {
+    match with_ffi_boundary(|| {
+        require_non_null(handle, "handle")?;
+        let identity_file_path = cstr_required(identity_file_path, "identity_file_path")?;
+        let mut loaded = load_identity_file(identity_file_path)?;
+        // SAFETY: handle validated non-null; mutable access is exclusive per C caller contract.
+        let keyring = unsafe { &mut *handle };
+        keyring.identities.append(&mut loaded);
+        Ok(())
+    }) {
+        Ok(()) => SeclusorResult::Ok,
+        Err(code) => code,
+    }
+}
+
+/// Return keyring handle status as JSON.
+///
+/// JSON shape: `{\"identity_count\":1,\"recipient_count\":2}`.
+///
+/// # Safety
+/// `handle` must be a valid keyring handle pointer from this library. `out_json`
+/// must be a valid non-null pointer to receive an allocated C string.
+#[no_mangle]
+pub unsafe extern "C" fn seclusor_keyring_handle_status(
+    handle: *const SeclusorKeyringHandle,
+    out_json: *mut *mut c_char,
+) -> SeclusorResult {
+    match with_ffi_boundary(|| {
+        require_non_null(handle, "handle")?;
+        require_non_null(out_json, "out_json")?;
+        // SAFETY: out_json validated non-null.
+        unsafe { *out_json = ptr::null_mut() };
+        // SAFETY: handle validated non-null; immutable access only.
+        let keyring = unsafe { &*handle };
+        let status = FfiKeyringStatus {
+            identity_count: keyring.identities.len(),
+            recipient_count: keyring.recipients.len(),
+        };
+        write_out_string(out_json, json_string(&status)?)?;
+        Ok(())
+    }) {
+        Ok(()) => SeclusorResult::Ok,
+        Err(code) => code,
+    }
+}
+
+/// Rekey bundle ciphertext using identities and recipients currently loaded in keyring handle.
+///
+/// # Safety
+/// `handle` must be a valid keyring handle pointer from this library.
+/// `input_ciphertext_path` and `output_ciphertext_path` must be valid non-null C strings.
+#[no_mangle]
+pub unsafe extern "C" fn seclusor_keyring_rekey_bundle(
+    handle: *const SeclusorKeyringHandle,
+    input_ciphertext_path: *const c_char,
+    output_ciphertext_path: *const c_char,
+) -> SeclusorResult {
+    match with_ffi_boundary(|| {
+        require_non_null(handle, "handle")?;
+        let input_ciphertext_path = cstr_required(input_ciphertext_path, "input_ciphertext_path")?;
+        let output_ciphertext_path =
+            cstr_required(output_ciphertext_path, "output_ciphertext_path")?;
+        // SAFETY: handle validated non-null; immutable access only.
+        let keyring = unsafe { &*handle };
+        if keyring.identities.is_empty() {
+            return Err(fail(
+                SeclusorResult::ValidationError,
+                "keyring has no identities loaded",
+            ));
+        }
+        if keyring.recipients.is_empty() {
+            return Err(fail(
+                SeclusorResult::ValidationError,
+                "keyring has no recipients loaded",
+            ));
+        }
+
+        let secrets = decrypt_bundle_from_file(input_ciphertext_path, &keyring.identities)?;
+        encrypt_bundle_to_file(&secrets, &keyring.recipients, output_ciphertext_path)?;
+        Ok(())
+    }) {
+        Ok(()) => SeclusorResult::Ok,
+        Err(code) => code,
+    }
 }
 
 /// List credential keys for a project as JSON string.
@@ -741,5 +870,107 @@ mod tests {
         let err = seclusor_last_error();
         let err_text = take_json(err);
         assert!(err_text.contains("document exceeds maximum size"));
+    }
+
+    #[test]
+    fn keyring_handle_status_add_and_rekey_bundle() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("secrets.json");
+        let original_bundle = dir.path().join("secrets.age");
+        let rekeyed_bundle = dir.path().join("secrets.rekeyed.age");
+        let old_identity_file = dir.path().join("old-identity.txt");
+        let new_identity_file = dir.path().join("new-identity.txt");
+        let output = dir.path().join("secrets.out.json");
+
+        let old_identity = TEST_IDENTITY
+            .parse::<seclusor_crypto::Identity>()
+            .expect("old identity parse");
+        let old_recipient = old_identity.to_public().to_string();
+        write_identity_file(&old_identity_file, TEST_IDENTITY);
+
+        let new_identity = seclusor_crypto::Identity::generate();
+        let new_identity_text = seclusor_crypto::identity_to_string(&new_identity);
+        write_identity_file(&new_identity_file, &new_identity_text);
+        let new_recipient = new_identity.to_public().to_string();
+
+        fs::write(
+            &input,
+            r#"{"schema_version":"v1.0.0","projects":[{"project_slug":"demo","credentials":{"API_KEY":{"type":"secret","value":"sk-123"}}}]}"#,
+        )
+        .expect("write input");
+
+        let input_c = cstring(input.to_str().expect("utf8 path"));
+        let bundle_c = cstring(original_bundle.to_str().expect("utf8 path"));
+        let recipients_json = cstring(&format!("[\"{old_recipient}\"]"));
+        assert_eq!(
+            seclusor_encrypt_bundle(
+                input_c.as_ptr(),
+                bundle_c.as_ptr(),
+                recipients_json.as_ptr()
+            ),
+            SeclusorResult::Ok
+        );
+
+        let mut keyring: *mut SeclusorKeyringHandle = ptr::null_mut();
+        // SAFETY: output pointer valid.
+        assert_eq!(
+            unsafe { seclusor_keyring_handle_new(&mut keyring) },
+            SeclusorResult::Ok
+        );
+        assert!(!keyring.is_null());
+
+        let mut status_ptr: *mut c_char = ptr::null_mut();
+        // SAFETY: handle/output pointers valid.
+        assert_eq!(
+            unsafe { seclusor_keyring_handle_status(keyring, &mut status_ptr) },
+            SeclusorResult::Ok
+        );
+        let status: serde_json::Value =
+            serde_json::from_str(&take_json(status_ptr)).expect("status json");
+        assert_eq!(status["identity_count"], 0);
+        assert_eq!(status["recipient_count"], 0);
+
+        let old_identity_c = cstring(old_identity_file.to_str().expect("utf8 path"));
+        // SAFETY: pointers valid.
+        assert_eq!(
+            unsafe { seclusor_keyring_handle_add_identity_file(keyring, old_identity_c.as_ptr()) },
+            SeclusorResult::Ok
+        );
+        let new_recipient_c = cstring(&new_recipient);
+        // SAFETY: pointers valid.
+        assert_eq!(
+            unsafe { seclusor_keyring_handle_add_recipient(keyring, new_recipient_c.as_ptr()) },
+            SeclusorResult::Ok
+        );
+
+        let input_bundle_c = cstring(original_bundle.to_str().expect("utf8 path"));
+        let output_bundle_c = cstring(rekeyed_bundle.to_str().expect("utf8 path"));
+        // SAFETY: pointers valid.
+        assert_eq!(
+            unsafe {
+                seclusor_keyring_rekey_bundle(
+                    keyring,
+                    input_bundle_c.as_ptr(),
+                    output_bundle_c.as_ptr(),
+                )
+            },
+            SeclusorResult::Ok
+        );
+
+        let output_c = cstring(output.to_str().expect("utf8 path"));
+        let new_identity_c = cstring(new_identity_file.to_str().expect("utf8 path"));
+        assert_eq!(
+            seclusor_decrypt_bundle(
+                output_bundle_c.as_ptr(),
+                output_c.as_ptr(),
+                new_identity_c.as_ptr()
+            ),
+            SeclusorResult::Ok
+        );
+        let output_json = fs::read_to_string(output).expect("read output");
+        assert!(output_json.contains("\"API_KEY\""));
+
+        // SAFETY: handle was allocated by this library and not freed yet.
+        unsafe { seclusor_keyring_handle_free(keyring) };
     }
 }
