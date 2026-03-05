@@ -39,7 +39,7 @@ for the v0.1.x line:
 - Any breaking FFI change requires v0.2.0 (or later) and coordinated downstream
   updates.
 
-This is a *time-bound commitment* tied to the v0.1.0 MVP push (D6).
+This is a _time-bound commitment_ tied to the v0.1.0 MVP push (D6).
 
 ## Contract Rules
 
