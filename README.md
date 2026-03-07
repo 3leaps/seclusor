@@ -195,8 +195,8 @@ See [SDR-0002](docs/decisions/SDR-0002-secret-input-channels-and-cli-arg-policy.
 | Linux arm64 (glibc) | `aarch64-unknown-linux-gnu`  | Primary   |
 | Linux x64 (musl)    | `x86_64-unknown-linux-musl`  | Supported |
 | Linux arm64 (musl)  | `aarch64-unknown-linux-musl` | Supported |
-| macOS arm64          | `aarch64-apple-darwin`       | Supported |
-| Windows x64          | `x86_64-pc-windows-msvc`     | Future    |
+| macOS arm64         | `aarch64-apple-darwin`       | Supported |
+| Windows x64         | `x86_64-pc-windows-msvc`     | Future    |
 
 ## Development
 
@@ -234,11 +234,11 @@ cargo audit
 
 Seclusor is part of the 3leaps platform library family:
 
-| Library                                        | Scope                       | Purpose                                            |
-| ---------------------------------------------- | --------------------------- | -------------------------------------------------- |
-| **seclusor**                                   | Secrets management          | Git-trackable secrets with age encryption          |
-| [ipcprims](https://github.com/3leaps/ipcprims) | Inter-process communication | Framed, multiplexed IPC primitives                 |
-| [sysprims](https://github.com/3leaps/sysprims) | System operations           | Process control and system interaction primitives  |
+| Library                                        | Scope                       | Purpose                                           |
+| ---------------------------------------------- | --------------------------- | ------------------------------------------------- |
+| **seclusor**                                   | Secrets management          | Git-trackable secrets with age encryption         |
+| [ipcprims](https://github.com/3leaps/ipcprims) | Inter-process communication | Framed, multiplexed IPC primitives                |
+| [sysprims](https://github.com/3leaps/sysprims) | System operations           | Process control and system interaction primitives |
 
 Seclusor is a key dependency for the [Lanyte](https://github.com/lanytehq/lanyte) secure agent platform, which uses `seclusor-crypto` and `seclusor-keyring` as direct Rust crate dependencies for session attestation and Ed25519 key management.
 

@@ -1,3 +1,14 @@
-# TypeScript bindings (placeholder)
+# TypeScript bindings
 
-Scaffold for N-API bindings targeting `crates/seclusor-ffi`.
+N-API addon bindings for seclusor.
+
+## Local workflow
+
+```bash
+npm install
+npm run build
+npm test
+```
+
+The build compiles the native Rust addon and writes a platform-specific `.node`
+artifact under `native/`.
