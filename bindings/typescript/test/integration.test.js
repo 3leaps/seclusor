@@ -17,6 +17,10 @@ const SAMPLE = JSON.stringify({
 					type: "secret",
 					value: "sk-123",
 				},
+				REF_ONLY: {
+					type: "ref",
+					ref: "vault://demo/path",
+				},
 			},
 		},
 	],
@@ -25,17 +29,23 @@ const SAMPLE = JSON.stringify({
 seclusor.validateSecretsJson(SAMPLE);
 
 const keys = seclusor.listKeys(SAMPLE, "demo");
-assert.deepEqual(keys, ["API_KEY"]);
+assert.deepEqual(keys, ["API_KEY", "REF_ONLY"]);
 
 const got = JSON.parse(
 	seclusor.getCredentialJson(SAMPLE, "demo", "API_KEY", false),
 );
 assert.equal(got.type, "secret");
 assert.equal(got.redacted, true);
-assert.equal(got.value, undefined);
+assert.equal(got.value, "<redacted>");
 
-const env = JSON.parse(seclusor.exportEnvJson(SAMPLE, "demo", "APP_", false));
-assert.equal(env.length, 1);
+const gotRef = JSON.parse(
+	seclusor.getCredentialJson(SAMPLE, "demo", "REF_ONLY", false),
+);
+assert.equal(gotRef.redacted, true);
+assert.equal(gotRef.ref, "<redacted>");
+
+const env = JSON.parse(seclusor.exportEnvJson(SAMPLE, "demo", "APP_", true));
+assert.equal(env.length, 2);
 assert.equal(env[0].key, "APP_API_KEY");
 assert.equal(env[0].value, "sk-123");
 
@@ -60,5 +70,18 @@ seclusor.decryptBundle(bundlePath, outputJsonPath, identityPath);
 const outputJson = fs.readFileSync(outputJsonPath, "utf8");
 const parsed = JSON.parse(outputJson);
 assert.equal(parsed.projects[0].project_slug, "demo");
+
+const oversizedPath = path.join(tempDir, "oversized.json");
+const oversized = `{"schema_version":"v1.0.0","projects":[{"project_slug":"x","credentials":{"K":{"type":"secret","value":"${"a".repeat(2_200_000)}"}}}]}`;
+fs.writeFileSync(oversizedPath, oversized, "utf8");
+assert.throws(
+	() =>
+		seclusor.encryptBundle(
+			oversizedPath,
+			bundlePath,
+			JSON.stringify([generated.recipient]),
+		),
+	/document exceeds maximum size/,
+);
 
 console.log("TypeScript binding integration tests passed");

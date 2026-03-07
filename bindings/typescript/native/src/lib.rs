@@ -1,6 +1,7 @@
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use seclusor_codec::{decrypt_bundle_from_file, encrypt_bundle_to_file};
+use seclusor_core::constants::MAX_SECRETS_DOC_BYTES;
 use seclusor_core::crud::{get_credential, list_credential_keys};
 use seclusor_core::env::{export_env, EnvExportOptions};
 use seclusor_core::validate::validate_strict;
@@ -8,6 +9,7 @@ use seclusor_core::SecretsFile;
 use seclusor_crypto::{load_identity_file, parse_recipients};
 use seclusor_keyring::generate_identity;
 use serde::Serialize;
+use std::io::Read;
 
 #[derive(Serialize)]
 struct TsCredentialView {
@@ -37,6 +39,34 @@ fn parse_and_validate(input_json: &str) -> napi::Result<SecretsFile> {
         .map_err(|e| Error::from_reason(format!("invalid JSON: {e}")))?;
     validate_strict(&parsed).map_err(|e| Error::from_reason(e.to_string()))?;
     Ok(parsed)
+}
+
+fn read_utf8_file_with_limit(path: &str, max: usize) -> napi::Result<String> {
+    let actual = std::fs::metadata(path)
+        .map_err(|e| Error::from_reason(format!("failed to stat input JSON file: {e}")))?
+        .len();
+    if actual > max as u64 {
+        return Err(Error::from_reason(format!(
+            "document exceeds maximum size {max} (actual: {actual})"
+        )));
+    }
+
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| Error::from_reason(format!("failed to open input JSON file: {e}")))?;
+    let mut limited = file.by_ref().take((max as u64) + 1);
+    let mut bytes = Vec::new();
+    limited
+        .read_to_end(&mut bytes)
+        .map_err(|e| Error::from_reason(format!("failed to read input JSON file: {e}")))?;
+
+    if bytes.len() > max {
+        return Err(Error::from_reason(format!(
+            "document exceeds maximum size {max} (actual: {})",
+            bytes.len()
+        )));
+    }
+
+    String::from_utf8(bytes).map_err(|_| Error::from_reason("input JSON must be valid UTF-8"))
 }
 
 #[napi]
@@ -78,13 +108,21 @@ pub fn get_credential_json(
     let value = if reveal {
         credential.value.clone()
     } else {
-        None
+        credential.value.as_ref().map(|_| "<redacted>".to_string())
+    };
+    let reference = if reveal {
+        credential.reference.clone()
+    } else {
+        credential
+            .reference
+            .as_ref()
+            .map(|_| "<redacted>".to_string())
     };
 
     let view = TsCredentialView {
         credential_type: credential.credential_type.clone(),
         value,
-        reference: credential.reference.clone(),
+        reference,
         redacted: !reveal,
     };
 
@@ -126,8 +164,7 @@ pub fn encrypt_bundle(
     output_cipher_path: String,
     recipients_json: String,
 ) -> napi::Result<()> {
-    let json_text = std::fs::read_to_string(&input_json_path)
-        .map_err(|e| Error::from_reason(format!("failed to read input JSON file: {e}")))?;
+    let json_text = read_utf8_file_with_limit(&input_json_path, MAX_SECRETS_DOC_BYTES)?;
     let secrets = parse_and_validate(&json_text)?;
     let recipients_raw: Vec<String> = serde_json::from_str(&recipients_json)
         .map_err(|e| Error::from_reason(format!("invalid recipients JSON array: {e}")))?;
