@@ -35,6 +35,13 @@ struct TsGeneratedIdentity {
 }
 
 fn parse_and_validate(input_json: &str) -> napi::Result<SecretsFile> {
+    if input_json.len() > MAX_SECRETS_DOC_BYTES {
+        return Err(Error::from_reason(format!(
+            "document exceeds maximum size {} (actual: {})",
+            MAX_SECRETS_DOC_BYTES,
+            input_json.len()
+        )));
+    }
     let parsed: SecretsFile = serde_json::from_str(input_json)
         .map_err(|e| Error::from_reason(format!("invalid JSON: {e}")))?;
     validate_strict(&parsed).map_err(|e| Error::from_reason(e.to_string()))?;

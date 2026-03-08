@@ -75,6 +75,14 @@ const oversizedPath = path.join(tempDir, "oversized.json");
 const oversized = `{"schema_version":"v1.0.0","projects":[{"project_slug":"x","credentials":{"K":{"type":"secret","value":"${"a".repeat(2_200_000)}"}}}]}`;
 fs.writeFileSync(oversizedPath, oversized, "utf8");
 assert.throws(
+	() => seclusor.validateSecretsJson(oversized),
+	/document exceeds maximum size/,
+);
+assert.throws(
+	() => seclusor.listKeys(oversized, "x"),
+	/document exceeds maximum size/,
+);
+assert.throws(
 	() =>
 		seclusor.encryptBundle(
 			oversizedPath,
