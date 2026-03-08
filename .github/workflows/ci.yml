@@ -1,0 +1,67 @@
+name: ci
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  rust-quality:
+    name: Rust Quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install rust tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install cargo-deny --locked
+      - name: CI checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          make ci
+      - name: Go bindings tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          make go-test
+      - name: TypeScript bindings tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          make ts-test
+  sbom:
+    name: SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-cyclonedx
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install cargo-cyclonedx --locked
+      - name: Generate SBOM
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo cyclonedx --all --format json
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: "**/bom.json"
