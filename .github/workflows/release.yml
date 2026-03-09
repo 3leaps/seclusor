@@ -4,11 +4,13 @@ on:
     tags:
       - "v*"
 permissions:
-  contents: write
+  contents: read
 jobs:
   build-assets:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -28,6 +30,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -65,9 +70,14 @@ jobs:
     name: Publish Draft Release
     runs-on: ubuntu-latest
     needs: build-assets
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
