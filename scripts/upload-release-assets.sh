@@ -14,9 +14,15 @@ if ! command -v gh >/dev/null 2>&1; then
     exit 1
 fi
 
-mapfile -t assets < <(find "$release_dir" -maxdepth 1 -type f | sort)
+mapfile -t assets < <(
+    find "$release_dir" -maxdepth 1 -type f \
+        \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.tgz' \
+        -o -name 'SHA256SUMS' -o -name 'SHA512SUMS' \
+        -o -name '*.minisig' -o -name '*.asc' -o -name '*.pub' \) |
+        sort
+)
 if [ "${#assets[@]}" -eq 0 ]; then
-    echo "error: no assets found in ${release_dir}" >&2
+    echo "error: no publishable assets found in ${release_dir}" >&2
     exit 1
 fi
 
