@@ -1,0 +1,39 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+$id: "https://schemas.seclusor.dev/seclusor/v1.0.0/embed-manifest.schema.yaml"
+title: "Seclusor Docs Embed Manifest"
+type: object
+additionalProperties: false
+required: [version, topics]
+properties:
+  version:
+    type: string
+    const: "1.0.0"
+  topics:
+    type: object
+    minProperties: 1
+    additionalProperties:
+      type: object
+      additionalProperties: false
+      required: [title, include]
+      properties:
+        title:
+          type: string
+          minLength: 1
+        description:
+          type: string
+        include:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            minLength: 1
+        exclude:
+          type: array
+          items:
+            type: string
+            minLength: 1
+        tags:
+          type: array
+          items:
+            type: string
+            minLength: 1

@@ -1,0 +1,41 @@
+version: "1.0.0"
+topics:
+  quickstart:
+    title: "Quick Start"
+    description: "Getting started with seclusor"
+    tags: [getting-started, cli]
+    include:
+      - guides/quickstart.md
+  cli-reference:
+    title: "CLI Command Reference"
+    description: "Full CLI command surface"
+    tags: [cli, commands]
+    include:
+      - guides/cli-reference.md
+  codecs:
+    title: "Storage Codecs"
+    description: "Bundle and inline encryption formats"
+    tags: [codecs, bundle, inline, encryption]
+    include:
+      - guides/codecs.md
+  key-management:
+    title: "Key Management"
+    description: "Identity generation, recipients, and rekey"
+    tags: [keys, identity, recipients, rekey]
+    include:
+      - guides/key-management.md
+  security:
+    title: "Security Model"
+    description: "Threat model, safety defaults, and secret handling"
+    tags: [security, encryption, safety]
+    include:
+      - guides/security.md
+  decisions:
+    title: "Architecture Decisions"
+    description: "Selected ADR and SDR records"
+    tags: [architecture, decisions, adr, sdr]
+    include:
+      - decisions/ADR-0002-*.md
+      - decisions/ADR-0003-*.md
+      - decisions/ADR-0006-*.md
+      - decisions/SDR-0002-*.md

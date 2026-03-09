@@ -9,7 +9,7 @@
 #   make build      - Build all crates
 
 .PHONY: all help bootstrap bootstrap-force tools check check-all test fmt fmt-check lint build build-release clean
-.PHONY: ffi-header build-ffi go-bindings-sync go-build go-test ts-build ts-test
+.PHONY: ffi-header build-ffi go-bindings-sync go-build go-test ts-build ts-test embed-verify
 .PHONY: precommit prepush deny deny-all audit miri msrv
 .PHONY: check-windows check-windows-msvc check-windows-gnu
 .PHONY: install dogfood-cli
@@ -64,6 +64,7 @@ help: ## Show available targets
 	@echo "  go-test         Run Go bindings tests"
 	@echo "  ts-build        Build TypeScript N-API bindings"
 	@echo "  ts-test         Run TypeScript bindings tests"
+	@echo "  embed-verify    Verify docs embed manifest/build pipeline"
 	@echo "  dogfood-cli     Run end-to-end CLI dogfooding matrix"
 	@echo "  clean           Remove build artifacts"
 	@echo ""
@@ -343,7 +344,7 @@ audit: ## Run cargo-audit security scan
 # Build
 # -----------------------------------------------------------------------------
 
-build: ## Build all crates (debug)
+build: embed-verify ## Build all crates (debug)
 	@echo "Building (debug)..."
 	$(CARGO) build --workspace
 	@echo "[ok] Build complete"
@@ -396,6 +397,12 @@ ts-test: ## Run TypeScript bindings tests
 	@echo "Running TypeScript bindings tests..."
 	@cd $(TS_BINDINGS_DIR) && npm install && npm test
 	@echo "[ok] TypeScript bindings tests passed"
+
+embed-verify: ## Verify docs embed manifest/build pipeline
+	@echo "Verifying embedded docs build pipeline..."
+	@$(CARGO) check -p seclusor
+	@$(CARGO) run -q -p seclusor -- docs list --format json >/dev/null
+	@echo "[ok] Embedded docs verification passed"
 
 clean: ## Remove build artifacts
 	@echo "Cleaning..."

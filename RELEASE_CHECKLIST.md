@@ -7,8 +7,9 @@ Use this checklist before tagging and publishing any `vX.Y.Z` release.
 1. `make release-preflight` passes.
 2. Working tree is clean (`git status` empty).
 3. `VERSION` matches workspace Cargo version (`make version-check`).
-4. Release notes exist at `docs/releases/vX.Y.Z.md`.
-5. D0-D8 briefs show approved status in local planning state.
+4. Run `make clean` then `make build` (build depends on `embed-verify`, validating docs embedding path).
+5. Release notes exist at `docs/releases/vX.Y.Z.md`.
+6. D0-D8 briefs show approved status in local planning state.
 
 ## CI and Build Artifacts
 
