@@ -93,3 +93,50 @@ fn export_json_stdout_is_valid_json_and_stderr_empty() {
     let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid json");
     assert_eq!(parsed["APP_API_KEY"], "sk-123");
 }
+
+#[test]
+fn missing_file_failure_writes_diagnostics_to_stderr_only() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing = dir.path().join("missing.json");
+
+    let output = run_seclusor(&[
+        "secrets",
+        "list",
+        "--file",
+        missing.to_str().expect("utf8 path"),
+        "--project",
+        "demo",
+    ]);
+    assert!(!output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).expect("utf8 stdout"), "");
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(
+        !stderr.trim().is_empty(),
+        "stderr should include diagnostics"
+    );
+}
+
+#[test]
+fn invalid_document_failure_writes_diagnostics_to_stderr_only() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let invalid = dir.path().join("invalid.json");
+    fs::write(
+        &invalid,
+        r#"{"schema_version":"v9.9.9","projects":[{"project_slug":"demo","credentials":{}}]}"#,
+    )
+    .expect("write invalid fixture");
+
+    let output = run_seclusor(&[
+        "secrets",
+        "validate",
+        "--file",
+        invalid.to_str().expect("utf8 path"),
+    ]);
+    assert!(!output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).expect("utf8 stdout"), "");
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(
+        !stderr.trim().is_empty(),
+        "stderr should include diagnostics"
+    );
+}
