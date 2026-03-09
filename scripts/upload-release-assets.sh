@@ -14,7 +14,10 @@ if ! command -v gh >/dev/null 2>&1; then
     exit 1
 fi
 
-mapfile -t assets < <(
+assets=()
+while IFS= read -r path; do
+    assets+=("$path")
+done < <(
     find "$release_dir" -maxdepth 1 -type f \
         \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.tgz' \
         -o -name 'SHA256SUMS' -o -name 'SHA512SUMS' \

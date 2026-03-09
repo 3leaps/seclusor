@@ -12,7 +12,10 @@ if [ ! -d "$release_dir" ]; then
     exit 1
 fi
 
-mapfile -t artifacts < <(find "$release_dir" -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.tgz' \) | sort)
+artifacts=()
+while IFS= read -r path; do
+    artifacts+=("$path")
+done < <(find "$release_dir" -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.tgz' \) | sort)
 if [ "${#artifacts[@]}" -eq 0 ]; then
     echo "error: no distributable archives found in ${release_dir}" >&2
     exit 1
