@@ -18,7 +18,9 @@ mapfile -t assets < <(
     find "$release_dir" -maxdepth 1 -type f \
         \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.tgz' \
         -o -name 'SHA256SUMS' -o -name 'SHA512SUMS' \
-        -o -name '*.minisig' -o -name '*.asc' -o -name '*.pub' \) |
+        -o -name 'SHA256SUMS.minisig' -o -name 'SHA512SUMS.minisig' \
+        -o -name 'SHA256SUMS.asc' -o -name 'SHA512SUMS.asc' \
+        -o -name 'release-key.asc' -o -name 'minisign.pub' \) |
         sort
 )
 if [ "${#assets[@]}" -eq 0 ]; then
