@@ -48,6 +48,10 @@ pub enum CodecError {
     #[error("bundle ciphertext exceeds maximum size of {max} bytes (actual: {actual})")]
     BundleCiphertextTooLarge { actual: u64, max: u64 },
 
+    /// Runtime bundle source requires identity files for decryption.
+    #[error("bundle input requires at least one identity file (--identity-file)")]
+    BundleIdentityRequired,
+
     /// Core-domain validation or model error.
     #[error(transparent)]
     Core(#[from] SeclusorError),
@@ -308,8 +312,63 @@ pub fn decrypt_bundle_from_file(
         return Err(CodecError::BundleCiphertextTooLarge { actual, max });
     }
 
-    let ciphertext = read_file_with_limit(input_path, max)?;
+    let ciphertext = read_file_with_limit(input_path, max, ReadLimitKind::BundleCiphertext)?;
     decrypt_bundle(&ciphertext, identities)
+}
+
+/// Resolve runtime source bytes as either plaintext JSON or bundle ciphertext.
+///
+/// Classification is fail-closed: bundle marker detection takes precedence and
+/// never falls back to plaintext JSON if bundle decryption fails.
+pub fn resolve_runtime_source(input: &[u8], identities: &[Identity]) -> Result<SecretsFile> {
+    if is_bundle_ciphertext(input) {
+        if identities.is_empty() {
+            return Err(CodecError::BundleIdentityRequired);
+        }
+        return decrypt_bundle(input, identities);
+    }
+
+    deserialize_json(input)
+}
+
+/// Resolve runtime source from file as either plaintext JSON or bundle ciphertext.
+///
+/// Uses bounded reads with codec-specific limits before allocation:
+/// - bundle marker input: `MAX_BUNDLE_CIPHERTEXT_BYTES`
+/// - non-bundle input: `MAX_SECRETS_DOC_BYTES`
+pub fn resolve_runtime_source_from_file(
+    input_path: impl AsRef<Path>,
+    identities: &[Identity],
+) -> Result<SecretsFile> {
+    let input_path = input_path.as_ref();
+    let is_bundle = detect_bundle_marker_from_file(input_path)?;
+    let max = if is_bundle {
+        MAX_BUNDLE_CIPHERTEXT_BYTES as u64
+    } else {
+        MAX_SECRETS_DOC_BYTES as u64
+    };
+    let kind = if is_bundle {
+        ReadLimitKind::BundleCiphertext
+    } else {
+        ReadLimitKind::Document
+    };
+
+    let actual = fs::metadata(input_path)?.len();
+    if actual > max {
+        return match kind {
+            ReadLimitKind::BundleCiphertext => {
+                Err(CodecError::BundleCiphertextTooLarge { actual, max })
+            }
+            ReadLimitKind::Document => Err(SeclusorError::DocumentTooLarge {
+                actual: actual as usize,
+                max: MAX_SECRETS_DOC_BYTES,
+            }
+            .into()),
+        };
+    }
+
+    let input = read_file_with_limit(input_path, max, kind)?;
+    resolve_runtime_source(&input, identities)
 }
 
 fn is_bundle_ciphertext(input: &[u8]) -> bool {
@@ -326,6 +385,19 @@ fn ensure_document_size(actual: usize) -> Result<()> {
         .into());
     }
     Ok(())
+}
+
+fn detect_bundle_marker_from_file(path: &Path) -> Result<bool> {
+    let mut file = std::fs::File::open(path)?;
+    let mut prefix = [0u8; 64];
+    let read = file.read(&mut prefix)?;
+    Ok(is_bundle_ciphertext(&prefix[..read]))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ReadLimitKind {
+    BundleCiphertext,
+    Document,
 }
 
 struct BoundedJsonWriter {
@@ -375,17 +447,24 @@ impl Write for BoundedJsonWriter {
     }
 }
 
-fn read_file_with_limit(path: &Path, max: u64) -> Result<Vec<u8>> {
+fn read_file_with_limit(path: &Path, max: u64, kind: ReadLimitKind) -> Result<Vec<u8>> {
     let mut file = std::fs::File::open(path)?;
     let mut limited = std::io::Read::by_ref(&mut file).take(max + 1);
     let mut buf = Vec::new();
     limited.read_to_end(&mut buf)?;
 
     if buf.len() as u64 > max {
-        return Err(CodecError::BundleCiphertextTooLarge {
-            actual: buf.len() as u64,
-            max,
-        });
+        return match kind {
+            ReadLimitKind::BundleCiphertext => Err(CodecError::BundleCiphertextTooLarge {
+                actual: buf.len() as u64,
+                max,
+            }),
+            ReadLimitKind::Document => Err(SeclusorError::DocumentTooLarge {
+                actual: buf.len(),
+                max: MAX_SECRETS_DOC_BYTES,
+            }
+            .into()),
+        };
     }
 
     Ok(buf)
@@ -522,9 +601,52 @@ mod tests {
     }
 
     #[test]
+    fn resolve_runtime_source_inline_json() {
+        let secrets = fixture_secrets();
+        let json = serde_json::to_vec(&secrets).expect("serialize should succeed");
+        let resolved = resolve_runtime_source(&json, &[]).expect("resolve should succeed");
+        assert_eq!(resolved, secrets);
+    }
+
+    #[test]
+    fn resolve_runtime_source_bundle_requires_identity() {
+        let secrets = fixture_secrets();
+        let ciphertext =
+            encrypt_bundle(&secrets, &[fixture_recipient()]).expect("encrypt should succeed");
+        let err = resolve_runtime_source(&ciphertext, &[]).expect_err("must fail");
+        assert!(matches!(err, CodecError::BundleIdentityRequired));
+    }
+
+    #[test]
+    fn resolve_runtime_source_bundle_decrypt_failure_is_fail_closed() {
+        let err = resolve_runtime_source(
+            b"age-encryption.org/v1\nthis is not valid age payload",
+            &[fixture_identity()],
+        )
+        .expect_err("must fail");
+        assert!(matches!(err, CodecError::Crypto(_)));
+    }
+
+    #[test]
     fn detect_format_rejects_oversized_non_bundle_input() {
         let oversized = vec![b'{'; MAX_SECRETS_DOC_BYTES + 1];
         let err = detect_format(&oversized).expect_err("must fail");
+        assert!(matches!(
+            err,
+            CodecError::Core(SeclusorError::DocumentTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn resolve_runtime_source_from_file_rejects_oversized_document() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("oversized.json");
+        let file = std::fs::File::create(&path).expect("create file");
+        file.set_len((MAX_SECRETS_DOC_BYTES as u64) + 1)
+            .expect("set file length");
+        drop(file);
+
+        let err = resolve_runtime_source_from_file(&path, &[]).expect_err("must fail");
         assert!(matches!(
             err,
             CodecError::Core(SeclusorError::DocumentTooLarge { .. })

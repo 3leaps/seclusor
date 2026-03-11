@@ -7,7 +7,7 @@ use std::process::Command;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use seclusor_codec::{
     convert_inline_to_bundle, decrypt_bundle_from_file, decrypt_inline, encrypt_bundle_to_file,
-    encrypt_inline, StorageCodec,
+    encrypt_inline, resolve_runtime_source_from_file, StorageCodec,
 };
 use seclusor_core::constants::{DEFAULT_CREDENTIAL_TYPE, MAX_SECRETS_DOC_BYTES};
 use seclusor_core::crud::{get_credential, list_credential_keys, set_credential, unset_credential};
@@ -244,6 +244,8 @@ struct ExportEnvArgs {
     allow: Vec<String>,
     #[arg(long = "deny")]
     deny: Vec<String>,
+    #[command(flatten)]
+    identities: IdentityArgs,
 }
 
 #[derive(Debug, Parser)]
@@ -278,6 +280,8 @@ struct RunArgs {
     allow: Vec<String>,
     #[arg(long = "deny")]
     deny: Vec<String>,
+    #[command(flatten)]
+    identities: IdentityArgs,
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
 }
@@ -630,7 +634,8 @@ fn handle_validate(args: ValidateArgs) -> CliResult<()> {
 }
 
 fn handle_export_env(args: ExportEnvArgs) -> CliResult<()> {
-    let secrets = read_secrets_file(&args.file)?;
+    let identities = resolve_identities(&args.identities, false)?;
+    let secrets = read_runtime_secrets_file(&args.file, &identities)?;
     let output = render_export_env_output(&secrets, args.project.as_deref(), &args)?;
     println!("{output}");
     Ok(())
@@ -695,7 +700,8 @@ fn handle_import_env(args: ImportEnvArgs) -> CliResult<()> {
 }
 
 fn handle_run(args: RunArgs) -> CliResult<()> {
-    let secrets = read_secrets_file(&args.file)?;
+    let identities = resolve_identities(&args.identities, false)?;
+    let secrets = read_runtime_secrets_file(&args.file, &identities)?;
     let env_vars = resolve_export_env_vars(
         &secrets,
         args.project.as_deref(),
@@ -914,6 +920,10 @@ fn read_secrets_file(path: &Path) -> CliResult<SecretsFile> {
     let secrets: SecretsFile = serde_json::from_slice(&bytes)?;
     validate_strict(&secrets)?;
     Ok(secrets)
+}
+
+fn read_runtime_secrets_file(path: &Path, identities: &[Identity]) -> CliResult<SecretsFile> {
+    Ok(resolve_runtime_source_from_file(path, identities)?)
 }
 
 fn write_secrets_file(path: &Path, secrets: &SecretsFile, create_new: bool) -> CliResult<()> {
@@ -1160,6 +1170,7 @@ mod tests {
             emit_ref: false,
             allow: vec!["APP_API_*".to_string()],
             deny: vec![],
+            identities: IdentityArgs::default(),
         };
 
         let output = render_export_env_output(&secrets, Some("demo"), &args).expect("export");
@@ -1189,10 +1200,218 @@ mod tests {
             emit_ref: false,
             allow: vec![],
             deny: vec![],
+            identities: IdentityArgs::default(),
             command,
         })
         .expect_err("run should fail with command exit status");
         assert!(matches!(err, CliError::CommandFailed(42)));
+    }
+
+    #[test]
+    fn handle_export_env_accepts_bundle_with_identity_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("input.json");
+        let bundle = dir.path().join("secrets.age");
+        let identity_file = dir.path().join("identity.txt");
+        let secrets = fixture_secrets();
+        write_secrets_file(&input, &secrets, true).expect("write input");
+        write_identity_file(&identity_file, TEST_IDENTITY);
+
+        handle_bundle_encrypt(BundleEncryptArgs {
+            input,
+            output: bundle.clone(),
+            recipients: RecipientArgs {
+                recipients: vec![fixture_recipient_string()],
+                recipient_file: None,
+                recipient_env_var: None,
+            },
+        })
+        .expect("bundle encrypt");
+
+        handle_export_env(ExportEnvArgs {
+            file: bundle,
+            project: Some("demo".to_string()),
+            format: EnvFormatArg::Dotenv,
+            prefix: None,
+            emit_ref: false,
+            allow: vec!["APP_API_*".to_string()],
+            deny: vec![],
+            identities: IdentityArgs {
+                identity_files: vec![identity_file],
+            },
+        })
+        .expect("export env from bundle");
+    }
+
+    #[test]
+    fn handle_export_env_bundle_requires_identity_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("input.json");
+        let bundle = dir.path().join("secrets.age");
+        let secrets = fixture_secrets();
+        write_secrets_file(&input, &secrets, true).expect("write input");
+
+        handle_bundle_encrypt(BundleEncryptArgs {
+            input,
+            output: bundle.clone(),
+            recipients: RecipientArgs {
+                recipients: vec![fixture_recipient_string()],
+                recipient_file: None,
+                recipient_env_var: None,
+            },
+        })
+        .expect("bundle encrypt");
+
+        let err = handle_export_env(ExportEnvArgs {
+            file: bundle,
+            project: Some("demo".to_string()),
+            format: EnvFormatArg::Dotenv,
+            prefix: None,
+            emit_ref: false,
+            allow: vec!["*".to_string()],
+            deny: vec![],
+            identities: IdentityArgs::default(),
+        })
+        .expect_err("bundle runtime must require identities");
+
+        assert!(matches!(
+            err,
+            CliError::Codec(seclusor_codec::CodecError::BundleIdentityRequired)
+        ));
+    }
+
+    #[test]
+    fn handle_run_accepts_bundle_with_identity_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("input.json");
+        let bundle = dir.path().join("secrets.age");
+        let identity_file = dir.path().join("identity.txt");
+        let secrets = fixture_secrets();
+        write_secrets_file(&input, &secrets, true).expect("write input");
+        write_identity_file(&identity_file, TEST_IDENTITY);
+
+        handle_bundle_encrypt(BundleEncryptArgs {
+            input,
+            output: bundle.clone(),
+            recipients: RecipientArgs {
+                recipients: vec![fixture_recipient_string()],
+                recipient_file: None,
+                recipient_env_var: None,
+            },
+        })
+        .expect("bundle encrypt");
+
+        #[cfg(unix)]
+        let command = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            r#"test "${APP_API_KEY}" = "sk-123""#.to_string(),
+        ];
+        #[cfg(windows)]
+        let command = vec![
+            "cmd".to_string(),
+            "/C".to_string(),
+            r#"if "%APP_API_KEY%"=="sk-123" (exit 0) else (exit 33)"#.to_string(),
+        ];
+
+        handle_run(RunArgs {
+            file: bundle,
+            project: Some("demo".to_string()),
+            prefix: None,
+            emit_ref: false,
+            allow: vec!["APP_API_KEY".to_string()],
+            deny: vec![],
+            identities: IdentityArgs {
+                identity_files: vec![identity_file],
+            },
+            command,
+        })
+        .expect("run from bundle");
+    }
+
+    #[test]
+    fn handle_run_bundle_wrong_identity_does_not_disclose_secret() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("input.json");
+        let bundle = dir.path().join("secrets.age");
+        let wrong_identity_file = dir.path().join("wrong-identity.txt");
+        let secrets = fixture_secrets();
+        write_secrets_file(&input, &secrets, true).expect("write input");
+        let wrong_identity = seclusor_crypto::identity_to_string(&Identity::generate());
+        write_identity_file(&wrong_identity_file, &wrong_identity);
+
+        handle_bundle_encrypt(BundleEncryptArgs {
+            input,
+            output: bundle.clone(),
+            recipients: RecipientArgs {
+                recipients: vec![fixture_recipient_string()],
+                recipient_file: None,
+                recipient_env_var: None,
+            },
+        })
+        .expect("bundle encrypt");
+
+        #[cfg(unix)]
+        let command = vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()];
+        #[cfg(windows)]
+        let command = vec!["cmd".to_string(), "/C".to_string(), "exit 0".to_string()];
+
+        let err = handle_run(RunArgs {
+            file: bundle,
+            project: Some("demo".to_string()),
+            prefix: None,
+            emit_ref: false,
+            allow: vec!["APP_API_KEY".to_string()],
+            deny: vec![],
+            identities: IdentityArgs {
+                identity_files: vec![wrong_identity_file],
+            },
+            command,
+        })
+        .expect_err("wrong identity should fail");
+
+        let rendered = format!("{err}");
+        assert!(!rendered.contains("sk-123"));
+    }
+
+    #[test]
+    fn handle_export_env_bundle_wrong_identity_does_not_disclose_secret() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("input.json");
+        let bundle = dir.path().join("secrets.age");
+        let wrong_identity_file = dir.path().join("wrong-identity.txt");
+        let secrets = fixture_secrets();
+        write_secrets_file(&input, &secrets, true).expect("write input");
+        let wrong_identity = seclusor_crypto::identity_to_string(&Identity::generate());
+        write_identity_file(&wrong_identity_file, &wrong_identity);
+
+        handle_bundle_encrypt(BundleEncryptArgs {
+            input,
+            output: bundle.clone(),
+            recipients: RecipientArgs {
+                recipients: vec![fixture_recipient_string()],
+                recipient_file: None,
+                recipient_env_var: None,
+            },
+        })
+        .expect("bundle encrypt");
+
+        let err = handle_export_env(ExportEnvArgs {
+            file: bundle,
+            project: Some("demo".to_string()),
+            format: EnvFormatArg::Dotenv,
+            prefix: None,
+            emit_ref: false,
+            allow: vec!["APP_API_KEY".to_string()],
+            deny: vec![],
+            identities: IdentityArgs {
+                identity_files: vec![wrong_identity_file],
+            },
+        })
+        .expect_err("wrong identity should fail");
+
+        let rendered = format!("{err}");
+        assert!(!rendered.contains("sk-123"));
     }
 
     #[test]
