@@ -28,7 +28,8 @@ VERSION := $(shell cargo metadata --format-version 1 --no-deps 2>/dev/null | \
 
 BIN_DIR := $(CURDIR)/bin
 
-SFETCH_VERSION := latest
+SFETCH_VERSION ?= v0.4.5
+SFETCH_INSTALL_URL ?= https://github.com/3leaps/sfetch/releases/download/$(SFETCH_VERSION)/install-sfetch.sh
 GONEAT_VERSION ?= v0.5.1
 
 SFETCH = $(shell [ -x "$(BIN_DIR)/sfetch" ] && echo "$(BIN_DIR)/sfetch" || command -v sfetch 2>/dev/null)
@@ -131,7 +132,7 @@ bootstrap: ## Install required tools (sfetch -> goneat)
 	@mkdir -p "$(BIN_DIR)"
 	@if [ ! -x "$(BIN_DIR)/sfetch" ] && ! command -v sfetch >/dev/null 2>&1; then \
 		echo "[..] Installing sfetch (trust anchor)..."; \
-		curl -fsSL https://github.com/3leaps/sfetch/releases/download/$(SFETCH_VERSION)/install-sfetch.sh | bash -s -- --dest "$(BIN_DIR)"; \
+		curl -fsSL "$(SFETCH_INSTALL_URL)" | bash -s -- --dir "$(BIN_DIR)" --yes; \
 	else \
 		echo "[ok] sfetch already installed"; \
 	fi
