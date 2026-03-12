@@ -5,9 +5,12 @@ on:
   pull_request:
 permissions:
   contents: read
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-Dwarnings"
 jobs:
   rust-quality:
-    name: Rust Quality
+    name: Rust Quality (Linux)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -43,6 +46,44 @@ jobs:
         run: |
           set -euo pipefail
           make ts-test
+  macos-test:
+    name: Test (macOS arm64)
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.94.0
+      - name: Build and test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          cargo test --workspace --all-features
+  windows-cross-check:
+    name: Cross-check (Windows)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-pc-windows-msvc
+          - aarch64-pc-windows-msvc
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.94.0
+        with:
+          targets: ${{ matrix.target }}
+      - name: Type-check Windows target
+        shell: bash
+        run: |
+          set -euo pipefail
+          # cargo check (type-check only, no linking) catches Windows-specific
+          # compile errors without requiring Windows SDK or linkers.
+          # FFI crate excluded — uses platform-specific linking.
+          cargo check --workspace --exclude seclusor-ffi --target ${{ matrix.target }}
   sbom:
     name: SBOM
     runs-on: ubuntu-latest

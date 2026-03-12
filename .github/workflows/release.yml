@@ -5,6 +5,8 @@ on:
       - "v*"
 permissions:
   contents: read
+env:
+  CARGO_TERM_COLOR: always
 jobs:
   build-assets:
     name: Build (${{ matrix.target }})
@@ -27,6 +29,14 @@ jobs:
             target: aarch64-apple-darwin
             bin_name: seclusor
             archive_ext: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin_name: seclusor.exe
+            archive_ext: zip
+          - os: windows-latest-arm64-s
+            target: aarch64-pc-windows-msvc
+            bin_name: seclusor.exe
+            archive_ext: zip
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -51,21 +61,32 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --release --target "${{ matrix.target }}" -p seclusor
-      - name: Package archive
+      - name: Package archive (Unix)
+        if: matrix.archive_ext == 'tar.gz'
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
           version="${GITHUB_REF_NAME#v}"
-          archive="dist/seclusor-v${version}-${{ matrix.target }}.${{ matrix.archive_ext }}"
+          archive="dist/seclusor-v${version}-${{ matrix.target }}.tar.gz"
           tar -czf "$archive" -C "target/${{ matrix.target }}/release" "${{ matrix.bin_name }}"
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
-        id: pkg
+        id: pkg_unix
+      - name: Package archive (Windows)
+        if: matrix.archive_ext == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $version = "$env:GITHUB_REF_NAME" -replace '^v', ''
+          $archive = "dist/seclusor-v${version}-${{ matrix.target }}.zip"
+          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" -DestinationPath $archive
+          "archive=$archive" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+        id: pkg_windows
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: build-${{ matrix.target }}
-          path: ${{ steps.pkg.outputs.archive }}
+          path: dist/*.${{ matrix.archive_ext }}
   publish-draft:
     name: Publish Draft Release
     runs-on: ubuntu-latest
@@ -86,10 +107,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          artifacts="$(mktemp)"
-          find dist -type f \( -name "*.tar.gz" -o -name "*.zip" \) -print0 > "$artifacts"
-          sort -z "$artifacts" | xargs -0 shasum -a 256 > dist/SHA256SUMS
-          sort -z "$artifacts" | xargs -0 shasum -a 512 > dist/SHA512SUMS
+          find dist -type f \( -name "*.tar.gz" -o -name "*.zip" \) | sort | while read -r f; do
+            shasum -a 256 "$f"
+          done > dist/SHA256SUMS
+          find dist -type f \( -name "*.tar.gz" -o -name "*.zip" \) | sort | while read -r f; do
+            shasum -a 512 "$f"
+          done > dist/SHA512SUMS
       - name: Create draft release
         uses: softprops/action-gh-release@v2
         with:
