@@ -10,7 +10,7 @@
 
 .PHONY: all help bootstrap bootstrap-force tools check check-all test fmt fmt-check lint build build-release clean
 .PHONY: ffi-header build-ffi go-bindings-sync go-build go-test ts-build ts-test embed-verify
-.PHONY: precommit prepush deny deny-all audit miri msrv
+.PHONY: precommit prepush repo-status deny deny-all audit miri msrv
 .PHONY: check-windows check-windows-msvc check-windows-gnu
 .PHONY: install dogfood-cli
 .PHONY: version version-patch version-minor version-major version-set version-sync version-check
@@ -447,8 +447,21 @@ dogfood-cli: ## Run end-to-end CLI dogfooding matrix
 precommit: fmt-check lint ## Run pre-commit checks (fast)
 	@echo "[ok] Pre-commit checks passed"
 
-prepush: check version-check go-test ts-test ## Run pre-push checks (thorough)
+prepush: repo-status check version-check go-test ts-test ## Run pre-push checks (thorough)
 	@echo "[ok] Pre-push checks passed"
+
+repo-status: ## Fail if working tree has uncommitted changes (goneat assess repo-status)
+	@if command -v goneat >/dev/null 2>&1; then \
+		goneat assess --categories repo-status --fail-on high --ci-summary --log-level warn; \
+	else \
+		echo "Checking working tree..."; \
+		if [ -n "$$(git status --porcelain 2>/dev/null)" ]; then \
+			echo "[!!] Working tree not clean — commit or stash changes before pushing"; \
+			git status --short; \
+			exit 1; \
+		fi; \
+		echo "[ok] Working tree is clean"; \
+	fi
 
 # -----------------------------------------------------------------------------
 # Version Management
