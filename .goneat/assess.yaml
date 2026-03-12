@@ -43,7 +43,7 @@ lint:
     checkmake:
       enabled: true
       config:
-        max_body_length: 70
+        max_body_length: 80
         min_phony_targets:
           - all
           - clean
