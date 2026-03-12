@@ -27,6 +27,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo install cargo-deny --locked
+          cargo install cbindgen --locked
       - name: CI checks
         shell: bash
         run: |

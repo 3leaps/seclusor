@@ -436,7 +436,7 @@ dogfood-cli: ## Run end-to-end CLI dogfooding matrix
 precommit: fmt-check lint ## Run pre-commit checks (fast)
 	@echo "[ok] Pre-commit checks passed"
 
-prepush: check version-check ## Run pre-push checks (thorough)
+prepush: check version-check go-test ts-test ## Run pre-push checks (thorough)
 	@echo "[ok] Pre-push checks passed"
 
 # -----------------------------------------------------------------------------
