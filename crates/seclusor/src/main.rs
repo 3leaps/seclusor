@@ -1105,7 +1105,9 @@ mod tests {
         .expect_err("must reject invalid document");
         assert!(matches!(
             err,
-            CliError::Codec(seclusor_codec::CodecError::Core(SeclusorError::Validation(_)))
+            CliError::Codec(seclusor_codec::CodecError::Core(SeclusorError::Validation(
+                _
+            )))
         ));
     }
 
