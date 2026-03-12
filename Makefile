@@ -170,6 +170,12 @@ bootstrap: ## Install required tools (sfetch -> goneat)
 	else \
 		echo "[ok] cargo-audit installed"; \
 	fi
+	@if ! command -v cbindgen >/dev/null 2>&1; then \
+		echo "[..] Installing cbindgen..."; \
+		cargo install cbindgen --locked; \
+	else \
+		echo "[ok] cbindgen installed"; \
+	fi
 	@if ! cargo set-version -V >/dev/null 2>&1; then \
 		echo "[..] Installing cargo-edit..."; \
 		cargo install cargo-edit --locked; \
@@ -208,6 +214,11 @@ tools: ## Verify external tools are available
 		echo "[ok] cargo-audit: $$(cargo-audit --version)"; \
 	else \
 		echo "[!!] cargo-audit not found (cargo install cargo-audit)"; \
+	fi
+	@if command -v cbindgen >/dev/null 2>&1; then \
+		echo "[ok] cbindgen: $$(cbindgen --version)"; \
+	else \
+		echo "[!!] cbindgen not found (cargo install cbindgen)"; \
 	fi
 	@if cargo set-version -V >/dev/null 2>&1; then \
 		echo "[ok] cargo-edit: $$(cargo set-version -V)"; \
