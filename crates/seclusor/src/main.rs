@@ -202,6 +202,8 @@ struct GetArgs {
     key: String,
     #[arg(long, default_value_t = false)]
     reveal: bool,
+    #[command(flatten)]
+    identities: IdentityArgs,
 }
 
 #[derive(Debug, Parser)]
@@ -584,7 +586,8 @@ fn handle_set(args: SetArgs) -> CliResult<()> {
 }
 
 fn handle_get(args: GetArgs) -> CliResult<()> {
-    let secrets = read_secrets_file(&args.file)?;
+    let identities = resolve_identities(&args.identities, false)?;
+    let secrets = read_runtime_secrets_file(&args.file, &identities)?;
     let credential = get_credential(&secrets, args.project.as_deref(), &args.key)?;
     if args.reveal {
         if let Some(value) = &credential.value {
@@ -1097,9 +1100,130 @@ mod tests {
             project: Some("demo".to_string()),
             key: "API_KEY".to_string(),
             reveal: false,
+            identities: IdentityArgs::default(),
         })
         .expect_err("must reject invalid document");
-        assert!(matches!(err, CliError::Core(SeclusorError::Validation(_))));
+        assert!(matches!(
+            err,
+            CliError::Codec(seclusor_codec::CodecError::Core(SeclusorError::Validation(
+                _
+            )))
+        ));
+    }
+
+    #[test]
+    fn handle_get_bundle_redacted_and_reveal() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("input.json");
+        let bundle = dir.path().join("secrets.age");
+        let identity_file = dir.path().join("identity.txt");
+        let secrets = fixture_secrets();
+        write_secrets_file(&input, &secrets, true).expect("write input");
+        write_identity_file(&identity_file, TEST_IDENTITY);
+
+        handle_bundle_encrypt(BundleEncryptArgs {
+            input,
+            output: bundle.clone(),
+            recipients: RecipientArgs {
+                recipients: vec![fixture_recipient_string()],
+                recipient_file: None,
+                recipient_env_var: None,
+            },
+        })
+        .expect("bundle encrypt");
+
+        handle_get(GetArgs {
+            file: bundle.clone(),
+            project: Some("demo".to_string()),
+            key: "API_KEY".to_string(),
+            reveal: false,
+            identities: IdentityArgs {
+                identity_files: vec![identity_file.clone()],
+            },
+        })
+        .expect("get redacted from bundle");
+
+        handle_get(GetArgs {
+            file: bundle,
+            project: Some("demo".to_string()),
+            key: "API_KEY".to_string(),
+            reveal: true,
+            identities: IdentityArgs {
+                identity_files: vec![identity_file],
+            },
+        })
+        .expect("get reveal from bundle");
+    }
+
+    #[test]
+    fn handle_get_bundle_requires_identity_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("input.json");
+        let bundle = dir.path().join("secrets.age");
+        let secrets = fixture_secrets();
+        write_secrets_file(&input, &secrets, true).expect("write input");
+
+        handle_bundle_encrypt(BundleEncryptArgs {
+            input,
+            output: bundle.clone(),
+            recipients: RecipientArgs {
+                recipients: vec![fixture_recipient_string()],
+                recipient_file: None,
+                recipient_env_var: None,
+            },
+        })
+        .expect("bundle encrypt");
+
+        let err = handle_get(GetArgs {
+            file: bundle,
+            project: Some("demo".to_string()),
+            key: "API_KEY".to_string(),
+            reveal: false,
+            identities: IdentityArgs::default(),
+        })
+        .expect_err("bundle runtime must require identities");
+
+        assert!(matches!(
+            err,
+            CliError::Codec(seclusor_codec::CodecError::BundleIdentityRequired)
+        ));
+    }
+
+    #[test]
+    fn handle_get_bundle_wrong_identity_does_not_disclose_secret() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("input.json");
+        let bundle = dir.path().join("secrets.age");
+        let wrong_identity_file = dir.path().join("wrong-identity.txt");
+        let secrets = fixture_secrets();
+        write_secrets_file(&input, &secrets, true).expect("write input");
+        let wrong_identity = seclusor_crypto::identity_to_string(&Identity::generate());
+        write_identity_file(&wrong_identity_file, &wrong_identity);
+
+        handle_bundle_encrypt(BundleEncryptArgs {
+            input,
+            output: bundle.clone(),
+            recipients: RecipientArgs {
+                recipients: vec![fixture_recipient_string()],
+                recipient_file: None,
+                recipient_env_var: None,
+            },
+        })
+        .expect("bundle encrypt");
+
+        let err = handle_get(GetArgs {
+            file: bundle,
+            project: Some("demo".to_string()),
+            key: "API_KEY".to_string(),
+            reveal: false,
+            identities: IdentityArgs {
+                identity_files: vec![wrong_identity_file],
+            },
+        })
+        .expect_err("wrong identity should fail");
+
+        let rendered = format!("{err}");
+        assert!(!rendered.contains("sk-123"));
     }
 
     #[test]
