@@ -50,7 +50,7 @@ seclusor-core = "0.1"     # domain types, validation
 use seclusor_crypto::{encrypt, decrypt, load_identity_file};
 
 // Encrypt a secret for one or more age recipients
-let ciphertext = encrypt(b"sk-live-abc123", &recipients)?;
+let ciphertext = encrypt(b"example-secret-value-12345", &recipients)?;
 
 // Decrypt using an identity file
 let identities = load_identity_file("~/.config/seclusor/identity.txt")?;
@@ -67,7 +67,7 @@ seclusor keys age identity generate --output ~/.config/seclusor/identity.txt
 
 # 2. Create and armor a simple secrets file
 seclusor secrets init --output secrets.json --project myapp
-seclusor secrets set --file secrets.json --project myapp --key DB_PASSWORD --value "super-secret-123"
+seclusor secrets set --file secrets.json --project myapp --key DB_PASSWORD --value "example-db-password-9xK7mP2qR8vT"
 seclusor secrets bundle encrypt --file secrets.json --output secrets.age --recipient age1...yourrecipient...
 
 # 3. Run with injected secrets (contrived example)

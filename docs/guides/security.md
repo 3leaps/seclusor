@@ -1,6 +1,6 @@
 # Security Model
 
-Seclusor is a security-sensitive library and tool for managing encrypted secrets with age. Defaults are fail-closed for malformed data, dangerous paths, and unsafe operations.
+Seclusor is a security-sensitive library and tool for managing encrypted secrets with age (**alpha** — subject to change). Defaults are fail-closed for malformed data, dangerous paths, and unsafe operations.
 
 ## Core Guardrails
 
@@ -21,7 +21,7 @@ Rekeying allows you to change the recipient set on existing armored files withou
 seclusor secrets rekey --file secrets.age --identity-file old.txt --recipient age1...new1 --recipient age1...new2
 ```
 
-See `docs/guides/key-management.md` for full rekeying workflow, especially for glassbreak credential archives.
+See `docs/guides/key-management.md` for full rekeying workflow, especially for **glassbreak credentials** (root keys, master passphrases, long-term signing keys, and emergency break-glass accounts). These are the highest-sensitivity secrets and should almost never be stored in git.
 
 ## Compromise Response
 
@@ -45,16 +45,9 @@ Old ciphertexts remain decryptable by the compromised key until rekeyed.
 
 ## Responsible Disclosure
 
-We take security issues seriously.
+See `SECURITY.md` (at repository root) for the full responsible disclosure policy and contact instructions.
 
-**Report security concerns** to the maintainers via:
-
-- Email: security@3leaps.net (preferred for sensitive reports)
-- GitHub: Open a private security advisory (if available) or contact @3leapsdave directly.
-
-Please do **not** open public issues for potential vulnerabilities.
-
-See `SECURITY.md` for full details.
+Please report potential vulnerabilities privately to `security@3leaps.net` or @3leapsdave. Do **not** open public GitHub issues for security concerns.
 
 ## Operational Practices
 
@@ -64,4 +57,4 @@ See `SECURITY.md` for full details.
 - Review release artifacts and signatures before distribution.
 
 For key management workflows see [Key Management](key-management.md).  
-For storage risk guidance see [App Note 01: Git Storage](../appnotes/01-git-armored-storage.md).
+For storage risk guidance see [App Note 01: Git Storage of Armored Secrets](../appnotes/01-git-armored-storage.md).

@@ -1,6 +1,6 @@
 # App Note 02: Runtime & Deployment Patterns
 
-**Status**: Draft  
+**Status**: Draft — subject to change (v0.1.0)  
 **Audience**: Developers, DevSecOps, platform engineers
 
 Beyond git storage, seclusor supports several secure runtime patterns.

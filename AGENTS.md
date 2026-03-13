@@ -179,7 +179,8 @@ See [Role Catalog](config/agentic/roles/README.md) for full definitions.
 ### DO
 
 - Run `cargo fmt && cargo clippy` before commits
-- Read files before editing them
+- **Read files before editing them** (mandatory)
+- **After every write or edit operation, immediately verify the change with a read or ls** (mandatory verification rule)
 - Keep changes focused on the task
 - Consider library API surface (what's `pub`)
 - Consider FFI memory safety implications

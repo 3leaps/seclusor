@@ -1,6 +1,6 @@
 # App Note 01: Git Storage of Armored Secrets — Risk Continuum
 
-**Status**: Draft  
+**Status**: Draft — subject to change (v0.1.0)  
 **Audience**: Developers, DevSecOps engineers, integrators
 
 Seclusor allows you to store encrypted ("armored") secrets alongside code. However, **git is not a secret store**. The safety of this practice exists on a continuum.
@@ -30,6 +30,8 @@ Seclusor allows you to store encrypted ("armored") secrets alongside code. Howev
 - **Guidance**: Prefer short-lived branches or external secret managers for production. Use bundle codec. Rotate keys frequently. Audit git history periodically.
 
 ### 3. High-Sensitivity (Strongly Discouraged in Git)
+
+**Glassbreak credentials** are the highest-sensitivity secrets (root keys, master passphrases, long-term signing keys, and emergency break-glass accounts).
 
 - **Examples**: Glassbreak credentials, root keys, master passphrases, long-term signing keys (primary initial use case for seclusor).
 - **Recommendation**: **Never commit to git**. Store locally with strong file permissions (0600) or in dedicated secret managers. Use `seclusor run` or library calls for injection.
