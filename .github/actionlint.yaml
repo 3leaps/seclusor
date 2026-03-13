@@ -1,0 +1,5 @@
+# actionlint configuration
+# https://github.com/rhysd/actionlint/blob/main/docs/config.md
+self-hosted-runner:
+  labels:
+    - windows-latest-arm64-s
