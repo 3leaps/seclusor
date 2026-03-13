@@ -39,3 +39,15 @@ topics:
       - decisions/ADR-0003-*.md
       - decisions/ADR-0006-*.md
       - decisions/SDR-0002-*.md
+  appnotes:
+    title: "Application Notes"
+    description: "Risk guidance, deployment patterns, and usage examples"
+    tags: [appnotes, guidance, security, deployment]
+    include:
+      - appnotes/*.md
+  releases:
+    title: "Release Notes"
+    description: "Version history and release summaries"
+    tags: [releases, changelog]
+    include:
+      - releases/*.md

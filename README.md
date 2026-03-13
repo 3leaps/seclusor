@@ -3,30 +3,37 @@
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 [![Rust: 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
 
-> **Git-trackable secrets management.**
+> **Secure secrets management with age encryption.**
 
-Seclusor encrypts secrets with [age](https://age-encryption.org/) so they can live alongside your code in version control — visible to the right people, opaque to everyone else. A library-first Rust core powers a full CLI, with first-class Go and TypeScript bindings so every part of your stack can manage secrets through the same engine.
+Seclusor is a library-first Rust project that lets developers, DevSecOps engineers, and integrators encrypt secrets with [age](https://age-encryption.org/). It provides a full CLI, secure runtime injection via `seclusor run`, and first-class bindings for Rust, Go, and TypeScript.
+
+**Important**: While armored secrets _can_ be stored in git, this is not always advisable. See [App Note 01: Git Storage of Armored Secrets](docs/appnotes/01-git-armored-storage.md) for the risk continuum and guidance by sensitivity level.
 
 **Lifecycle Phase**: `alpha` | See [VERSION](VERSION) for current version
 
 ## The Problem
 
-Secrets don't belong in plaintext, but they do belong near the code that uses them. Your options today:
+Secrets don't belong in plaintext, but they often need to live near the code that uses them. Common alternatives include:
 
-1. **HashiCorp Vault** — powerful, but requires running infrastructure and a network dependency for every decrypt
-2. **Mozilla SOPS** — git-friendly, but no library API; you shell out or parse its output
-3. **git-crypt** — transparent encryption, but no per-field visibility or multi-format support
-4. **Roll your own** — envelope encryption, key management, recipient rotation, format detection… you'll be maintaining crypto glue forever
+- **Cloud / managed secret stores** (AWS Secrets Manager, GCP Secret Manager, Azure Key Vault, HashiCorp Vault) — excellent but require network calls and infrastructure
+- **Mozilla SOPS** — git-friendly but lacks a library API (requires shelling out)
+- **git-crypt** — transparent but offers no per-field visibility or flexible formats
+- **Password managers** (1Password, Bitwarden/Vaultwarden) — great for individuals, with varying automation support
+- **HSMs** — appropriate for the highest-security keys and root material
+- **Roll your own** — time-consuming and error-prone
+
+Seclusor fills the gap for teams that want local-first, library-native, git-compatible secret management with strong defaults.
 
 ## What Seclusor Offers
 
-- **Git-trackable**: Encrypted secrets commit, branch, diff, and merge like any other file.
-- **age encryption**: X25519 recipients for team sharing, scrypt passphrases for ad-hoc use. Modern cryptography, simple key format.
-- **Two storage codecs**: Bundle (whole-file opaque `.age`) for safety, inline (`sec:age:v1:` per-field) for git-friendly diffs. Convert freely between them.
-- **Library-first**: Core logic lives in Rust crates. No shelling out — link directly from Rust, Go, or TypeScript.
-- **Full CLI**: `secrets init`, `set`, `get`, `list`, `export-env`, `run -- <cmd>` — everything you need from the command line.
-- **Safe by default**: `get` redacts values unless `--reveal` is passed. `list` never shows values. Secrets never appear in CLI args or shell history.
-- **Permissively licensed**: MIT/Apache-2.0 dual licensed. Link statically or dynamically with no additional obligations.
+- **Modern age encryption**: X25519 for team sharing and scrypt for passphrases. Strong defaults with size limits.
+- **Two storage codecs**: Bundle (opaque, safest) and inline (`sec:age:v1:`) for when you need readable structure. Convert between them easily.
+- **Library-first design**: Use `seclusor-crypto`, `seclusor-codec`, and `seclusor-keyring` directly from Rust, Go, or TypeScript. No shelling out.
+- **Secure CLI**: Full command set including `secrets run` (injects secrets without exposing them in CLI args, history, or process lists).
+- **Safe by default**: Redaction, stdout purity, no secrets in arguments, strict validation.
+- **Audience-focused**: Great for developers (local workflows), DevSecOps (secure pipelines), and integrators (library usage).
+
+For guidance on storing armored files in git, see [App Note 01](docs/appnotes/01-git-armored-storage.md). For runtime patterns see [App Note 02](docs/appnotes/02-runtime-deployment-patterns.md).
 
 ## Quick Start
 
@@ -50,30 +57,31 @@ let identities = load_identity_file("~/.config/seclusor/identity.txt")?;
 let plaintext = decrypt(&ciphertext, &identities)?;
 ```
 
-### As a CLI
+### Simplest Useful Case: Secure Local Run
+
+Create a secrets file and run a command with injected environment variables (no secrets in shell history or process list):
 
 ```bash
-# Generate an age identity
+# 1. Create identity (once)
 seclusor keys age identity generate --output ~/.config/seclusor/identity.txt
 
-# Initialize a secrets file
-seclusor secrets init --output secrets.json
+# 2. Create and armor a simple secrets file
+seclusor secrets init --output secrets.json --project myapp
+seclusor secrets set --file secrets.json --project myapp --key DB_PASSWORD --value "super-secret-123"
+seclusor secrets bundle encrypt --file secrets.json --output secrets.age --recipient age1...yourrecipient...
 
-# Manage secrets
-seclusor secrets set --file secrets.json --key API_KEY --value "sk-live-abc123"
-seclusor secrets get --file secrets.json --key API_KEY --reveal
-seclusor secrets list --file secrets.json
-
-# Export to environment
-eval $(seclusor secrets export-env --file secrets.json --format export)
-
-# Run a command with secrets injected
-seclusor secrets run --file secrets.json -- node server.js
-
-# Bundle encrypt/decrypt
-seclusor secrets bundle encrypt --file secrets.json --recipient age1...
-seclusor secrets bundle decrypt --file secrets.age --identity-file identity.txt
+# 3. Run with injected secrets (contrived example)
+seclusor secrets run \
+  --file secrets.age \
+  --identity-file ~/.config/seclusor/identity.txt \
+  --project myapp \
+  --allow DB_* \
+  -- env | grep DB_
 ```
+
+Other access methods are supported: exporting to `.env` files, library calls, or building a simple secret server.
+
+See the [App Notes](docs/appnotes/) for detailed guidance.
 
 ### Exit Codes
 
@@ -234,13 +242,13 @@ cargo audit
 
 Seclusor is part of the 3leaps platform library family:
 
-| Library                                        | Scope                       | Purpose                                           |
-| ---------------------------------------------- | --------------------------- | ------------------------------------------------- |
-| **seclusor**                                   | Secrets management          | Git-trackable secrets with age encryption         |
-| [ipcprims](https://github.com/3leaps/ipcprims) | Inter-process communication | Framed, multiplexed IPC primitives                |
-| [sysprims](https://github.com/3leaps/sysprims) | System operations           | Process control and system interaction primitives |
+| Library                                        | Scope                       | Purpose                                                   |
+| ---------------------------------------------- | --------------------------- | --------------------------------------------------------- |
+| **seclusor**                                   | Secrets management          | Age encryption, secure runner, and cross-language library |
+| [ipcprims](https://github.com/3leaps/ipcprims) | Inter-process communication | Framed, multiplexed IPC primitives                        |
+| [sysprims](https://github.com/3leaps/sysprims) | System operations           | Process control and system interaction primitives         |
 
-Seclusor is a key dependency for the [Lanyte](https://github.com/lanytehq/lanyte) secure agent platform, which uses `seclusor-crypto` and `seclusor-keyring` as direct Rust crate dependencies for session attestation and Ed25519 key management.
+Seclusor is a key dependency for the [Lanyte](https://github.com/lanytehq/lanyte) secure agent platform, which uses `seclusor-crypto` and `seclusor-keyring` directly for session attestation and glassbreak credential handling.
 
 ## License
 

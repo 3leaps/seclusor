@@ -1,18 +1,29 @@
 # Storage Codecs
 
-Seclusor supports two storage codecs:
+Seclusor supports two storage codecs. The choice has important security and usability tradeoffs.
 
-- `bundle`: encrypts the whole document into one age payload.
-- `inline`: encrypts per-value while keeping the document mostly diff-friendly.
+- **`bundle`**: Whole-file age encryption (`.age`). Opaque ciphertext.
+- **`inline`**: Per-value encryption inside a JSON document. Structure remains readable.
 
-## Bundle
+## Bundle (Recommended for most cases)
 
-Use when you want strongest accidental-leak resistance and simple operational handling.
+Best when security is the primary concern. No metadata leakage. Ideal for git, distribution, and runtime use.
+
+Use for: high-sensitivity secrets, glassbreak credentials, production bundles.
 
 ## Inline
 
-Use when you need git diffs and partial merge ergonomics. Values are prefixed with `sec:age:v1:`.
+Best when you need good git diffs, code review, and partial visibility of structure.
+
+**Warning**: Reveals which keys exist and when they change. Only suitable for low-sensitivity data.
+
+See [App Note 01: Git Storage](../appnotes/01-git-armored-storage.md) for detailed risk guidance.
 
 ## Convert
 
-Use `seclusor secrets convert` to translate between bundle and inline formats.
+```bash
+seclusor secrets convert --file secrets.json --to-codec bundle --recipient age1...
+seclusor secrets convert --file secrets.age --to-codec inline --recipient age1...
+```
+
+Use `seclusor secrets convert` to switch formats.

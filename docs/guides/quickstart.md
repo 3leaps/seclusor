@@ -1,6 +1,6 @@
 # Quick Start
 
-Seclusor stores secrets in a git-trackable JSON document and encrypts data with age.
+Seclusor encrypts secrets with age so they can be used safely in code and pipelines. **Important**: While secrets can be stored in git, this carries risk. See [App Note 01: Git Storage](../appnotes/01-git-armored-storage.md).
 
 ## Initialize a file
 
@@ -22,14 +22,28 @@ seclusor secrets get --file secrets.json --project demo --key API_KEY --reveal  
 seclusor secrets export-env --file secrets.json --project demo --format export
 ```
 
+## Simplest Useful Case: Secure Runtime Injection
+
+The most common and safest pattern is using `seclusor run` to inject secrets without exposing them in shell history or process lists.
+
+```bash
+# Run a command with secrets injected from an armored bundle
+seclusor secrets run \
+  --file secrets.age \
+  --identity-file ~/.config/seclusor/identity.txt \
+  --project demo \
+  --allow APP_* \
+  -- env | grep APP_
+```
+
+Other patterns (export to .env, library calls, or building a secret server) are also supported.
+
 ## Encrypt for sharing and runtime
 
-Bundle ciphertext can be used directly for runtime commands. Plaintext JSON still works, but
-bundle inputs require one or more identity files.
+Bundle files can be used directly as runtime input (recommended for security). Plaintext JSON works for local editing.
 
 ```bash
 seclusor secrets bundle encrypt --input secrets.json --output secrets.age --recipient age1...
 seclusor secrets export-env --file secrets.age --identity-file ./identity.txt --project demo --format export
-seclusor secrets run --file secrets.age --identity-file ./identity.txt --project demo --allow APP_API_KEY -- env | grep APP_API_KEY
 seclusor secrets bundle decrypt --input secrets.age --output secrets.json --identity-file ./identity.txt
 ```
