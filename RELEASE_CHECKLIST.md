@@ -10,6 +10,11 @@ Use this checklist before tagging and publishing any `vX.Y.Z` release.
 4. Run `make clean` then `make build` (build depends on `embed-verify`, validating docs embedding path).
 5. Release notes exist at `docs/releases/vX.Y.Z.md`.
 6. All v0.1.0 briefs (D0-D8, D5C, D5D, D5E) show done status in local planning state.
+7. Run Go bindings prep workflow and merge its PR before tagging:
+   - `make go-bindings-ci`
+   - Review and merge the auto-created PR
+   - Wait for CI green on the merge commit
+   - Confirm `bindings/go/seclusor/lib/<platform>/libseclusor_ffi.a` exists for all release platforms
 
 ## CI and Build Artifacts
 
@@ -38,4 +43,7 @@ Use this checklist before tagging and publishing any `vX.Y.Z` release.
 1. Draft release notes reflect final asset set (5 platform archives + checksums).
 2. Optional lanes (if omitted) are called out explicitly in notes.
 3. Draft verified by four-eyes (`devrev`) and security (`secrev`) for release readiness.
-4. Only after all checks pass: undraft/publish the GitHub release.
+4. Release commit carries both tags:
+   - `vX.Y.Z`
+   - `bindings/go/seclusor/vX.Y.Z`
+5. Only after all checks pass: undraft/publish the GitHub release.

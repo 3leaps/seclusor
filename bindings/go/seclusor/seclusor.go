@@ -1,10 +1,6 @@
 package seclusor
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/include
-#cgo darwin,arm64 LDFLAGS: -L${SRCDIR}/lib/local/darwin-arm64 -lseclusor_ffi
-#cgo linux,amd64 LDFLAGS: -L${SRCDIR}/lib/local/linux-amd64 -lseclusor_ffi
-#cgo linux,arm64 LDFLAGS: -L${SRCDIR}/lib/local/linux-arm64 -lseclusor_ffi
 #include "seclusor.h"
 #include <stdlib.h>
 */

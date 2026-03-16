@@ -9,7 +9,7 @@
 #   make build      - Build all crates
 
 .PHONY: all help bootstrap bootstrap-force tools check check-all test fmt fmt-check lint build build-release clean
-.PHONY: ffi-header build-ffi go-bindings-sync go-build go-test ts-build ts-test embed-verify
+.PHONY: ffi-header build-ffi go-bindings-sync go-bindings-ci go-build go-test go-test-committed ts-build ts-test embed-verify
 .PHONY: precommit prepush repo-status deny deny-all audit miri msrv
 .PHONY: check-windows check-windows-msvc check-windows-gnu
 .PHONY: install dogfood-cli
@@ -61,8 +61,10 @@ help: ## Show available targets
 	@echo "  ffi-header      Generate C header for seclusor-ffi"
 	@echo "  build-ffi       Build seclusor-ffi static and shared libraries"
 	@echo "  go-bindings-sync  Sync generated header + static lib into Go bindings"
+	@echo "  go-bindings-ci    Dispatch Go bindings prep workflow for current VERSION"
 	@echo "  go-build        Build Go bindings module"
 	@echo "  go-test         Run Go bindings tests"
+	@echo "  go-test-committed  Run Go bindings tests against committed prebuilt lib"
 	@echo "  ts-build        Build TypeScript N-API bindings"
 	@echo "  ts-test         Run TypeScript bindings tests"
 	@echo "  embed-verify    Verify docs embed manifest/build pipeline"
@@ -390,6 +392,11 @@ go-bindings-sync: build-ffi ## Sync FFI header + static lib into Go bindings
 	@cp target/release/libseclusor_ffi.a $(GO_BINDINGS_DIR)/lib/local/$(GO_PLATFORM)/libseclusor_ffi.a
 	@echo "[ok] Synced Go binding artifacts into $(GO_BINDINGS_DIR)"
 
+go-bindings-ci: ## Dispatch Go bindings prep workflow for current VERSION
+	@echo "Dispatching Go bindings prep workflow for v$(VERSION)..."
+	@gh workflow run go-bindings.yml -f version=$(VERSION)
+	@echo "[ok] Workflow dispatched"
+
 go-build: go-bindings-sync ## Build Go bindings
 	@echo "Building Go bindings..."
 	@cd $(GO_BINDINGS_DIR) && go build ./...
@@ -399,6 +406,27 @@ go-test: go-bindings-sync ## Run Go bindings tests
 	@echo "Running Go bindings tests..."
 	@cd $(GO_BINDINGS_DIR) && go test ./...
 	@echo "[ok] Go bindings tests passed"
+
+go-test-committed: ## Run Go bindings tests against committed prebuilt lib
+	@echo "Running Go bindings tests against committed lib ($(GO_PLATFORM))..."
+	@committed_lib="$(GO_BINDINGS_DIR)/lib/$(GO_PLATFORM)/libseclusor_ffi.a"; \
+	local_lib="$(GO_BINDINGS_DIR)/lib/local/$(GO_PLATFORM)/libseclusor_ffi.a"; \
+	backup_lib="$$local_lib.bak"; \
+	if [ ! -f "$$committed_lib" ]; then \
+		echo "[!!] Missing committed FFI lib: $$committed_lib"; \
+		exit 1; \
+	fi; \
+	restore() { \
+		if [ -f "$$backup_lib" ]; then \
+			mv "$$backup_lib" "$$local_lib"; \
+		fi; \
+	}; \
+	trap restore EXIT INT TERM; \
+	if [ -f "$$local_lib" ]; then \
+		mv "$$local_lib" "$$backup_lib"; \
+	fi; \
+	cd $(GO_BINDINGS_DIR) && go test ./...
+	@echo "[ok] Go bindings tests passed against committed lib"
 
 ts-build: ## Build TypeScript bindings
 	@echo "Building TypeScript bindings..."
