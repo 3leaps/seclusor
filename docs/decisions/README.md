@@ -9,6 +9,7 @@ This directory holds ADRs/SDRs/DDRs for the Rust rewrite.
 - `ADR-0003-storage-codecs-bundle-and-inline.md`
 - `ADR-0005-api-contract-schema-first.md`
 - `ADR-0006-dry-core-cli-server-and-stdout-purity.md`
+- `ADR-0008-ffi-contract-json-over-ffi-and-opaque-handles.md`
 - `ADR-0011-ed25519-signing-in-seclusor-crypto.md`
 
 ## Accepted SDRs
@@ -18,13 +19,12 @@ This directory holds ADRs/SDRs/DDRs for the Rust rewrite.
 
 ## Accepted DDRs
 
-- `DDR-0001-go-ts-delivery-strategy.md`
+- `DDR-0001-go-ts-delivery-strategy.md` (in-repo delivery, Option A)
 - `DDR-0002-ed25519-signing-contract.md`
 
 ## Proposed / Draft
 
 - `ADR-0004-sqlite-driver-and-replication.md` (proposed; Rust TBD)
 - `ADR-0007-rust-crate-decomposition.md` (draft)
-- `ADR-0008` (planned): FFI design (opaque handles vs JSON-over-FFI)
 - `ADR-0009` (planned): Error model (Rust + FFI code mapping)
 - `ADR-0010` (planned): Secret injection models (exec/eval/env-file/library/daemon)

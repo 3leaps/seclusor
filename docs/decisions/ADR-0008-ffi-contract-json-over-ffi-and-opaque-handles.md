@@ -1,6 +1,6 @@
 # ADR-0008: FFI Contract (Opaque Handles + JSON-over-FFI) and v0.1.x Stability
 
-Status: Draft
+Status: Accepted
 Date: 2026-03-04
 Owner: entarch
 
