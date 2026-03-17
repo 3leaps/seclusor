@@ -9,6 +9,7 @@ This directory holds ADRs/SDRs/DDRs for the Rust rewrite.
 - `ADR-0003-storage-codecs-bundle-and-inline.md`
 - `ADR-0005-api-contract-schema-first.md`
 - `ADR-0006-dry-core-cli-server-and-stdout-purity.md`
+- `ADR-0011-ed25519-signing-in-seclusor-crypto.md`
 
 ## Accepted SDRs
 
@@ -18,6 +19,7 @@ This directory holds ADRs/SDRs/DDRs for the Rust rewrite.
 ## Accepted DDRs
 
 - `DDR-0001-go-ts-delivery-strategy.md`
+- `DDR-0002-ed25519-signing-contract.md`
 
 ## Proposed / Draft
 
