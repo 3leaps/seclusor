@@ -28,6 +28,7 @@ Seclusor fills the gap for teams that want local-first, library-native, git-comp
 
 - **Modern age encryption**: X25519 for team sharing and scrypt for passphrases. Strong defaults with size limits.
 - **Two storage codecs**: Bundle (opaque, safest) and inline (`sec:age:v1:`) for when you need readable structure. Convert between them easily.
+- **Ed25519 signing** (`seclusor-crypto/signing` feature): Generate keypairs, sign messages, and verify signatures in Rust. Secret keys stored encrypted at rest with the existing age backend. Cross-language signing bindings planned for v0.1.2.
 - **Library-first design**: Use `seclusor-crypto`, `seclusor-codec`, and `seclusor-keyring` directly from Rust, Go, or TypeScript. No shelling out.
 - **Secure CLI**: Full command set including `secrets run` (injects secrets without exposing them in CLI args, history, or process lists).
 - **Safe by default**: Redaction, stdout purity, no secrets in arguments, strict validation.
@@ -44,6 +45,9 @@ For guidance on storing armored files in git, see [App Note 01](docs/appnotes/01
 seclusor-crypto = "0.1"   # encrypt/decrypt with age
 seclusor-keyring = "0.1"  # identity generation, recipient management
 seclusor-core = "0.1"     # domain types, validation
+
+# Optional: add Ed25519 sign/verify
+seclusor-crypto = { version = "0.1", features = ["signing"] }
 ```
 
 ```rust
@@ -55,6 +59,20 @@ let ciphertext = encrypt(b"example-secret-value-12345", &recipients)?;
 // Decrypt using an identity file
 let identities = load_identity_file("~/.config/seclusor/identity.txt")?;
 let plaintext = decrypt(&ciphertext, &identities)?;
+```
+
+Ed25519 signing (requires `features = ["signing"]`):
+
+```rust
+use seclusor_crypto::{generate_signing_keypair, sign, verify};
+
+let keypair = generate_signing_keypair()?;
+let sig = sign(keypair.secret_key(), b"payload")?;
+verify(keypair.public_key(), b"payload", &sig)?;
+
+// Keys stored encrypted at rest — serialize the seed and encrypt with age
+let seed_bytes = seclusor_crypto::signing_secret_key_to_bytes(keypair.secret_key());
+let encrypted_key = encrypt(&seed_bytes, &recipients)?;
 ```
 
 ### Simplest Useful Case: Secure Local Run
@@ -100,7 +118,7 @@ Seclusor is a Rust workspace with six crates. Library crates are the architectur
 seclusor/
 ├── crates/
 │   ├── seclusor-core/         # Domain types, validation, env export/import
-│   ├── seclusor-crypto/       # age encryption (X25519 + scrypt), identity parsing
+│   ├── seclusor-crypto/       # age encryption (X25519 + scrypt), Ed25519 signing (feature-gated)
 │   ├── seclusor-codec/        # Bundle + inline codecs, format conversion
 │   ├── seclusor-keyring/      # Key generation, recipient discovery, rekey
 │   ├── seclusor-ffi/          # C-ABI exports (cdylib + staticlib)
@@ -145,6 +163,10 @@ seclusor secrets convert --file secrets.json --to-codec bundle --recipient age1.
 
 ### Go
 
+The Go bindings (`bindings/go/seclusor`) use CGo over the `seclusor-ffi` static library and provide full access to secret document management, encryption, and keyring operations. Prebuilt static libraries for all supported platforms are committed to the repo and resolved at build time.
+
+**Phase 1 (v0.1.1)**: encryption, secret document operations (`List`, `Get`, `ExportEnv`), bundle encrypt/decrypt, and keyring management. Ed25519 signing bindings are not included and are planned for v0.1.2 (tracked as D11B).
+
 ```go
 import "github.com/3leaps/seclusor/bindings/go/seclusor"
 
@@ -160,7 +182,7 @@ env, err := handle.ExportEnv("", "", false)
 
 ### TypeScript
 
-TypeScript bindings via NAPI-RS are planned for v0.1.0.
+TypeScript bindings via NAPI-RS are in development.
 
 ## FFI Contract
 
@@ -171,7 +193,7 @@ The `seclusor-ffi` crate exposes a C-ABI surface using:
 - **Thread-local error state** via `seclusor_last_error()` with result code enum
 - **Panic-safe boundary** — all exports wrap logic in `catch_unwind`
 
-Once v0.1.0 ships, the FFI surface is treated as stable for the v0.1.x line. See [ADR-0008](docs/decisions/ADR-0008-ffi-contract-json-over-ffi-and-opaque-handles.md) for the full contract.
+The FFI surface established in v0.1.0 is treated as stable for the v0.1.x line. Ed25519 signing is not exposed over FFI in v0.1.1; signing bindings are a deliberate second pass planned for v0.1.2. See [ADR-0008](docs/decisions/ADR-0008-ffi-contract-json-over-ffi-and-opaque-handles.md) and [ADR-0011](docs/decisions/ADR-0011-ed25519-signing-in-seclusor-crypto.md) for the full contract and rationale.
 
 ## Security Model
 
@@ -183,6 +205,18 @@ Seclusor uses [age](https://age-encryption.org/) (ADR-0002):
 - **ChaCha20-Poly1305** authenticated encryption
 - **scrypt** passphrase-based encryption for ad-hoc sharing
 - **16 MiB** decrypt size limit, **1 MiB** inline value limit
+
+### Signing
+
+The `seclusor-crypto/signing` feature adds Ed25519 digital signatures (added in v0.1.1):
+
+- **Ed25519 plain mode** — 32-byte seed secret key, 32-byte public key, 64-byte signature, opaque message bytes
+- **`SigningSecretKey`** implements `Zeroize`/`ZeroizeOnDrop`; no `Debug`, `Clone`, or serde to prevent accidental key exposure
+- **Four content-free error variants** — no key material, message bytes, or signature bytes ever in error strings
+- **Key at rest** — encrypt the 32-byte seed with the existing age `encrypt()`/`decrypt()` API; no new storage format
+- Rust-native only in v0.1.1; cross-language signing bindings planned for v0.1.2
+
+See [ADR-0011](docs/decisions/ADR-0011-ed25519-signing-in-seclusor-crypto.md) and [DDR-0002](docs/decisions/DDR-0002-ed25519-signing-contract.md) for the full signing contract.
 
 ### Safety Defaults
 
