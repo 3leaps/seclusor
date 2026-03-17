@@ -8,11 +8,18 @@ repository.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[features]
+default = []
+signing = ["dep:ed25519-dalek", "dep:rand_core", "dep:zeroize"]
+
 [dependencies]
 age = { workspace = true }
 base64 = { workspace = true }
+ed25519-dalek = { version = "2", optional = true, default-features = false, features = ["rand_core", "zeroize"] }
+rand_core = { version = "0.6", optional = true, features = ["getrandom"] }
 seclusor-core = { workspace = true }
 thiserror = { workspace = true }
+zeroize = { version = "1", optional = true, features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"

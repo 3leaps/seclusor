@@ -4,6 +4,8 @@
 //! lanyte-attest) will link this crate directly.
 
 mod error;
+#[cfg(feature = "signing")]
+mod signing;
 
 use std::fs;
 use std::io::{Read, Write};
@@ -21,6 +23,13 @@ use seclusor_core::constants::{
 const MAX_IDENTITY_FILE_BYTES: u64 = 1024 * 1024;
 
 pub use error::{CryptoError, Result};
+#[cfg(feature = "signing")]
+pub use signing::{
+    generate_signing_keypair, sign, signature_from_bytes, signature_to_bytes, signing_public_key,
+    signing_public_key_from_bytes, signing_public_key_to_bytes, signing_secret_key_from_bytes,
+    signing_secret_key_to_bytes, verify, Signature, SigningKeypair, SigningPublicKey,
+    SigningSecretKey, SIGNATURE_LEN, SIGNING_PUBLIC_KEY_LEN, SIGNING_SECRET_KEY_LEN,
+};
 
 /// Type alias for X25519 recipient.
 pub type Recipient = age::x25519::Recipient;
@@ -352,6 +361,8 @@ fn read_identity_file_with_limit(path: &Path, max: u64) -> Result<String> {
 mod tests {
     use super::*;
     use std::io::Write;
+    #[cfg(feature = "signing")]
+    use zeroize::Zeroize;
 
     const TEST_IDENTITY: &str =
         "AGE-SECRET-KEY-1GQ9778VQXMMJVE8SK7J6VT8UJ4HDQAJUVSFCWCM02D8GEWQ72PVQ2Y5J33";
@@ -583,5 +594,83 @@ mod tests {
             Err(err) => err,
         };
         assert!(matches!(err, CryptoError::IdentityFileTooLarge { .. }));
+    }
+
+    #[cfg(feature = "signing")]
+    #[test]
+    fn signing_roundtrip_and_byte_contract() {
+        let kp = generate_signing_keypair().expect("generate keypair");
+        let message = b"signing payload";
+
+        let sig = sign(kp.secret_key(), message).expect("sign");
+        verify(kp.public_key(), message, &sig).expect("verify");
+
+        let secret = signing_secret_key_to_bytes(kp.secret_key());
+        let public = signing_public_key_to_bytes(kp.public_key());
+        let signature = signature_to_bytes(&sig);
+        assert_eq!(secret.len(), SIGNING_SECRET_KEY_LEN);
+        assert_eq!(public.len(), SIGNING_PUBLIC_KEY_LEN);
+        assert_eq!(signature.len(), SIGNATURE_LEN);
+    }
+
+    #[cfg(feature = "signing")]
+    #[test]
+    fn signing_from_bytes_and_verify_follow_error_contract() {
+        let err = signing_secret_key_from_bytes(&[7_u8; SIGNING_SECRET_KEY_LEN - 1])
+            .err()
+            .expect("bad secret");
+        assert!(matches!(err, CryptoError::InvalidSecretKeyBytes));
+
+        let err = match signing_public_key_from_bytes(&[7_u8; SIGNING_PUBLIC_KEY_LEN - 1]) {
+            Ok(_) => panic!("bad public must fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, CryptoError::InvalidPublicKeyBytes));
+
+        let err = match signing_public_key_from_bytes(&[0x02_u8; SIGNING_PUBLIC_KEY_LEN]) {
+            Ok(_) => panic!("malformed public key must fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, CryptoError::InvalidPublicKeyBytes));
+
+        let err = match signature_from_bytes(&[7_u8; SIGNATURE_LEN - 1]) {
+            Ok(_) => panic!("bad signature must fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, CryptoError::InvalidSignatureBytes));
+
+        let kp = generate_signing_keypair().expect("generate");
+        let sig = sign(kp.secret_key(), b"message-a").expect("sign");
+        let err = verify(kp.public_key(), b"message-b", &sig).expect_err("must fail verify");
+        assert!(matches!(err, CryptoError::SignatureVerificationFailed));
+
+        let malformed_signature =
+            signature_from_bytes(&[0xff_u8; SIGNATURE_LEN]).expect("64-byte signature parses");
+        let err = verify(kp.public_key(), b"message-a", &malformed_signature)
+            .expect_err("malformed signature must fail verify");
+        assert!(matches!(err, CryptoError::SignatureVerificationFailed));
+    }
+
+    #[cfg(feature = "signing")]
+    #[test]
+    fn signing_key_at_rest_roundtrip() {
+        let recipient = parsed_recipient();
+        let identity = parsed_identity();
+        let message = b"jwt payload bytes";
+
+        let kp = generate_signing_keypair().expect("generate");
+        let mut encoded = signing_secret_key_to_bytes(kp.secret_key()).to_vec();
+        let ciphertext = encrypt(&encoded, &[recipient]).expect("encrypt signing key");
+        encoded.zeroize();
+        assert!(encoded.iter().all(|b| *b == 0));
+
+        let mut decrypted = decrypt(&ciphertext, &[identity]).expect("decrypt signing key");
+        let secret_key = signing_secret_key_from_bytes(&decrypted).expect("rebuild signing key");
+        decrypted.zeroize();
+        assert!(decrypted.iter().all(|b| *b == 0));
+
+        let signature = sign(&secret_key, message).expect("sign");
+        let public_key = signing_public_key(&secret_key);
+        verify(&public_key, message, &signature).expect("verify");
     }
 }

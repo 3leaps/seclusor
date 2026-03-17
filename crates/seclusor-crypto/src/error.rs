@@ -66,6 +66,26 @@ pub enum CryptoError {
     #[error("invalid ciphertext")]
     InvalidCiphertext,
 
+    /// Signing secret-key bytes were malformed.
+    #[cfg(feature = "signing")]
+    #[error("invalid Ed25519 secret-key bytes")]
+    InvalidSecretKeyBytes,
+
+    /// Signing public-key bytes were malformed.
+    #[cfg(feature = "signing")]
+    #[error("invalid Ed25519 public-key bytes")]
+    InvalidPublicKeyBytes,
+
+    /// Signature bytes were malformed.
+    #[cfg(feature = "signing")]
+    #[error("invalid Ed25519 signature bytes")]
+    InvalidSignatureBytes,
+
+    /// Signature verification failed for otherwise well-formed inputs.
+    #[cfg(feature = "signing")]
+    #[error("signature verification failed")]
+    SignatureVerificationFailed,
+
     /// I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
