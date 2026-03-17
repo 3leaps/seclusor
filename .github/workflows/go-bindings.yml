@@ -176,7 +176,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="${{ needs.validate.outputs.version }}"
           header_path="$(find ffi-libs -maxdepth 2 -name seclusor.h | head -n 1)"
           if [ -z "$header_path" ]; then
             echo "ERROR: seclusor.h not found in downloaded artifacts"
@@ -211,7 +210,8 @@ jobs:
             This PR updates the prebuilt FFI libraries for the Go bindings to:
             v${{ needs.validate.outputs.version }}
 
-            Merge this PR before tagging so the release tags include the prebuilt libs and `go get` works for external consumers.
+            Merge this PR before tagging so the release tags include
+            the prebuilt libs and `go get` works for external consumers.
 
             ### Platforms Updated
             - linux-amd64 (glibc)
