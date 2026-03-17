@@ -36,18 +36,11 @@ jobs:
         run: |
           set -euo pipefail
           make ci
-      - name: Go bindings tests (PR/local rebuild path)
-        if: github.event_name == 'pull_request'
+      - name: Go bindings tests
         shell: bash
         run: |
           set -euo pipefail
           make go-test
-      - name: Go bindings tests (push/committed libs path)
-        if: github.event_name == 'push'
-        shell: bash
-        run: |
-          set -euo pipefail
-          make go-test-committed
       - name: TypeScript bindings tests
         shell: bash
         run: |
