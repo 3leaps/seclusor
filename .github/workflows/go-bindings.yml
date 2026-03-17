@@ -1,4 +1,7 @@
 name: Go Bindings (Prep)
+# NOTE: Windows arm64 is NOT supported for Go bindings.
+# MinGW does not support the arm64 target, and Go's CGo requires MinGW on Windows.
+# The release workflow builds windows-arm64 with MSVC for the CLI binary only.
 on:
   workflow_dispatch:
     inputs:
@@ -8,6 +11,7 @@ on:
         type: string
 permissions:
   contents: read
+  actions: write
 env:
   CARGO_TERM_COLOR: always
 jobs:
@@ -49,6 +53,9 @@ jobs:
             artifact_suffix: linux-arm64
     steps:
       - uses: actions/checkout@v4
+      - name: Ensure Rust target is installed
+        shell: bash
+        run: rustup target add ${{ matrix.target }}
       - name: Build FFI
         shell: bash
         run: |
@@ -158,6 +165,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      actions: read
     steps:
       - uses: actions/checkout@v4
         with:
