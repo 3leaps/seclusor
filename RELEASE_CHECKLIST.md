@@ -9,12 +9,13 @@ Use this checklist before tagging and publishing any `vX.Y.Z` release.
 3. `VERSION` matches workspace Cargo version (`make version-check`).
 4. Run `make clean` then `make build` (build depends on `embed-verify`, validating docs embedding path).
 5. Release notes exist at `docs/releases/vX.Y.Z.md`.
-6. All v0.1.0 briefs (D0-D8, D5C, D5D, D5E) show done status in local planning state.
+6. All planned briefs for this release show done status in local planning state.
 7. Run Go bindings prep workflow and merge its PR before tagging:
-   - `make go-bindings-ci`
-   - Review and merge the auto-created PR
+   - `make go-bindings-ci` (triggers GitHub Actions workflow)
+   - Review and merge the auto-created PR (adds platform `.a` files)
    - Wait for CI green on the merge commit
    - Confirm `bindings/go/seclusor/lib/<platform>/libseclusor_ffi.a` exists for all release platforms
+   - **Tag the merge commit** (not the pre-bindings commit) with both tags in step 4 of Publish Gate
 
 ## CI and Build Artifacts
 
