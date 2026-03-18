@@ -27,6 +27,24 @@ const (
 	ResultUnknown    ResultCode = 255
 )
 
+const (
+	SigningSecretKeyLen = 32
+	SigningPublicKeyLen = 32
+	SignatureLen        = 64
+)
+
+// WipeBytes best-effort zeroes a byte slice in place.
+//
+// Use this for secret-key material after encrypting it at rest or once
+// signing is complete. It does not guarantee elimination of all copies that
+// may exist due to Go runtime behavior, but it reduces retention of the
+// current slice contents.
+func WipeBytes(value []byte) {
+	for i := range value {
+		value[i] = 0
+	}
+}
+
 type Error struct {
 	Code    ResultCode
 	Message string
@@ -127,6 +145,13 @@ func freeCString(ptr *C.char) {
 	if ptr != nil {
 		C.free(unsafe.Pointer(ptr))
 	}
+}
+
+func bytesPtr(value []byte) *C.uint8_t {
+	if len(value) == 0 {
+		return nil
+	}
+	return (*C.uint8_t)(unsafe.Pointer(&value[0]))
 }
 
 func fromJSONString[T any](raw *C.char, into *T) error {
@@ -243,6 +268,59 @@ func DecryptBundle(inputCipherPath, outputJSONPath, identityFilePath string) err
 	defer C.free(unsafe.Pointer(cIdentity))
 
 	return toError(C.seclusor_decrypt_bundle(cInput, cOutput, cIdentity))
+}
+
+func GenerateSigningKeypair() ([]byte, []byte, error) {
+	secretKey := make([]byte, SigningSecretKeyLen)
+	publicKey := make([]byte, SigningPublicKeyLen)
+	if err := toError(C.seclusor_signing_generate_keypair(
+		bytesPtr(secretKey),
+		C.size_t(len(secretKey)),
+		bytesPtr(publicKey),
+		C.size_t(len(publicKey)),
+	)); err != nil {
+		return nil, nil, err
+	}
+	return secretKey, publicKey, nil
+}
+
+func SigningPublicKeyFromSecretKey(secretKey []byte) ([]byte, error) {
+	publicKey := make([]byte, SigningPublicKeyLen)
+	if err := toError(C.seclusor_signing_public_key_from_secret_key(
+		bytesPtr(secretKey),
+		C.size_t(len(secretKey)),
+		bytesPtr(publicKey),
+		C.size_t(len(publicKey)),
+	)); err != nil {
+		return nil, err
+	}
+	return publicKey, nil
+}
+
+func Sign(secretKey, message []byte) ([]byte, error) {
+	signature := make([]byte, SignatureLen)
+	if err := toError(C.seclusor_signing_sign(
+		bytesPtr(secretKey),
+		C.size_t(len(secretKey)),
+		bytesPtr(message),
+		C.size_t(len(message)),
+		bytesPtr(signature),
+		C.size_t(len(signature)),
+	)); err != nil {
+		return nil, err
+	}
+	return signature, nil
+}
+
+func Verify(publicKey, message, signature []byte) error {
+	return toError(C.seclusor_signing_verify(
+		bytesPtr(publicKey),
+		C.size_t(len(publicKey)),
+		bytesPtr(message),
+		C.size_t(len(message)),
+		bytesPtr(signature),
+		C.size_t(len(signature)),
+	))
 }
 
 func NewKeyringHandle() (*KeyringHandle, error) {

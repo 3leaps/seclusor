@@ -8,6 +8,7 @@ use std::fs;
 use std::io::Read;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
+use std::slice;
 
 use seclusor_codec::{decrypt_bundle_from_file, encrypt_bundle_to_file, CodecError};
 use seclusor_core::constants::MAX_SECRETS_DOC_BYTES;
@@ -15,7 +16,12 @@ use seclusor_core::crud::{get_credential, list_credential_keys};
 use seclusor_core::env::{export_env, EnvExportOptions};
 use seclusor_core::validate::validate_strict;
 use seclusor_core::{SeclusorError, SecretsFile};
-use seclusor_crypto::{load_identity_file, parse_recipients, CryptoError, Identity};
+use seclusor_crypto::{
+    generate_signing_keypair, load_identity_file, parse_recipients, sign, signature_from_bytes,
+    signature_to_bytes, signing_public_key, signing_public_key_from_bytes,
+    signing_public_key_to_bytes, signing_secret_key_from_bytes, signing_secret_key_to_bytes,
+    verify, CryptoError, Identity, SIGNATURE_LEN, SIGNING_PUBLIC_KEY_LEN, SIGNING_SECRET_KEY_LEN,
+};
 use seclusor_keyring::{KeyringError, Recipient};
 use serde::Serialize;
 
@@ -157,6 +163,32 @@ fn write_out_string(out_json: *mut *mut c_char, value: String) -> FfiResult<()> 
     // SAFETY: out_json validated non-null and points to caller-provided storage.
     unsafe { *out_json = raw };
     Ok(())
+}
+
+fn bytes_input<'a>(ptr: *const u8, len: usize, label: &str) -> FfiResult<&'a [u8]> {
+    if len == 0 {
+        return Ok(&[]);
+    }
+    require_non_null(ptr, label)?;
+    // SAFETY: ptr is non-null for non-zero len and points to readable input.
+    Ok(unsafe { slice::from_raw_parts(ptr, len) })
+}
+
+fn bytes_output_exact<'a>(
+    ptr: *mut u8,
+    len: usize,
+    expected: usize,
+    label: &str,
+) -> FfiResult<&'a mut [u8]> {
+    if len != expected {
+        return Err(fail(
+            SeclusorResult::InvalidArgument,
+            format!("{label}_len must be {expected}"),
+        ));
+    }
+    require_non_null(ptr, label)?;
+    // SAFETY: ptr is non-null and points to writable output storage.
+    Ok(unsafe { slice::from_raw_parts_mut(ptr, len) })
 }
 
 fn json_string<T: Serialize>(value: &T) -> FfiResult<String> {
@@ -687,6 +719,140 @@ pub extern "C" fn seclusor_decrypt_bundle(
     }
 }
 
+/// Generate a new Ed25519 signing keypair.
+///
+/// # Safety
+/// `secret_key_out` must point to a writable 32-byte buffer and
+/// `public_key_out` must point to a writable 32-byte buffer.
+#[no_mangle]
+pub unsafe extern "C" fn seclusor_signing_generate_keypair(
+    secret_key_out: *mut u8,
+    secret_key_out_len: usize,
+    public_key_out: *mut u8,
+    public_key_out_len: usize,
+) -> SeclusorResult {
+    match with_ffi_boundary(|| {
+        let secret_key_out = bytes_output_exact(
+            secret_key_out,
+            secret_key_out_len,
+            SIGNING_SECRET_KEY_LEN,
+            "secret_key_out",
+        )?;
+        let public_key_out = bytes_output_exact(
+            public_key_out,
+            public_key_out_len,
+            SIGNING_PUBLIC_KEY_LEN,
+            "public_key_out",
+        )?;
+        let keypair = generate_signing_keypair()?;
+        let mut secret_key_bytes = signing_secret_key_to_bytes(keypair.secret_key());
+        let public_key_bytes = signing_public_key_to_bytes(keypair.public_key());
+        secret_key_out.copy_from_slice(&secret_key_bytes);
+        public_key_out.copy_from_slice(&public_key_bytes);
+        secret_key_bytes.fill(0);
+        Ok(())
+    }) {
+        Ok(()) => SeclusorResult::Ok,
+        Err(code) => code,
+    }
+}
+
+/// Derive an Ed25519 public key from a canonical 32-byte secret-key seed.
+///
+/// # Safety
+/// `secret_key` must either be null with `secret_key_len == 0` or point to a
+/// readable input buffer. `public_key_out` must point to a writable 32-byte
+/// buffer.
+#[no_mangle]
+pub unsafe extern "C" fn seclusor_signing_public_key_from_secret_key(
+    secret_key: *const u8,
+    secret_key_len: usize,
+    public_key_out: *mut u8,
+    public_key_out_len: usize,
+) -> SeclusorResult {
+    match with_ffi_boundary(|| {
+        let secret_key = bytes_input(secret_key, secret_key_len, "secret_key")?;
+        let public_key_out = bytes_output_exact(
+            public_key_out,
+            public_key_out_len,
+            SIGNING_PUBLIC_KEY_LEN,
+            "public_key_out",
+        )?;
+        let secret_key = signing_secret_key_from_bytes(secret_key)?;
+        let public_key = signing_public_key(&secret_key);
+        let public_key_bytes = signing_public_key_to_bytes(&public_key);
+        public_key_out.copy_from_slice(&public_key_bytes);
+        Ok(())
+    }) {
+        Ok(()) => SeclusorResult::Ok,
+        Err(code) => code,
+    }
+}
+
+/// Sign a message with an Ed25519 secret key.
+///
+/// # Safety
+/// `secret_key` must either be null with `secret_key_len == 0` or point to a
+/// readable input buffer. `message` may be null only when `message_len == 0`.
+/// `signature_out` must point to a writable 64-byte buffer.
+#[no_mangle]
+pub unsafe extern "C" fn seclusor_signing_sign(
+    secret_key: *const u8,
+    secret_key_len: usize,
+    message: *const u8,
+    message_len: usize,
+    signature_out: *mut u8,
+    signature_out_len: usize,
+) -> SeclusorResult {
+    match with_ffi_boundary(|| {
+        let secret_key = bytes_input(secret_key, secret_key_len, "secret_key")?;
+        let message = bytes_input(message, message_len, "message")?;
+        let signature_out = bytes_output_exact(
+            signature_out,
+            signature_out_len,
+            SIGNATURE_LEN,
+            "signature_out",
+        )?;
+        let secret_key = signing_secret_key_from_bytes(secret_key)?;
+        let signature = sign(&secret_key, message)?;
+        let signature_bytes = signature_to_bytes(&signature);
+        signature_out.copy_from_slice(&signature_bytes);
+        Ok(())
+    }) {
+        Ok(()) => SeclusorResult::Ok,
+        Err(code) => code,
+    }
+}
+
+/// Verify an Ed25519 signature.
+///
+/// # Safety
+/// `public_key` and `signature` must either be null with zero lengths or point
+/// to readable input buffers. `message` may be null only when
+/// `message_len == 0`.
+#[no_mangle]
+pub unsafe extern "C" fn seclusor_signing_verify(
+    public_key: *const u8,
+    public_key_len: usize,
+    message: *const u8,
+    message_len: usize,
+    signature: *const u8,
+    signature_len: usize,
+) -> SeclusorResult {
+    match with_ffi_boundary(|| {
+        let public_key = bytes_input(public_key, public_key_len, "public_key")?;
+        let message = bytes_input(message, message_len, "message")?;
+        let signature = bytes_input(signature, signature_len, "signature")?;
+        let public_key = signing_public_key_from_bytes(public_key)?;
+        let signature = signature_from_bytes(signature)?;
+        verify(&public_key, message, &signature)?;
+        Ok(())
+    }) {
+        Ok(()) => SeclusorResult::Ok,
+        Err(code) => code,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -707,6 +873,10 @@ mod tests {
         // SAFETY: pointer originated from seclusor allocation APIs.
         unsafe { seclusor_free_string(ptr) };
         s
+    }
+
+    fn last_error_text() -> String {
+        take_json(seclusor_last_error())
     }
 
     fn write_identity_file(path: &Path, identity: &str) {
@@ -793,9 +963,164 @@ mod tests {
         // SAFETY: out pointer is valid; null json is intentional to test validation.
         let result = unsafe { seclusor_secrets_handle_new_from_json(ptr::null(), &mut out) };
         assert_eq!(result, SeclusorResult::InvalidArgument);
-        let err = seclusor_last_error();
-        let err_text = take_json(err);
+        let err_text = last_error_text();
         assert!(err_text.contains("json must not be null"));
+    }
+
+    #[test]
+    fn signing_ffi_roundtrip_and_zero_length_message() {
+        let mut secret_key = [0_u8; SIGNING_SECRET_KEY_LEN];
+        let mut public_key = [0_u8; SIGNING_PUBLIC_KEY_LEN];
+        assert_eq!(
+            unsafe {
+                seclusor_signing_generate_keypair(
+                    secret_key.as_mut_ptr(),
+                    secret_key.len(),
+                    public_key.as_mut_ptr(),
+                    public_key.len(),
+                )
+            },
+            SeclusorResult::Ok
+        );
+
+        let mut derived_public_key = [0_u8; SIGNING_PUBLIC_KEY_LEN];
+        assert_eq!(
+            unsafe {
+                seclusor_signing_public_key_from_secret_key(
+                    secret_key.as_ptr(),
+                    secret_key.len(),
+                    derived_public_key.as_mut_ptr(),
+                    derived_public_key.len(),
+                )
+            },
+            SeclusorResult::Ok
+        );
+        assert_eq!(derived_public_key, public_key);
+
+        let mut signature = [0_u8; SIGNATURE_LEN];
+        assert_eq!(
+            unsafe {
+                seclusor_signing_sign(
+                    secret_key.as_ptr(),
+                    secret_key.len(),
+                    ptr::null(),
+                    0,
+                    signature.as_mut_ptr(),
+                    signature.len(),
+                )
+            },
+            SeclusorResult::Ok
+        );
+        assert_eq!(
+            unsafe {
+                seclusor_signing_verify(
+                    public_key.as_ptr(),
+                    public_key.len(),
+                    ptr::null(),
+                    0,
+                    signature.as_ptr(),
+                    signature.len(),
+                )
+            },
+            SeclusorResult::Ok
+        );
+    }
+
+    #[test]
+    fn signing_ffi_distinguishes_invalid_argument_and_crypto_failures() {
+        let mut secret_key = [0_u8; SIGNING_SECRET_KEY_LEN];
+        let mut public_key = [0_u8; SIGNING_PUBLIC_KEY_LEN];
+        assert_eq!(
+            unsafe {
+                seclusor_signing_generate_keypair(
+                    secret_key.as_mut_ptr(),
+                    secret_key.len(),
+                    public_key.as_mut_ptr(),
+                    public_key.len(),
+                )
+            },
+            SeclusorResult::Ok
+        );
+
+        let mut short_public_key = [0_u8; SIGNING_PUBLIC_KEY_LEN - 1];
+        let result = unsafe {
+            seclusor_signing_public_key_from_secret_key(
+                secret_key.as_ptr(),
+                secret_key.len(),
+                short_public_key.as_mut_ptr(),
+                short_public_key.len(),
+            )
+        };
+        assert_eq!(result, SeclusorResult::InvalidArgument);
+        assert_eq!(last_error_text(), "public_key_out_len must be 32");
+
+        let mut signature = [0_u8; SIGNATURE_LEN];
+        let result = unsafe {
+            seclusor_signing_sign(
+                ptr::null(),
+                1,
+                ptr::null(),
+                0,
+                signature.as_mut_ptr(),
+                signature.len(),
+            )
+        };
+        assert_eq!(result, SeclusorResult::InvalidArgument);
+        assert_eq!(last_error_text(), "secret_key must not be null");
+
+        let result = unsafe {
+            seclusor_signing_sign(
+                secret_key[..SIGNING_SECRET_KEY_LEN - 1].as_ptr(),
+                SIGNING_SECRET_KEY_LEN - 1,
+                b"msg".as_ptr(),
+                3,
+                signature.as_mut_ptr(),
+                signature.len(),
+            )
+        };
+        assert_eq!(result, SeclusorResult::CryptoError);
+        assert_eq!(last_error_text(), "invalid Ed25519 secret-key bytes");
+
+        assert_eq!(
+            unsafe {
+                seclusor_signing_sign(
+                    secret_key.as_ptr(),
+                    secret_key.len(),
+                    b"msg".as_ptr(),
+                    3,
+                    signature.as_mut_ptr(),
+                    signature.len(),
+                )
+            },
+            SeclusorResult::Ok
+        );
+
+        let result = unsafe {
+            seclusor_signing_verify(
+                public_key.as_ptr(),
+                public_key.len(),
+                b"other".as_ptr(),
+                5,
+                signature.as_ptr(),
+                signature.len(),
+            )
+        };
+        assert_eq!(result, SeclusorResult::CryptoError);
+        assert_eq!(last_error_text(), "signature verification failed");
+
+        let invalid_signature = [0_u8; SIGNATURE_LEN - 1];
+        let result = unsafe {
+            seclusor_signing_verify(
+                public_key.as_ptr(),
+                public_key.len(),
+                b"msg".as_ptr(),
+                3,
+                invalid_signature.as_ptr(),
+                invalid_signature.len(),
+            )
+        };
+        assert_eq!(result, SeclusorResult::CryptoError);
+        assert_eq!(last_error_text(), "invalid Ed25519 signature bytes");
     }
 
     #[test]

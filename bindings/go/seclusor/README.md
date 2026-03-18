@@ -2,6 +2,28 @@
 
 CGo wrapper for `crates/seclusor-ffi`.
 
+Available in `v0.1.2`:
+
+- Ed25519 signing key generation
+- public-key derivation from the canonical 32-byte seed
+- sign / verify helpers over byte slices
+
+Canonical signing forms remain:
+
+- secret key: 32-byte Ed25519 seed
+- public key: 32 bytes
+- signature: 64 bytes
+
+Secret-key hygiene:
+
+- signing APIs return and accept the canonical 32-byte seed as a normal Go
+  `[]byte`
+- callers should keep secret-key slices short-lived
+- use `WipeBytes(secretKey)` promptly after age-encrypting the seed for storage
+  or after completing signing work
+- this is best-effort zeroing of the current slice contents; Go runtime behavior
+  may still leave other copies outside package control
+
 ## Local workflow
 
 1. Generate/sync FFI artifacts:

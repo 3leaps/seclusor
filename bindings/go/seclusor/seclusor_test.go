@@ -3,6 +3,7 @@
 package seclusor
 
 import (
+	"bytes"
 	"testing"
 )
 
@@ -57,5 +58,99 @@ func TestKeyringHandleStatusAndValidation(t *testing.T) {
 
 	if err := h.AddRecipient("not-a-recipient"); err == nil {
 		t.Fatalf("expected add recipient to fail for invalid input")
+	}
+}
+
+func TestSigningGenerateDeriveSignVerify(t *testing.T) {
+	secretKey, publicKey, err := GenerateSigningKeypair()
+	if err != nil {
+		t.Fatalf("GenerateSigningKeypair: %v", err)
+	}
+	if len(secretKey) != SigningSecretKeyLen {
+		t.Fatalf("unexpected secret key length: %d", len(secretKey))
+	}
+	if len(publicKey) != SigningPublicKeyLen {
+		t.Fatalf("unexpected public key length: %d", len(publicKey))
+	}
+
+	derivedPublicKey, err := SigningPublicKeyFromSecretKey(secretKey)
+	if err != nil {
+		t.Fatalf("SigningPublicKeyFromSecretKey: %v", err)
+	}
+	if !bytes.Equal(derivedPublicKey, publicKey) {
+		t.Fatalf("derived public key mismatch")
+	}
+
+	message := []byte("ffi signing message")
+	signature, err := Sign(secretKey, message)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	if len(signature) != SignatureLen {
+		t.Fatalf("unexpected signature length: %d", len(signature))
+	}
+
+	if err := Verify(publicKey, message, signature); err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+}
+
+func TestSigningEmptyMessageAndErrorCategories(t *testing.T) {
+	secretKey, publicKey, err := GenerateSigningKeypair()
+	if err != nil {
+		t.Fatalf("GenerateSigningKeypair: %v", err)
+	}
+
+	signature, err := Sign(secretKey, nil)
+	if err != nil {
+		t.Fatalf("Sign nil message: %v", err)
+	}
+	if err := Verify(publicKey, nil, signature); err != nil {
+		t.Fatalf("Verify nil message: %v", err)
+	}
+
+	_, err = Sign(secretKey[:SigningSecretKeyLen-1], []byte("msg"))
+	if err == nil {
+		t.Fatalf("expected wrong-length secret key to fail")
+	}
+	ffiErr, ok := err.(*Error)
+	if !ok || ffiErr.Code != ResultCrypto {
+		t.Fatalf("expected ResultCrypto for wrong secret key length, got %#v", err)
+	}
+
+	err = Verify(publicKey[:SigningPublicKeyLen-1], []byte("msg"), signature)
+	if err == nil {
+		t.Fatalf("expected wrong-length public key to fail")
+	}
+	ffiErr, ok = err.(*Error)
+	if !ok || ffiErr.Code != ResultCrypto {
+		t.Fatalf("expected ResultCrypto for wrong public key length, got %#v", err)
+	}
+
+	err = Verify(publicKey, []byte("msg"), signature[:SignatureLen-1])
+	if err == nil {
+		t.Fatalf("expected wrong-length signature to fail")
+	}
+	ffiErr, ok = err.(*Error)
+	if !ok || ffiErr.Code != ResultCrypto {
+		t.Fatalf("expected ResultCrypto for wrong signature length, got %#v", err)
+	}
+
+	badSignature := bytes.Repeat([]byte{0xff}, SignatureLen)
+	err = Verify(publicKey, nil, badSignature)
+	if err == nil {
+		t.Fatalf("expected semantically invalid signature to fail")
+	}
+	ffiErr, ok = err.(*Error)
+	if !ok || ffiErr.Code != ResultCrypto {
+		t.Fatalf("expected ResultCrypto for bad signature verify failure, got %#v", err)
+	}
+}
+
+func TestWipeBytesZeroesSlice(t *testing.T) {
+	value := []byte{1, 2, 3, 4}
+	WipeBytes(value)
+	if !bytes.Equal(value, []byte{0, 0, 0, 0}) {
+		t.Fatalf("expected wiped slice, got %#v", value)
 	}
 }

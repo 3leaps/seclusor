@@ -198,4 +198,59 @@ enum SeclusorResult seclusor_decrypt_bundle(const char *input_ciphertext_path,
                                             const char *output_json_path,
                                             const char *identity_file_path);
 
+/**
+ * Generate a new Ed25519 signing keypair.
+ *
+ * # Safety
+ * `secret_key_out` must point to a writable 32-byte buffer and
+ * `public_key_out` must point to a writable 32-byte buffer.
+ */
+enum SeclusorResult seclusor_signing_generate_keypair(uint8_t *secret_key_out,
+                                                      uintptr_t secret_key_out_len,
+                                                      uint8_t *public_key_out,
+                                                      uintptr_t public_key_out_len);
+
+/**
+ * Derive an Ed25519 public key from a canonical 32-byte secret-key seed.
+ *
+ * # Safety
+ * `secret_key` must either be null with `secret_key_len == 0` or point to a
+ * readable input buffer. `public_key_out` must point to a writable 32-byte
+ * buffer.
+ */
+enum SeclusorResult seclusor_signing_public_key_from_secret_key(const uint8_t *secret_key,
+                                                                uintptr_t secret_key_len,
+                                                                uint8_t *public_key_out,
+                                                                uintptr_t public_key_out_len);
+
+/**
+ * Sign a message with an Ed25519 secret key.
+ *
+ * # Safety
+ * `secret_key` must either be null with `secret_key_len == 0` or point to a
+ * readable input buffer. `message` may be null only when `message_len == 0`.
+ * `signature_out` must point to a writable 64-byte buffer.
+ */
+enum SeclusorResult seclusor_signing_sign(const uint8_t *secret_key,
+                                          uintptr_t secret_key_len,
+                                          const uint8_t *message,
+                                          uintptr_t message_len,
+                                          uint8_t *signature_out,
+                                          uintptr_t signature_out_len);
+
+/**
+ * Verify an Ed25519 signature.
+ *
+ * # Safety
+ * `public_key` and `signature` must either be null with zero lengths or point
+ * to readable input buffers. `message` may be null only when
+ * `message_len == 0`.
+ */
+enum SeclusorResult seclusor_signing_verify(const uint8_t *public_key,
+                                            uintptr_t public_key_len,
+                                            const uint8_t *message,
+                                            uintptr_t message_len,
+                                            const uint8_t *signature,
+                                            uintptr_t signature_len);
+
 #endif  /* SECLUSOR_H */

@@ -11,7 +11,7 @@ crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
 seclusor-core = { workspace = true }
-seclusor-crypto = { workspace = true }
+seclusor-crypto = { workspace = true, features = ["signing"] }
 seclusor-codec = { workspace = true }
 seclusor-keyring = { workspace = true }
 serde = { workspace = true }
