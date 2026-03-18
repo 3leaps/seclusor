@@ -509,6 +509,7 @@ version-patch: ## Bump patch version (0.1.0 -> 0.1.1)
 	new_version="$$major.$$minor.$$new_patch"; \
 	echo "$$new_version" > $(VERSION_FILE); \
 	echo "Version bumped: $$current -> $$new_version"
+	@$(MAKE) version-sync
 
 version-minor: ## Bump minor version (0.1.0 -> 0.2.0)
 	@current=$$(cat $(VERSION_FILE)); \
@@ -518,6 +519,7 @@ version-minor: ## Bump minor version (0.1.0 -> 0.2.0)
 	new_version="$$major.$$new_minor.0"; \
 	echo "$$new_version" > $(VERSION_FILE); \
 	echo "Version bumped: $$current -> $$new_version"
+	@$(MAKE) version-sync
 
 version-major: ## Bump major version (0.1.0 -> 1.0.0)
 	@current=$$(cat $(VERSION_FILE)); \
@@ -526,6 +528,7 @@ version-major: ## Bump major version (0.1.0 -> 1.0.0)
 	new_version="$$new_major.0.0"; \
 	echo "$$new_version" > $(VERSION_FILE); \
 	echo "Version bumped: $$current -> $$new_version"
+	@$(MAKE) version-sync
 
 version-set: ## Set explicit version (V=X.Y.Z)
 	@if [ -z "$(V)" ]; then \
@@ -534,6 +537,7 @@ version-set: ## Set explicit version (V=X.Y.Z)
 	fi
 	@echo "$(V)" > $(VERSION_FILE)
 	@echo "Version set to $(V)"
+	@$(MAKE) version-sync
 
 version-sync: ## Sync VERSION file to Cargo.toml and package.json
 	@ver=$$(cat $(VERSION_FILE)); \
