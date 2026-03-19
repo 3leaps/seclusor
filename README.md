@@ -9,7 +9,7 @@ Seclusor is a library-first Rust project that lets developers, DevSecOps enginee
 
 **Important**: While armored secrets _can_ be stored in git, this is not always advisable. See [App Note 01: Git Storage of Armored Secrets](docs/appnotes/01-git-armored-storage.md) for the risk continuum and guidance by sensitivity level.
 
-**Lifecycle Phase**: `alpha` | See [VERSION](VERSION) for current version
+**Lifecycle Phase**: `alpha` | Current version: **v0.1.2** (signing parity & public polish) | See [VERSION](VERSION) and [CHANGELOG.md](CHANGELOG.md)
 
 ## The Problem
 
@@ -28,7 +28,7 @@ Seclusor fills the gap for teams that want local-first, library-native, git-comp
 
 - **Modern age encryption**: X25519 for team sharing and scrypt for passphrases. Strong defaults with size limits.
 - **Two storage codecs**: Bundle (opaque, safest) and inline (`sec:age:v1:`) for when you need readable structure. Convert between them easily.
-- **Ed25519 signing** (`seclusor-crypto/signing` feature): Generate keypairs, sign messages, and verify signatures in Rust. Secret keys stored encrypted at rest with the existing age backend. Cross-language signing bindings planned for v0.1.2.
+- **Ed25519 signing** (`seclusor-crypto/signing` feature): Generate keypairs, sign messages, and verify signatures. Available in Rust (v0.1.1) and Go (v0.1.2). Secret keys are zeroized on drop and stored encrypted at rest using the existing age backend.
 - **Library-first design**: Use `seclusor-crypto`, `seclusor-codec`, and `seclusor-keyring` directly from Rust, Go, or TypeScript. No shelling out.
 - **Secure CLI**: Full command set including `secrets run` (injects secrets without exposing them in CLI args, history, or process lists).
 - **Safe by default**: Redaction, stdout purity, no secrets in arguments, strict validation.
@@ -165,7 +165,7 @@ seclusor secrets convert --file secrets.json --to-codec bundle --recipient age1.
 
 The Go bindings (`bindings/go/seclusor`) use CGo over the `seclusor-ffi` static library and provide full access to secret document management, encryption, and keyring operations. Prebuilt static libraries for all supported platforms are committed to the repo and resolved at build time.
 
-**Phase 1 (v0.1.1)**: encryption, secret document operations (`List`, `Get`, `ExportEnv`), bundle encrypt/decrypt, and keyring management. Ed25519 signing bindings are not included and are planned for v0.1.2 (tracked as D11B).
+**Current Go surface**: encryption, secret document operations (`List`, `Get`, `ExportEnv`), bundle encrypt/decrypt, keyring management, and Ed25519 signing in v0.1.2.
 
 ```go
 import "github.com/3leaps/seclusor/bindings/go/seclusor"
@@ -193,7 +193,7 @@ The `seclusor-ffi` crate exposes a C-ABI surface using:
 - **Thread-local error state** via `seclusor_last_error()` with result code enum
 - **Panic-safe boundary** — all exports wrap logic in `catch_unwind`
 
-The FFI surface established in v0.1.0 is treated as stable for the v0.1.x line. Ed25519 signing is not exposed over FFI in v0.1.1; signing bindings are a deliberate second pass planned for v0.1.2. See [ADR-0008](docs/decisions/ADR-0008-ffi-contract-json-over-ffi-and-opaque-handles.md) and [ADR-0011](docs/decisions/ADR-0011-ed25519-signing-in-seclusor-crypto.md) for the full contract and rationale.
+The FFI surface established in v0.1.0 is treated as stable for the v0.1.x line. Ed25519 signing was intentionally excluded from the first v0.1.1 FFI pass, then added in v0.1.2 after the Rust-side signing contract was reviewed. See [ADR-0008](docs/decisions/ADR-0008-ffi-contract-json-over-ffi-and-opaque-handles.md) and [ADR-0011](docs/decisions/ADR-0011-ed25519-signing-in-seclusor-crypto.md) for the full contract and rationale.
 
 ## Security Model
 
@@ -214,7 +214,7 @@ The `seclusor-crypto/signing` feature adds Ed25519 digital signatures (added in 
 - **`SigningSecretKey`** implements `Zeroize`/`ZeroizeOnDrop`; no `Debug`, `Clone`, or serde to prevent accidental key exposure
 - **Four content-free error variants** — no key material, message bytes, or signature bytes ever in error strings
 - **Key at rest** — encrypt the 32-byte seed with the existing age `encrypt()`/`decrypt()` API; no new storage format
-- Rust-native only in v0.1.1; cross-language signing bindings planned for v0.1.2
+- Rust-native in v0.1.1; Go signing bindings added in v0.1.2. TypeScript signing remains out of scope.
 
 See [ADR-0011](docs/decisions/ADR-0011-ed25519-signing-in-seclusor-crypto.md) and [DDR-0002](docs/decisions/DDR-0002-ed25519-signing-contract.md) for the full signing contract.
 

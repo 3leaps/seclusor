@@ -6,6 +6,22 @@ All notable changes to seclusor will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.1.2] - 2026-03-19
+
+### Added
+
+- Go bindings for Ed25519 signing workflows (D12)
+- Signing parity tests between Rust and Go implementations
+- The Go `seclusor` bindings now expose `GenerateSigningKeypair`, `Sign`, `Verify`, `SigningPublicKeyFromSecretKey`, and `WipeBytes`
+- Full test coverage ensuring Rust and Go agree on key, signature, and error semantics
+
+### Changed
+
+- Public repo polish pass trimmed stale license allowances from `deny.toml`
+- Updated top-level documentation and release notes to reflect shipped Go signing support in v0.1.2
+
+See `docs/releases/v0.1.2.md` for full notes.
+
 ## [Unreleased]
 
 _(No changes yet)_
