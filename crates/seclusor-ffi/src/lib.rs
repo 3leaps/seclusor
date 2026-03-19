@@ -1027,6 +1027,51 @@ mod tests {
     }
 
     #[test]
+    fn signing_ffi_verify_accepts_null_zero_length_message() {
+        let secret_key: [u8; SIGNING_SECRET_KEY_LEN] = std::array::from_fn(|index| index as u8);
+        let mut public_key = [0_u8; SIGNING_PUBLIC_KEY_LEN];
+        assert_eq!(
+            unsafe {
+                seclusor_signing_public_key_from_secret_key(
+                    secret_key.as_ptr(),
+                    secret_key.len(),
+                    public_key.as_mut_ptr(),
+                    public_key.len(),
+                )
+            },
+            SeclusorResult::Ok
+        );
+
+        let mut signature = [0_u8; SIGNATURE_LEN];
+        assert_eq!(
+            unsafe {
+                seclusor_signing_sign(
+                    secret_key.as_ptr(),
+                    secret_key.len(),
+                    ptr::null(),
+                    0,
+                    signature.as_mut_ptr(),
+                    signature.len(),
+                )
+            },
+            SeclusorResult::Ok
+        );
+        assert_eq!(
+            unsafe {
+                seclusor_signing_verify(
+                    public_key.as_ptr(),
+                    public_key.len(),
+                    ptr::null(),
+                    0,
+                    signature.as_ptr(),
+                    signature.len(),
+                )
+            },
+            SeclusorResult::Ok
+        );
+    }
+
+    #[test]
     fn signing_ffi_distinguishes_invalid_argument_and_crypto_failures() {
         let mut secret_key = [0_u8; SIGNING_SECRET_KEY_LEN];
         let mut public_key = [0_u8; SIGNING_PUBLIC_KEY_LEN];

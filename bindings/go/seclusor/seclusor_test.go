@@ -4,6 +4,7 @@ package seclusor
 
 import (
 	"bytes"
+	"encoding/hex"
 	"testing"
 )
 
@@ -144,6 +145,41 @@ func TestSigningEmptyMessageAndErrorCategories(t *testing.T) {
 	ffiErr, ok = err.(*Error)
 	if !ok || ffiErr.Code != ResultCrypto {
 		t.Fatalf("expected ResultCrypto for bad signature verify failure, got %#v", err)
+	}
+}
+
+func TestSigningDeterministicVector(t *testing.T) {
+	secretKey := []byte{
+		0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+		0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+		0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+		0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+	}
+	message := []byte("d12 deterministic signing vector")
+
+	publicKey, err := SigningPublicKeyFromSecretKey(secretKey)
+	if err != nil {
+		t.Fatalf("SigningPublicKeyFromSecretKey: %v", err)
+	}
+	signature, err := Sign(secretKey, message)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+
+	wantPublicKey, err := hex.DecodeString("03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8")
+	if err != nil {
+		t.Fatalf("decode public key: %v", err)
+	}
+	wantSignature, err := hex.DecodeString("e158fc7f04a9f0797b0e8e83bff679fa01bf7c60d8ab91d5efd7b90ce3227a025b6e10cb23e83d36fb50cb2f0e97a2a6da684861d60b136ccf82e1a79331b802")
+	if err != nil {
+		t.Fatalf("decode signature: %v", err)
+	}
+
+	if !bytes.Equal(publicKey, wantPublicKey) {
+		t.Fatalf("unexpected public key: %x", publicKey)
+	}
+	if !bytes.Equal(signature, wantSignature) {
+		t.Fatalf("unexpected signature: %x", signature)
 	}
 }
 
