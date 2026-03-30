@@ -4,6 +4,7 @@ use seclusor_codec::{decrypt_bundle_from_file, encrypt_bundle_to_file};
 use seclusor_core::constants::MAX_SECRETS_DOC_BYTES;
 use seclusor_core::crud::{get_credential, list_credential_keys};
 use seclusor_core::env::{export_env, EnvExportOptions};
+use seclusor_core::error::sanitize_serde_json_error_message;
 use seclusor_core::validate::validate_strict;
 use seclusor_core::SecretsFile;
 use seclusor_crypto::{load_identity_file, parse_recipients};
@@ -43,7 +44,12 @@ fn parse_and_validate(input_json: &str) -> napi::Result<SecretsFile> {
         )));
     }
     let parsed: SecretsFile = serde_json::from_str(input_json)
-        .map_err(|e| Error::from_reason(format!("invalid JSON: {e}")))?;
+        .map_err(|e| {
+            Error::from_reason(format!(
+                "invalid JSON: {}",
+                sanitize_serde_json_error_message(&e.to_string())
+            ))
+        })?;
     validate_strict(&parsed).map_err(|e| Error::from_reason(e.to_string()))?;
     Ok(parsed)
 }
