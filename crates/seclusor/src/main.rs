@@ -624,16 +624,21 @@ fn handle_list(args: ListArgs) -> CliResult<()> {
 }
 
 fn handle_unset(args: UnsetArgs) -> CliResult<()> {
-    let mut secrets = read_secrets_file(&args.file)?;
-    let _ = get_credential(&secrets, args.project.as_deref(), &args.key)?;
-    let removed = unset_credential(&mut secrets, args.project.as_deref(), &args.key)?;
-    if !removed {
-        return Err(CliError::Message("credential was not removed".to_string()));
+    match read_secrets_file(&args.file) {
+        Ok(mut secrets) => {
+            let _ = get_credential(&secrets, args.project.as_deref(), &args.key)?;
+            let removed = unset_credential(&mut secrets, args.project.as_deref(), &args.key)?;
+            if !removed {
+                return Err(CliError::Message("credential was not removed".to_string()));
+            }
+            validate_strict(&secrets)?;
+            write_secrets_file(&args.file, &secrets, false)?;
+            println!("ok");
+            Ok(())
+        }
+        Err(err) if should_use_lenient_unset(&err) => handle_unset_lenient(args),
+        Err(err) => Err(err),
     }
-    validate_strict(&secrets)?;
-    write_secrets_file(&args.file, &secrets, false)?;
-    println!("ok");
-    Ok(())
 }
 
 fn handle_validate(args: ValidateArgs) -> CliResult<()> {
@@ -956,6 +961,19 @@ fn write_secrets_file(path: &Path, secrets: &SecretsFile, create_new: bool) -> C
     Ok(())
 }
 
+fn write_json_value_file(path: &Path, value: &serde_json::Value) -> CliResult<()> {
+    let data = serde_json::to_vec_pretty(value)?;
+    if data.len() > MAX_SECRETS_DOC_BYTES {
+        return Err(CliError::Core(SeclusorError::DocumentTooLarge {
+            actual: data.len(),
+            max: MAX_SECRETS_DOC_BYTES,
+        }));
+    }
+
+    fs::write(path, data)?;
+    Ok(())
+}
+
 fn read_file_with_limit(path: &Path, max: usize) -> CliResult<Vec<u8>> {
     let mut file = fs::File::open(path)?;
     let mut limited = std::io::Read::by_ref(&mut file).take((max as u64) + 1);
@@ -968,6 +986,110 @@ fn read_file_with_limit(path: &Path, max: usize) -> CliResult<Vec<u8>> {
         }));
     }
     Ok(buf)
+}
+
+fn handle_unset_lenient(args: UnsetArgs) -> CliResult<()> {
+    eprintln!("warning: file contains malformed credentials; using lenient parse");
+
+    let bytes = read_file_with_limit(&args.file, MAX_SECRETS_DOC_BYTES)?;
+    let mut root: serde_json::Value = serde_json::from_slice(&bytes)?;
+    remove_credential_lenient(&mut root, args.project.as_deref(), &args.key)?;
+    write_json_value_file(&args.file, &root)?;
+
+    if let Err(err) = read_secrets_file(&args.file) {
+        eprintln!(
+            "warning: file still contains malformed credentials after removing {:?}: {}",
+            args.key, err
+        );
+        return Err(CliError::Message(format!(
+            "file still contains malformed credentials after removing {:?}",
+            args.key
+        )));
+    }
+
+    println!("ok");
+    Ok(())
+}
+
+fn should_use_lenient_unset(err: &CliError) -> bool {
+    match err {
+        CliError::Json(_) => true,
+        CliError::Core(SeclusorError::Validation(message)) => {
+            message.contains("credential ") || message.contains("credentials[")
+        }
+        _ => false,
+    }
+}
+
+fn remove_credential_lenient(
+    root: &mut serde_json::Value,
+    project_slug: Option<&str>,
+    key: &str,
+) -> CliResult<()> {
+    let projects = root
+        .get_mut("projects")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| {
+            CliError::Message("lenient unset requires a top-level projects array".to_string())
+        })?;
+
+    let project_index = resolve_lenient_project_index(projects, project_slug)?;
+    let project = &mut projects[project_index];
+    let credentials = project
+        .get_mut("credentials")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| {
+            CliError::Message(
+                "lenient unset requires each project to contain a credentials object".to_string(),
+            )
+        })?;
+
+    if credentials.remove(key).is_some() {
+        return Ok(());
+    }
+
+    let available = available_credential_keys(credentials);
+    if available.is_empty() {
+        return Err(CliError::Message(format!(
+            "credential {key:?} not found; project has no credential keys"
+        )));
+    }
+
+    Err(CliError::Message(format!(
+        "credential {key:?} not found; available keys: {}",
+        available.join(", ")
+    )))
+}
+
+fn resolve_lenient_project_index(
+    projects: &[serde_json::Value],
+    requested_slug: Option<&str>,
+) -> CliResult<usize> {
+    if let Some(slug) = requested_slug {
+        return projects
+            .iter()
+            .position(|project| {
+                project
+                    .get("project_slug")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(slug)
+            })
+            .ok_or_else(|| CliError::Core(SeclusorError::ProjectNotFound(slug.to_string())));
+    }
+
+    if projects.len() == 1 {
+        return Ok(0);
+    }
+
+    Err(CliError::Core(SeclusorError::AmbiguousProject(
+        projects.len(),
+    )))
+}
+
+fn available_credential_keys(
+    credentials: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<String> {
+    credentials.keys().cloned().collect()
 }
 
 #[cfg(test)]
@@ -1278,7 +1400,7 @@ mod tests {
         let path = dir.path().join("invalid.json");
         write_raw_json(
             &path,
-            r#"{"schema_version":"v1.0.0","projects":[{"project_slug":"demo","credentials":{"CLOUDFLARE_API_TOKEN":"cfat_secret_token"}}]}"#,
+            r#"{"schema_version":"v1.0.0","projects":"cfat_secret_token"}"#,
         );
 
         let err = handle_set(SetArgs {
@@ -1298,6 +1420,34 @@ mod tests {
     }
 
     #[test]
+    fn handle_bundle_encrypt_bare_string_credential_has_helpful_error() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("invalid.json");
+        let output = dir.path().join("secrets.age");
+        write_raw_json(
+            &input,
+            r#"{"schema_version":"v1.0.0","projects":[{"project_slug":"demo","credentials":{"CLOUDFLARE_API_TOKEN":"cfat_secret_token"}}]}"#,
+        );
+
+        let err = handle_bundle_encrypt(BundleEncryptArgs {
+            input,
+            output,
+            recipients: RecipientArgs {
+                recipients: vec![fixture_recipient_string()],
+                recipient_file: None,
+                recipient_env_var: None,
+            },
+        })
+        .expect_err("must reject malformed credential");
+
+        let rendered = err.to_string();
+        assert!(!rendered.contains("cfat_secret_token"));
+        assert!(rendered.contains(r#"credential "CLOUDFLARE_API_TOKEN" must be an object"#));
+        assert!(rendered
+            .contains("Use: seclusor secrets set --key CLOUDFLARE_API_TOKEN --value <value>"));
+    }
+
+    #[test]
     fn handle_unset_rejects_invalid_document() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("invalid.json");
@@ -1313,6 +1463,72 @@ mod tests {
         })
         .expect_err("must reject invalid document");
         assert!(matches!(err, CliError::Core(SeclusorError::Validation(_))));
+    }
+
+    #[test]
+    fn handle_unset_leniently_removes_malformed_credential() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("invalid.json");
+        write_raw_json(
+            &path,
+            r#"{"schema_version":"v1.0.0","projects":[{"project_slug":"demo","credentials":{"CLOUDFLARE_API_TOKEN":"cfat_secret_token","API_KEY":{"type":"secret","value":"sk-123"}}}]}"#,
+        );
+
+        handle_unset(UnsetArgs {
+            file: path.clone(),
+            project: Some("demo".to_string()),
+            key: "CLOUDFLARE_API_TOKEN".to_string(),
+        })
+        .expect("lenient unset should succeed");
+
+        let secrets = read_secrets_file(&path).expect("file should be valid after removal");
+        assert!(!secrets.projects[0]
+            .credentials
+            .contains_key("CLOUDFLARE_API_TOKEN"));
+        assert!(secrets.projects[0].credentials.contains_key("API_KEY"));
+    }
+
+    #[test]
+    fn handle_unset_leniently_repairs_validation_failure_credentials() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("invalid.json");
+        write_raw_json(
+            &path,
+            r#"{"schema_version":"v1.0.0","projects":[{"project_slug":"demo","credentials":{"BAD":{"type":"secret"},"API_KEY":{"type":"secret","value":"sk-123"}}}]}"#,
+        );
+
+        handle_unset(UnsetArgs {
+            file: path.clone(),
+            project: Some("demo".to_string()),
+            key: "BAD".to_string(),
+        })
+        .expect("lenient unset should repair validation failure");
+
+        let secrets = read_secrets_file(&path).expect("file should be valid after removal");
+        assert!(!secrets.projects[0].credentials.contains_key("BAD"));
+        assert!(secrets.projects[0].credentials.contains_key("API_KEY"));
+    }
+
+    #[test]
+    fn handle_unset_lenient_returns_error_if_file_still_invalid() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("invalid.json");
+        write_raw_json(
+            &path,
+            r#"{"schema_version":"v1.0.0","projects":[{"project_slug":"demo","credentials":{"BAD_ONE":"cfat_one","BAD_TWO":"cfat_two"}}]}"#,
+        );
+
+        let err = handle_unset(UnsetArgs {
+            file: path.clone(),
+            project: Some("demo".to_string()),
+            key: "BAD_ONE".to_string(),
+        })
+        .expect_err("must fail if file remains invalid");
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("file still contains malformed credentials"));
+        assert!(!rendered.contains("cfat_one"));
+        assert!(!rendered.contains("cfat_two"));
     }
 
     #[test]

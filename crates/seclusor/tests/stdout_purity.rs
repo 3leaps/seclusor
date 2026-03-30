@@ -140,3 +140,72 @@ fn invalid_document_failure_writes_diagnostics_to_stderr_only() {
         "stderr should include diagnostics"
     );
 }
+
+#[test]
+fn unset_lenient_recovery_keeps_plaintext_off_output() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let invalid = dir.path().join("invalid.json");
+    fs::write(
+        &invalid,
+        r#"{"schema_version":"v1.0.0","projects":[{"project_slug":"demo","credentials":{"CLOUDFLARE_API_TOKEN":"cfat_secret_token","API_KEY":{"type":"secret","value":"sk-123"}}}]}"#,
+    )
+    .expect("write invalid fixture");
+
+    let output = run_seclusor(&[
+        "secrets",
+        "unset",
+        "--file",
+        invalid.to_str().expect("utf8 path"),
+        "--project",
+        "demo",
+        "--key",
+        "CLOUDFLARE_API_TOKEN",
+    ]);
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert_eq!(stdout, "ok\n");
+
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(stderr.contains("warning: file contains malformed credentials; using lenient parse"));
+    assert!(!stderr.contains("cfat_secret_token"));
+
+    let repaired = fs::read_to_string(&invalid).expect("read repaired file");
+    assert!(!repaired.contains("CLOUDFLARE_API_TOKEN"));
+    assert!(!repaired.contains("cfat_secret_token"));
+}
+
+#[test]
+fn unset_lenient_recovery_fails_when_other_malformed_credentials_remain() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let invalid = dir.path().join("invalid.json");
+    fs::write(
+        &invalid,
+        r#"{"schema_version":"v1.0.0","projects":[{"project_slug":"demo","credentials":{"BAD_ONE":"cfat_one","BAD_TWO":"cfat_two"}}]}"#,
+    )
+    .expect("write invalid fixture");
+
+    let output = run_seclusor(&[
+        "secrets",
+        "unset",
+        "--file",
+        invalid.to_str().expect("utf8 path"),
+        "--project",
+        "demo",
+        "--key",
+        "BAD_ONE",
+    ]);
+    assert!(!output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).expect("utf8 stdout"), "");
+
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(stderr.contains("warning: file contains malformed credentials; using lenient parse"));
+    assert!(stderr.contains("file still contains malformed credentials after removing"));
+    assert!(!stderr.contains("cfat_one"));
+    assert!(!stderr.contains("cfat_two"));
+
+    let repaired = fs::read_to_string(&invalid).expect("read repaired file");
+    assert!(!repaired.contains("BAD_ONE"));
+    assert!(!repaired.contains("cfat_one"));
+    assert!(repaired.contains("BAD_TWO"));
+}

@@ -973,9 +973,7 @@ mod tests {
 
     #[test]
     fn last_error_redacts_plaintext_strings_in_json_errors() {
-        let json = cstring(
-            r#"{"schema_version":"v1.0.0","projects":[{"project_slug":"demo","credentials":{"CLOUDFLARE_API_TOKEN":"cfat_secret_token"}}]}"#,
-        );
+        let json = cstring(r#"{"schema_version":"v1.0.0","projects":"cfat_secret_token"}"#);
         let mut handle: *mut SeclusorSecretsHandle = ptr::null_mut();
 
         let result = unsafe { seclusor_secrets_handle_new_from_json(json.as_ptr(), &mut handle) };

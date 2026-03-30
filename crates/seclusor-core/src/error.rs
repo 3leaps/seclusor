@@ -110,7 +110,7 @@ mod tests {
 
     #[test]
     fn serde_json_error_redacts_plaintext_strings() {
-        let json = r#"{"schema_version":"v1.0.0","projects":[{"project_slug":"demo","credentials":{"CLOUDFLARE_API_TOKEN":"cfat_secret_token"}}]}"#;
+        let json = r#"{"schema_version":"v1.0.0","projects":"cfat_secret_token"}"#;
         let err: SeclusorError = serde_json::from_str::<SecretsFile>(json)
             .expect_err("must fail")
             .into();
@@ -121,7 +121,7 @@ mod tests {
 
     #[test]
     fn serde_json_error_redacts_plaintext_scalar_values() {
-        let json = r#"{"schema_version":"v1.0.0","projects":[{"project_slug":"demo","credentials":{"CLOUDFLARE_API_TOKEN":{"type":"secret","value":123456789}}}]}"#;
+        let json = r#"{"schema_version":"v1.0.0","projects":123456789}"#;
         let err: SeclusorError = serde_json::from_str::<SecretsFile>(json)
             .expect_err("must fail")
             .into();
@@ -129,7 +129,7 @@ mod tests {
         assert!(!rendered.contains("123456789"));
         assert!(rendered.contains("integer `<redacted>`"));
 
-        let json = r#"{"schema_version":"v1.0.0","projects":[{"project_slug":"demo","credentials":{"CLOUDFLARE_API_TOKEN":{"type":"secret","value":true}}}]}"#;
+        let json = r#"{"schema_version":"v1.0.0","projects":true}"#;
         let err: SeclusorError = serde_json::from_str::<SecretsFile>(json)
             .expect_err("must fail")
             .into();

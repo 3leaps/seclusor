@@ -24,6 +24,7 @@ pub struct Project {
     pub project_slug: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(deserialize_with = "deserialize_credentials_map")]
     pub credentials: BTreeMap<String, Credential>,
 }
 
@@ -145,6 +146,55 @@ impl<'de> Deserialize<'de> for Credential {
         }
 
         deserializer.deserialize_map(CredentialVisitor)
+    }
+}
+
+fn deserialize_credentials_map<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, Credential>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw: BTreeMap<String, serde_json::Value> = BTreeMap::deserialize(deserializer)?;
+    let mut credentials = BTreeMap::new();
+
+    for (key, value) in raw {
+        if !value.is_object() {
+            return Err(de::Error::custom(credential_shape_message(
+                &key,
+                Some(value_kind(&value)),
+            )));
+        }
+
+        let credential = serde_json::from_value::<Credential>(value)
+            .map_err(|_| de::Error::custom(credential_shape_message(&key, None)))?;
+        credentials.insert(key, credential);
+    }
+
+    Ok(credentials)
+}
+
+fn credential_shape_message(key: &str, actual_kind: Option<&str>) -> String {
+    let mut message = format!(
+        "credential {key:?} must be an object with \"type\" plus either \"value\" or \"ref\" string fields"
+    );
+    if let Some(kind) = actual_kind {
+        message.push_str(&format!(", not {kind}"));
+    }
+    message.push_str(&format!(
+        ". Use: seclusor secrets set --key {key} --value <value>"
+    ));
+    message
+}
+
+fn value_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
     }
 }
 
@@ -270,6 +320,18 @@ mod tests {
         let json = r#"["secret1", "secret2"]"#;
         let result: std::result::Result<Credential, _> = serde_json::from_str(json);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn bare_string_credential_error_names_key_and_hint() {
+        let json = r#"{"schema_version":"v1.0.0","projects":[{"project_slug":"demo","credentials":{"CLOUDFLARE_API_TOKEN":"cfat_example123"}}]}"#;
+        let result: std::result::Result<SecretsFile, _> = serde_json::from_str(json);
+        let err = result.expect_err("must fail").to_string();
+        assert!(err.contains(r#"credential "CLOUDFLARE_API_TOKEN" must be an object"#));
+        assert!(
+            err.contains(r#"Use: seclusor secrets set --key CLOUDFLARE_API_TOKEN --value <value>"#)
+        );
+        assert!(!err.contains("cfat_example123"));
     }
 
     #[test]

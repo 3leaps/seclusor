@@ -85,6 +85,8 @@ seclusor keys age identity generate --output ~/.config/seclusor/identity.txt
 
 # 2. Create and armor a simple secrets file
 seclusor secrets init --output secrets.json --project myapp
+# Add credentials with `secrets set`; the JSON shape is an object like:
+# {"DB_PASSWORD":{"type":"secret","value":"..."}}
 seclusor secrets set --file secrets.json --project myapp --key DB_PASSWORD --value "example-db-password-9xK7mP2qR8vT"
 seclusor secrets bundle encrypt --file secrets.json --output secrets.age --recipient age1...yourrecipient...
 

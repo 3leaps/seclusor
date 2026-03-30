@@ -535,7 +535,7 @@ mod tests {
 
     #[test]
     fn deserialize_json_redacts_plaintext_strings_in_errors() {
-        let json = br#"{"schema_version":"v1.0.0","projects":[{"project_slug":"demo","credentials":{"CLOUDFLARE_API_TOKEN":"cfat_secret_token"}}]}"#;
+        let json = br#"{"schema_version":"v1.0.0","projects":"cfat_secret_token"}"#;
         let err = deserialize_json(json).expect_err("must fail");
         let rendered = err.to_string();
         assert!(!rendered.contains("cfat_secret_token"));
