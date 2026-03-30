@@ -9,6 +9,7 @@ use std::path::Path;
 use seclusor_core::constants::{
     INLINE_CIPHERTEXT_PREFIX, MAX_BUNDLE_CIPHERTEXT_BYTES, MAX_SECRETS_DOC_BYTES,
 };
+use seclusor_core::error::sanitize_serde_json_error_message;
 use seclusor_core::validate::validate_strict;
 use seclusor_core::{SeclusorError, SecretsFile};
 use seclusor_crypto::{CryptoError, Identity, Recipient};
@@ -62,7 +63,7 @@ pub enum CodecError {
 
     /// JSON parse/serialize error.
     #[error("json error: {0}")]
-    Json(#[from] serde_json::Error),
+    Json(String),
 
     /// I/O error.
     #[error("I/O error: {0}")]
@@ -71,6 +72,12 @@ pub enum CodecError {
 
 /// Result type alias for codec operations.
 pub type Result<T> = std::result::Result<T, CodecError>;
+
+impl From<serde_json::Error> for CodecError {
+    fn from(value: serde_json::Error) -> Self {
+        CodecError::Json(sanitize_serde_json_error_message(&value.to_string()))
+    }
+}
 
 /// Serialize a secrets file into canonical JSON bytes for bundle payloads.
 pub fn serialize_canonical_json(secrets: &SecretsFile) -> Result<Vec<u8>> {
@@ -524,6 +531,15 @@ mod tests {
         let idx_a = text.find("\"A_KEY\"").expect("A_KEY present");
         let idx_b = text.find("\"B_KEY\"").expect("B_KEY present");
         assert!(idx_a < idx_b);
+    }
+
+    #[test]
+    fn deserialize_json_redacts_plaintext_strings_in_errors() {
+        let json = br#"{"schema_version":"v1.0.0","projects":"cfat_secret_token"}"#;
+        let err = deserialize_json(json).expect_err("must fail");
+        let rendered = err.to_string();
+        assert!(!rendered.contains("cfat_secret_token"));
+        assert!(rendered.contains("string \"<redacted>\""));
     }
 
     #[test]

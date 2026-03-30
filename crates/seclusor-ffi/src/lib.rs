@@ -14,6 +14,7 @@ use seclusor_codec::{decrypt_bundle_from_file, encrypt_bundle_to_file, CodecErro
 use seclusor_core::constants::MAX_SECRETS_DOC_BYTES;
 use seclusor_core::crud::{get_credential, list_credential_keys};
 use seclusor_core::env::{export_env, EnvExportOptions};
+use seclusor_core::error::sanitize_serde_json_error_message;
 use seclusor_core::validate::validate_strict;
 use seclusor_core::{SeclusorError, SecretsFile};
 use seclusor_crypto::{
@@ -248,7 +249,7 @@ impl From<SeclusorError> for FfiError {
                 SeclusorResult::ValidationError,
                 format!("document exceeds maximum size {max} (actual: {actual})"),
             ),
-            SeclusorError::Json(err) => fail(SeclusorResult::JsonError, err.to_string()),
+            SeclusorError::Json(err) => fail(SeclusorResult::JsonError, err),
             SeclusorError::Io(err) => fail(SeclusorResult::IoError, err.to_string()),
         }
     }
@@ -265,7 +266,7 @@ impl From<CodecError> for FfiError {
         match value {
             CodecError::Core(err) => FfiError::from(err),
             CodecError::Crypto(err) => FfiError::from(err),
-            CodecError::Json(err) => fail(SeclusorResult::JsonError, err.to_string()),
+            CodecError::Json(err) => fail(SeclusorResult::JsonError, err),
             CodecError::Io(err) => fail(SeclusorResult::IoError, err.to_string()),
             other => fail(SeclusorResult::CodecError, other.to_string()),
         }
@@ -285,7 +286,10 @@ impl From<KeyringError> for FfiError {
 
 impl From<serde_json::Error> for FfiError {
     fn from(value: serde_json::Error) -> Self {
-        fail(SeclusorResult::JsonError, value.to_string())
+        fail(
+            SeclusorResult::JsonError,
+            sanitize_serde_json_error_message(&value.to_string()),
+        )
     }
 }
 
@@ -965,6 +969,20 @@ mod tests {
         assert_eq!(result, SeclusorResult::InvalidArgument);
         let err_text = last_error_text();
         assert!(err_text.contains("json must not be null"));
+    }
+
+    #[test]
+    fn last_error_redacts_plaintext_strings_in_json_errors() {
+        let json = cstring(r#"{"schema_version":"v1.0.0","projects":"cfat_secret_token"}"#);
+        let mut handle: *mut SeclusorSecretsHandle = ptr::null_mut();
+
+        let result = unsafe { seclusor_secrets_handle_new_from_json(json.as_ptr(), &mut handle) };
+        assert_eq!(result, SeclusorResult::JsonError);
+        assert!(handle.is_null());
+
+        let err_text = last_error_text();
+        assert!(!err_text.contains("cfat_secret_token"));
+        assert!(err_text.contains("string \"<redacted>\""));
     }
 
     #[test]

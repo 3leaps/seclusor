@@ -8,6 +8,10 @@ Seclusor encrypts secrets with age so they can be used safely in code and pipeli
 seclusor secrets init --file secrets.json --project demo --env-prefix APP_
 ```
 
+Add credentials with `seclusor secrets set` rather than hand-writing bare
+`"KEY": "value"` pairs. Each JSON credential is an object such as
+`{"API_KEY":{"type":"secret","value":"sk-123"}}`.
+
 ## Set and read secrets
 
 ```bash
