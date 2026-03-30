@@ -93,10 +93,13 @@ assert.throws(
 );
 
 const malformed = `{"schema_version":"v1.0.0","projects":"cfat_secret_token"}`;
-assert.throws(() => seclusor.validateSecretsJson(malformed), (error) => {
-	assert.match(error.message, /string "<redacted>"/);
-	assert.doesNotMatch(error.message, /cfat_secret_token/);
-	return true;
-});
+assert.throws(
+	() => seclusor.validateSecretsJson(malformed),
+	(error) => {
+		assert.match(error.message, /string "<redacted>"/);
+		assert.doesNotMatch(error.message, /cfat_secret_token/);
+		return true;
+	},
+);
 
 console.log("TypeScript binding integration tests passed");
