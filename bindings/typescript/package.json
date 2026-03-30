@@ -1,6 +1,6 @@
 {
   "name": "@3leaps/seclusor",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "TypeScript N-API bindings for seclusor",
   "main": "index.js",
   "types": "index.d.ts",

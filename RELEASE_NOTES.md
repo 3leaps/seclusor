@@ -2,11 +2,16 @@
 
 **Content policy**: This file contains the most recent 3 releases (reverse chronological). Older releases are archived in `docs/releases/vX.Y.Z.md`.
 
-## Current Patch Work
+## v0.1.3 (March 2026)
 
-- Tightened one JSON error-reporting path so malformed input does not leak secret material into console-facing diagnostics or binding error output
-- This is a defensive patch only; no schema or API contract changes are intended
-- Release messaging remains intentionally high level
+**Error redaction and credential recovery** — Plugs a secret-leak vector in JSON error messages, adds actionable credential format errors, and introduces lenient `unset` for malformed files.
+
+- **Security**: serde JSON errors across CLI, FFI, and TypeScript bindings no longer echo plaintext values from malformed input
+- **Credential recovery**: `secrets unset` now falls back to raw JSON manipulation when a file contains malformed credential entries, enabling CLI-only repair without viewing secrets
+- **Better error guidance**: credential validation errors report the key name, expected shape, and a `secrets set` hint — never the value
+- **Process**: feature branch model and updated release checklist
+
+See `docs/releases/v0.1.3.md` for full notes.
 
 ## v0.1.2 (March 2026)
 
@@ -30,16 +35,4 @@ See `docs/releases/v0.1.2.md` for full notes.
 
 See `docs/releases/v0.1.1.md` for full notes.
 
-## v0.1.0 (March 2026)
-
-**Initial MVP release** — Rust rewrite of the seclusor secrets management library.
-
-- Library-first design with strong Rust core and bindings for Go + TypeScript
-- Age encryption with bundle and inline codecs
-- Secure `seclusor run` for secret injection without CLI exposure
-- Comprehensive security model and app notes (including git storage risk guidance)
-- Embedded `seclusor docs` command
-
-See `docs/releases/v0.1.0.md` for full notes.
-
-_(This file is kept short per project convention.)_
+_(Older releases archived in `docs/releases/`. This file is kept short per project convention.)_
