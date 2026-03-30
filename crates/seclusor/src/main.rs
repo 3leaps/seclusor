@@ -9,7 +9,7 @@ use seclusor_codec::{
     convert_inline_to_bundle, decrypt_bundle_from_file, decrypt_inline, encrypt_bundle_to_file,
     encrypt_inline, resolve_runtime_source_from_file, StorageCodec,
 };
-use seclusor_core::constants::{DEFAULT_CREDENTIAL_TYPE, MAX_SECRETS_DOC_BYTES};
+use seclusor_core::constants::{DEFAULT_CREDENTIAL_TYPE, MAX_SECRETS_DOC_BYTES, SCHEMA_VERSION};
 use seclusor_core::crud::{get_credential, list_credential_keys, set_credential, unset_credential};
 use seclusor_core::env::{
     export_env, format_env_vars, import_env_vars, parse_dotenv, EnvExportOptions, EnvFilter,
@@ -636,7 +636,11 @@ fn handle_unset(args: UnsetArgs) -> CliResult<()> {
             println!("ok");
             Ok(())
         }
-        Err(err) if should_use_lenient_unset(&err) => handle_unset_lenient(args),
+        Err(err)
+            if should_use_lenient_unset(&args.file, args.project.as_deref(), &args.key, &err) =>
+        {
+            handle_unset_lenient(args)
+        }
         Err(err) => Err(err),
     }
 }
@@ -998,11 +1002,11 @@ fn handle_unset_lenient(args: UnsetArgs) -> CliResult<()> {
 
     if let Err(err) = read_secrets_file(&args.file) {
         eprintln!(
-            "warning: file still contains malformed credentials after removing {:?}: {}",
+            "warning: file was updated, but malformed credentials remain after removing {:?}: {}",
             args.key, err
         );
         return Err(CliError::Message(format!(
-            "file still contains malformed credentials after removing {:?}",
+            "file was updated, but malformed credentials remain after removing {:?}",
             args.key
         )));
     }
@@ -1011,14 +1015,73 @@ fn handle_unset_lenient(args: UnsetArgs) -> CliResult<()> {
     Ok(())
 }
 
-fn should_use_lenient_unset(err: &CliError) -> bool {
+fn should_use_lenient_unset(
+    path: &Path,
+    project_slug: Option<&str>,
+    key: &str,
+    err: &CliError,
+) -> bool {
     match err {
         CliError::Json(_) => true,
-        CliError::Core(SeclusorError::Validation(message)) => {
-            message.contains("credential ") || message.contains("credentials[")
+        CliError::Core(SeclusorError::Validation(_)) => {
+            target_credential_requires_lenient_repair(path, project_slug, key).unwrap_or(false)
         }
         _ => false,
     }
+}
+
+fn target_credential_requires_lenient_repair(
+    path: &Path,
+    project_slug: Option<&str>,
+    key: &str,
+) -> CliResult<bool> {
+    let bytes = read_file_with_limit(path, MAX_SECRETS_DOC_BYTES)?;
+    let root: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let Some(raw_credential) = target_credential_value(&root, project_slug, key)? else {
+        return Ok(false);
+    };
+
+    if !raw_credential.is_object() {
+        return Ok(true);
+    }
+
+    let credential = match serde_json::from_value::<Credential>(raw_credential.clone()) {
+        Ok(credential) => credential,
+        Err(_) => return Ok(true),
+    };
+
+    let mut probe = SecretsFile::new("lenient-unset-probe");
+    probe.schema_version = SCHEMA_VERSION.to_string();
+    probe.projects[0]
+        .credentials
+        .insert(key.to_string(), credential);
+    Ok(validate_strict(&probe).is_err())
+}
+
+fn target_credential_value<'a>(
+    root: &'a serde_json::Value,
+    project_slug: Option<&str>,
+    key: &str,
+) -> CliResult<Option<&'a serde_json::Value>> {
+    let projects = root
+        .get("projects")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            CliError::Message("lenient unset requires a top-level projects array".to_string())
+        })?;
+
+    let project_index = resolve_lenient_project_index(projects, project_slug)?;
+    let project = &projects[project_index];
+    let credentials = project
+        .get("credentials")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            CliError::Message(
+                "lenient unset requires each project to contain a credentials object".to_string(),
+            )
+        })?;
+
+    Ok(credentials.get(key))
 }
 
 fn remove_credential_lenient(
@@ -1526,7 +1589,7 @@ mod tests {
         .expect_err("must fail if file remains invalid");
 
         let rendered = err.to_string();
-        assert!(rendered.contains("file still contains malformed credentials"));
+        assert!(rendered.contains("file was updated, but malformed credentials remain"));
         assert!(!rendered.contains("cfat_one"));
         assert!(!rendered.contains("cfat_two"));
     }

@@ -200,7 +200,7 @@ fn unset_lenient_recovery_fails_when_other_malformed_credentials_remain() {
 
     let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
     assert!(stderr.contains("warning: file contains malformed credentials; using lenient parse"));
-    assert!(stderr.contains("file still contains malformed credentials after removing"));
+    assert!(stderr.contains("file was updated, but malformed credentials remain after removing"));
     assert!(!stderr.contains("cfat_one"));
     assert!(!stderr.contains("cfat_two"));
 

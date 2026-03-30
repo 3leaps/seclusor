@@ -6,7 +6,9 @@ pub fn sanitize_serde_json_error_message(message: &str) -> String {
     let message = sanitize_delimited_value(&message, "floating point `", '`');
     let message = sanitize_delimited_value(&message, "boolean `", '`');
     let message = sanitize_delimited_value(&message, "character `", '`');
-    sanitize_delimited_value(&message, "byte array `", '`')
+    let message = sanitize_delimited_value(&message, "byte array `", '`');
+    let message = sanitize_segment_after_marker(&message, "invalid type: ");
+    sanitize_segment_after_marker(&message, "invalid value: ")
 }
 
 fn sanitize_delimited_value(message: &str, prefix: &str, delimiter: char) -> String {
@@ -44,6 +46,32 @@ fn sanitize_delimited_value(message: &str, prefix: &str, delimiter: char) -> Str
                 break;
             }
         }
+    }
+
+    output.push_str(remaining);
+    output
+}
+
+fn sanitize_segment_after_marker(message: &str, marker: &str) -> String {
+    let mut output = String::with_capacity(message.len());
+    let mut remaining = message;
+
+    while let Some(start) = remaining.find(marker) {
+        output.push_str(&remaining[..start + marker.len()]);
+        let after = &remaining[start + marker.len()..];
+        let end = after
+            .find(", expected")
+            .or_else(|| after.find(" at line "))
+            .unwrap_or(after.len());
+        let segment = &after[..end];
+
+        if segment.contains("<redacted>") {
+            output.push_str(segment);
+        } else {
+            output.push_str("<redacted>");
+        }
+
+        remaining = &after[end..];
     }
 
     output.push_str(remaining);
@@ -105,7 +133,7 @@ impl From<serde_json::Error> for SeclusorError {
 
 #[cfg(test)]
 mod tests {
-    use super::SeclusorError;
+    use super::{sanitize_serde_json_error_message, SeclusorError};
     use crate::SecretsFile;
 
     #[test]
@@ -136,5 +164,16 @@ mod tests {
         let rendered = err.to_string();
         assert!(!rendered.contains("`true`"));
         assert!(rendered.contains("boolean `<redacted>`"));
+    }
+
+    #[test]
+    fn serde_json_error_generic_marker_redaction_is_defense_in_depth() {
+        let message =
+            r#"invalid type: borrowed secret token, expected something else at line 3 column 9"#;
+        let rendered = sanitize_serde_json_error_message(message);
+        assert_eq!(
+            rendered,
+            "invalid type: <redacted>, expected something else at line 3 column 9"
+        );
     }
 }
