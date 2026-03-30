@@ -24,7 +24,9 @@ See `docs/releases/v0.1.2.md` for full notes.
 
 ## [Unreleased]
 
-_(No changes yet)_
+### Security
+
+- Patched a JSON error-reporting path so secret material is not echoed to console output or surfaced through binding error state when malformed input triggers serde parsing failures
 
 ## [0.1.1] - 2026-03-17
 

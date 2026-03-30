@@ -2,6 +2,12 @@
 
 **Content policy**: This file contains the most recent 3 releases (reverse chronological). Older releases are archived in `docs/releases/vX.Y.Z.md`.
 
+## Current Patch Work
+
+- Tightened one JSON error-reporting path so malformed input does not leak secret material into console-facing diagnostics or binding error output
+- This is a defensive patch only; no schema or API contract changes are intended
+- Release messaging remains intentionally high level
+
 ## v0.1.2 (March 2026)
 
 **Signing parity and public repo polish** — Completes Go signing bindings and tightens the public-facing docs and license policy output.

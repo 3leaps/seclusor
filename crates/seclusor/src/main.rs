@@ -15,6 +15,7 @@ use seclusor_core::env::{
     export_env, format_env_vars, import_env_vars, parse_dotenv, EnvExportOptions, EnvFilter,
     EnvFormat,
 };
+use seclusor_core::error::sanitize_serde_json_error_message;
 use seclusor_core::validate::validate_strict;
 use seclusor_core::{Credential, SeclusorError, SecretsFile};
 use seclusor_crypto::{load_identity_file, parse_recipients, CryptoError, Identity};
@@ -51,14 +52,20 @@ enum CliError {
     Keyring(#[from] KeyringError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
-    #[error(transparent)]
-    Json(#[from] serde_json::Error),
+    #[error("json error: {0}")]
+    Json(String),
 
     #[error("command failed with exit code {0}")]
     CommandFailed(i32),
 }
 
 type CliResult<T> = std::result::Result<T, CliError>;
+
+impl From<serde_json::Error> for CliError {
+    fn from(value: serde_json::Error) -> Self {
+        CliError::Json(sanitize_serde_json_error_message(&value.to_string()))
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "seclusor", version)]
@@ -1263,6 +1270,31 @@ mod tests {
         })
         .expect_err("must reject invalid document");
         assert!(matches!(err, CliError::Core(SeclusorError::Validation(_))));
+    }
+
+    #[test]
+    fn handle_set_redacts_plaintext_strings_in_json_errors() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("invalid.json");
+        write_raw_json(
+            &path,
+            r#"{"schema_version":"v1.0.0","projects":[{"project_slug":"demo","credentials":{"CLOUDFLARE_API_TOKEN":"cfat_secret_token"}}]}"#,
+        );
+
+        let err = handle_set(SetArgs {
+            file: path,
+            project: Some("demo".to_string()),
+            key: "NEW_KEY".to_string(),
+            credential_type: "secret".to_string(),
+            value: Some("new-value".to_string()),
+            reference: None,
+            create_project: false,
+        })
+        .expect_err("must reject malformed document");
+
+        let rendered = err.to_string();
+        assert!(!rendered.contains("cfat_secret_token"));
+        assert!(rendered.contains("string \"<redacted>\""));
     }
 
     #[test]

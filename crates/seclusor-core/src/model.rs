@@ -1,5 +1,7 @@
-use serde::{Deserialize, Serialize};
+use serde::de::{self, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
+use std::fmt;
 
 use crate::constants::{INLINE_CIPHERTEXT_PREFIX, SCHEMA_VERSION};
 
@@ -26,8 +28,7 @@ pub struct Project {
 }
 
 /// A single credential with either a value or a reference.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Credential {
     #[serde(rename = "type")]
     pub credential_type: String,
@@ -38,6 +39,113 @@ pub struct Credential {
     pub reference: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for Credential {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &["type", "value", "ref", "description"];
+
+        enum Field {
+            Type,
+            Value,
+            Ref,
+            Description,
+        }
+
+        impl<'de> Deserialize<'de> for Field {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                struct FieldVisitor;
+
+                impl Visitor<'_> for FieldVisitor {
+                    type Value = Field;
+
+                    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                        formatter.write_str("a credential field")
+                    }
+
+                    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+                    where
+                        E: de::Error,
+                    {
+                        match value {
+                            "type" => Ok(Field::Type),
+                            "value" => Ok(Field::Value),
+                            "ref" => Ok(Field::Ref),
+                            "description" => Ok(Field::Description),
+                            _ => Err(de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+
+                deserializer.deserialize_identifier(FieldVisitor)
+            }
+        }
+
+        struct CredentialVisitor;
+
+        impl<'de> Visitor<'de> for CredentialVisitor {
+            type Value = Credential;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a credential object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut credential_type = None;
+                let mut value = None;
+                let mut reference = None;
+                let mut description = None;
+
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        Field::Type => {
+                            if credential_type.is_some() {
+                                return Err(de::Error::duplicate_field("type"));
+                            }
+                            credential_type = Some(map.next_value()?);
+                        }
+                        Field::Value => {
+                            if value.is_some() {
+                                return Err(de::Error::duplicate_field("value"));
+                            }
+                            value = Some(map.next_value()?);
+                        }
+                        Field::Ref => {
+                            if reference.is_some() {
+                                return Err(de::Error::duplicate_field("ref"));
+                            }
+                            reference = Some(map.next_value()?);
+                        }
+                        Field::Description => {
+                            if description.is_some() {
+                                return Err(de::Error::duplicate_field("description"));
+                            }
+                            description = Some(map.next_value()?);
+                        }
+                    }
+                }
+
+                Ok(Credential {
+                    credential_type: credential_type
+                        .ok_or_else(|| de::Error::missing_field("type"))?,
+                    value: value.unwrap_or(None),
+                    reference: reference.unwrap_or(None),
+                    description: description.unwrap_or(None),
+                })
+            }
+        }
+
+        deserializer.deserialize_map(CredentialVisitor)
+    }
 }
 
 impl SecretsFile {
@@ -153,6 +261,13 @@ mod tests {
     #[test]
     fn deny_unknown_fields() {
         let json = r#"{"type": "secret", "value": "x", "unknown": true}"#;
+        let result: std::result::Result<Credential, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn reject_array_form_credentials() {
+        let json = r#"["secret1", "secret2"]"#;
         let result: std::result::Result<Credential, _> = serde_json::from_str(json);
         assert!(result.is_err());
     }
