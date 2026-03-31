@@ -4,12 +4,12 @@
 
 ## v0.1.3 (March 2026)
 
-**Error redaction and credential recovery** — Plugs a secret-leak vector in JSON error messages, adds actionable credential format errors, and introduces lenient `unset` for malformed files.
+**Error redaction, credential recovery, and description metadata** — Plugs a secret-leak vector in JSON error messages, adds actionable credential repair flows, and exposes credential descriptions cleanly in the CLI.
 
 - **Security**: serde JSON errors across CLI, FFI, and TypeScript bindings no longer echo plaintext values from malformed input
 - **Credential recovery**: `secrets unset` now falls back to raw JSON manipulation when a file contains malformed credential entries, enabling CLI-only repair without viewing secrets
 - **Better error guidance**: credential validation errors report the key name, expected shape, and a `secrets set` hint — never the value
-- **Process**: feature branch model and updated release checklist
+- **Description metadata**: `secrets set --description`, `secrets get --show-description`, and `secrets list --verbose` now expose credential descriptions with shared normalization and validation
 
 See `docs/releases/v0.1.3.md` for full notes.
 
