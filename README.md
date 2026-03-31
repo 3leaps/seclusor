@@ -87,7 +87,12 @@ seclusor keys age identity generate --output ~/.config/seclusor/identity.txt
 seclusor secrets init --output secrets.json --project myapp
 # Add credentials with `secrets set`; the JSON shape is an object like:
 # {"DB_PASSWORD":{"type":"secret","value":"..."}}
-seclusor secrets set --file secrets.json --project myapp --key DB_PASSWORD --value "example-db-password-9xK7mP2qR8vT"
+seclusor secrets set \
+  --file secrets.json \
+  --project myapp \
+  --key DB_PASSWORD \
+  --value "example-db-password-9xK7mP2qR8vT" \
+  --description "primary application database password"
 seclusor secrets bundle encrypt --file secrets.json --output secrets.age --recipient age1...yourrecipient...
 
 # 3. Run with injected secrets (contrived example)
@@ -224,6 +229,8 @@ See [ADR-0011](docs/decisions/ADR-0011-ed25519-signing-in-seclusor-crypto.md) an
 
 - Secrets never appear in CLI arguments or shell history
 - `get` redacts by default; `--reveal` required to see values
+- `get --show-description` prints description metadata only
+- `list --verbose` prints `KEY<TAB>description` without exposing values
 - `list` never shows values
 - Identity files require `0600` permissions on Unix
 - Key material is never written to the repository root (pathguard)

@@ -4,6 +4,9 @@ use crate::constants::*;
 use crate::error::SeclusorError;
 use crate::model::{Credential, SecretsFile};
 
+const MAX_CREDENTIAL_DESCRIPTION_LEN: usize = 128;
+const MAX_DOCSTRING_DESCRIPTION_LEN: usize = 512;
+
 /// Check if a credential key matches the required pattern `^[A-Z_][A-Z0-9_]*$`.
 pub fn is_valid_credential_key(key: &str) -> bool {
     if key.is_empty() {
@@ -40,6 +43,50 @@ pub fn validate_strict(sf: &SecretsFile) -> crate::error::Result<()> {
     Ok(())
 }
 
+/// Normalize optional description input for storage.
+///
+/// Empty and whitespace-only values normalize to `None`. Non-empty values are trimmed.
+pub fn normalize_description(input: Option<&str>) -> Option<String> {
+    input
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+/// Validate a single-line credential description.
+pub fn validate_credential_description(desc: &str) -> crate::error::Result<()> {
+    if desc.chars().count() > MAX_CREDENTIAL_DESCRIPTION_LEN {
+        return Err(SeclusorError::Validation(format!(
+            "description must not exceed {MAX_CREDENTIAL_DESCRIPTION_LEN} characters"
+        )));
+    }
+
+    if desc.chars().any(is_disallowed_credential_description_char) {
+        return Err(SeclusorError::Validation(
+            "description must be single-line and must not contain control characters or non-breaking spaces".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Validate a file/project docstring description.
+pub fn validate_docstring_description(desc: &str) -> crate::error::Result<()> {
+    if desc.chars().count() > MAX_DOCSTRING_DESCRIPTION_LEN {
+        return Err(SeclusorError::Validation(format!(
+            "description must not exceed {MAX_DOCSTRING_DESCRIPTION_LEN} characters"
+        )));
+    }
+
+    if desc.chars().any(is_disallowed_docstring_description_char) {
+        return Err(SeclusorError::Validation(
+            "description must not contain tabs, non-newline control characters, or non-breaking spaces".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
 fn validate_schema_version(sf: &SecretsFile, errors: &mut Vec<SeclusorError>) {
     if sf.schema_version.trim() != sf.schema_version {
         errors.push(SeclusorError::Validation(
@@ -50,6 +97,12 @@ fn validate_schema_version(sf: &SecretsFile, errors: &mut Vec<SeclusorError>) {
             "unsupported schema_version {:?}",
             sf.schema_version
         )));
+    }
+
+    if let Some(description) = sf.description.as_deref() {
+        if let Err(err) = validate_docstring_description(description) {
+            errors.push(SeclusorError::Validation(format!("description {}", err)));
+        }
     }
 }
 
@@ -92,6 +145,15 @@ fn validate_projects(sf: &SecretsFile, errors: &mut Vec<SeclusorError>) {
                 "duplicate project_slug {:?}",
                 project.project_slug
             )));
+        }
+
+        if let Some(description) = project.description.as_deref() {
+            if let Err(err) = validate_docstring_description(description) {
+                errors.push(SeclusorError::Validation(format!(
+                    "projects[{}].description {}",
+                    i, err
+                )));
+            }
         }
 
         if project.credentials.len() > MAX_CREDENTIALS_PER_PROJECT {
@@ -181,6 +243,23 @@ fn validate_credential_entry(
             }
         }
     }
+
+    if let Some(description) = cred.description.as_deref() {
+        if let Err(err) = validate_credential_description(description) {
+            errors.push(SeclusorError::Validation(format!(
+                "{}.description {}",
+                ctx, err
+            )));
+        }
+    }
+}
+
+fn is_disallowed_credential_description_char(ch: char) -> bool {
+    ch == '\u{00A0}' || ch.is_control()
+}
+
+fn is_disallowed_docstring_description_char(ch: char) -> bool {
+    ch == '\u{00A0}' || (ch.is_control() && ch != '\n')
 }
 
 #[cfg(test)]
@@ -205,6 +284,48 @@ mod tests {
                 credentials: creds,
             }],
         }
+    }
+
+    #[test]
+    fn normalize_description_trims_and_clears_empty_values() {
+        assert_eq!(normalize_description(None), None);
+        assert_eq!(normalize_description(Some("")), None);
+        assert_eq!(normalize_description(Some("   ")), None);
+        assert_eq!(
+            normalize_description(Some("  demo token  ")),
+            Some("demo token".to_string())
+        );
+    }
+
+    #[test]
+    fn credential_description_validation_rejects_multiline_and_nbsp() {
+        let err = validate_credential_description("hello\nworld").unwrap_err();
+        assert!(err.to_string().contains("single-line"));
+
+        let err = validate_credential_description("hello\u{00A0}world").unwrap_err();
+        assert!(err.to_string().contains("non-breaking spaces"));
+    }
+
+    #[test]
+    fn description_limits_count_characters_not_bytes() {
+        let unicode_credential = "界".repeat(128);
+        validate_credential_description(&unicode_credential)
+            .expect("128 unicode scalar values should be accepted");
+        let err = validate_credential_description(&format!("{unicode_credential}界")).unwrap_err();
+        assert!(err.to_string().contains("128 characters"));
+
+        let unicode_doc = "界".repeat(512);
+        validate_docstring_description(&unicode_doc)
+            .expect("512 unicode scalar values should be accepted");
+        let err = validate_docstring_description(&format!("{unicode_doc}界")).unwrap_err();
+        assert!(err.to_string().contains("512 characters"));
+    }
+
+    #[test]
+    fn docstring_description_validation_allows_newlines_but_rejects_tabs() {
+        validate_docstring_description("line one\nline two").expect("newline should be allowed");
+        let err = validate_docstring_description("line\tone").unwrap_err();
+        assert!(err.to_string().contains("tabs"));
     }
 
     #[test]
@@ -240,6 +361,69 @@ mod tests {
         let errors = validate(&sf);
         assert_eq!(errors.len(), 1);
         assert!(errors[0].to_string().contains("unsupported schema_version"));
+    }
+
+    #[test]
+    fn validates_credential_description_field() {
+        let mut sf = valid_file();
+        sf.projects[0]
+            .credentials
+            .get_mut("API_KEY")
+            .unwrap()
+            .description = Some("operator note".to_string());
+        assert!(validate(&sf).is_empty());
+
+        sf.projects[0]
+            .credentials
+            .get_mut("API_KEY")
+            .unwrap()
+            .description = Some("bad\ttext".to_string());
+        let errors = validate(&sf);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0]
+            .to_string()
+            .contains(r#"projects[0].credentials["API_KEY"].description"#));
+    }
+
+    #[test]
+    fn validates_file_and_project_description_fields() {
+        let mut sf = valid_file();
+        sf.description = Some("line one\nline two".to_string());
+        sf.projects[0].description = Some("project overview\nwith newline".to_string());
+        assert!(validate(&sf).is_empty());
+
+        sf.description = Some("bad\tfile description".to_string());
+        let errors = validate(&sf);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].to_string().starts_with("description "));
+
+        sf.description = None;
+        sf.projects[0].description = Some("bad\tproject description".to_string());
+        let errors = validate(&sf);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].to_string().contains("projects[0].description"));
+    }
+
+    #[test]
+    fn schema_description_constraints_cover_docstrings_and_credentials() {
+        let schema: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../schemas/seclusor/v1.0.0/secrets.schema.json"
+        ))
+        .expect("schema json should parse");
+
+        assert_eq!(schema["properties"]["description"]["maxLength"], 512);
+        assert_eq!(
+            schema["$defs"]["project"]["properties"]["description"]["maxLength"],
+            512
+        );
+        assert_eq!(
+            schema["$defs"]["credential"]["properties"]["description"]["maxLength"],
+            128
+        );
+        assert_eq!(
+            schema["$defs"]["credential"]["properties"]["description"]["pattern"],
+            "^[^\\u0000-\\u001F\\u007F\\u00A0]*$"
+        );
     }
 
     #[test]

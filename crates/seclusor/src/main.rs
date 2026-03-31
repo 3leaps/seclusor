@@ -10,13 +10,15 @@ use seclusor_codec::{
     encrypt_inline, resolve_runtime_source_from_file, StorageCodec,
 };
 use seclusor_core::constants::{DEFAULT_CREDENTIAL_TYPE, MAX_SECRETS_DOC_BYTES, SCHEMA_VERSION};
-use seclusor_core::crud::{get_credential, list_credential_keys, set_credential, unset_credential};
+use seclusor_core::crud::{
+    get_credential, list_credential_keys, resolve_project_index, set_credential, unset_credential,
+};
 use seclusor_core::env::{
     export_env, format_env_vars, import_env_vars, parse_dotenv, EnvExportOptions, EnvFilter,
     EnvFormat,
 };
 use seclusor_core::error::sanitize_serde_json_error_message;
-use seclusor_core::validate::validate_strict;
+use seclusor_core::validate::{normalize_description, validate_strict};
 use seclusor_core::{Credential, SeclusorError, SecretsFile};
 use seclusor_crypto::{load_identity_file, parse_recipients, CryptoError, Identity};
 use seclusor_keyring::{
@@ -181,7 +183,7 @@ struct InitArgs {
     force: bool,
 }
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Parser, Clone)]
 struct SetArgs {
     #[arg(long, default_value = DEFAULT_SECRETS_FILE)]
     file: PathBuf,
@@ -195,6 +197,8 @@ struct SetArgs {
     value: Option<String>,
     #[arg(long = "ref")]
     reference: Option<String>,
+    #[arg(long)]
+    description: Option<String>,
     #[arg(long, default_value_t = false)]
     create_project: bool,
 }
@@ -209,6 +213,8 @@ struct GetArgs {
     key: String,
     #[arg(long, default_value_t = false)]
     reveal: bool,
+    #[arg(long, default_value_t = false, conflicts_with = "reveal")]
+    show_description: bool,
     #[command(flatten)]
     identities: IdentityArgs,
 }
@@ -219,6 +225,8 @@ struct ListArgs {
     file: PathBuf,
     #[arg(long)]
     project: Option<String>,
+    #[arg(long, short = 'v', default_value_t = false)]
+    verbose: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -569,7 +577,7 @@ fn handle_init(args: InitArgs) -> CliResult<()> {
 
     let mut secrets = SecretsFile::new(&args.project);
     secrets.env_prefix = args.env_prefix;
-    secrets.description = args.description;
+    secrets.description = normalize_description(args.description.as_deref());
     validate_strict(&secrets)?;
     write_secrets_file(&args.file, &secrets, !args.force)?;
     println!("{}", args.file.display());
@@ -578,7 +586,10 @@ fn handle_init(args: InitArgs) -> CliResult<()> {
 
 fn handle_set(args: SetArgs) -> CliResult<()> {
     let mut secrets = read_secrets_file(&args.file)?;
-    let credential = credential_from_set_args(&args)?;
+    let existing_description = get_credential(&secrets, args.project.as_deref(), &args.key)
+        .ok()
+        .and_then(|credential| credential.description.clone());
+    let credential = credential_from_set_args(&args, existing_description)?;
     set_credential(
         &mut secrets,
         args.project.as_deref(),
@@ -596,30 +607,53 @@ fn handle_get(args: GetArgs) -> CliResult<()> {
     let identities = resolve_identities(&args.identities, false)?;
     let secrets = read_runtime_secrets_file(&args.file, &identities)?;
     let credential = get_credential(&secrets, args.project.as_deref(), &args.key)?;
-    if args.reveal {
-        if let Some(value) = &credential.value {
-            println!("{value}");
-            return Ok(());
+    match get_output_mode(&args) {
+        GetOutputMode::Redacted => {
+            println!("{REDACTED_OUTPUT}");
+            Ok(())
         }
-        if let Some(reference) = &credential.reference {
-            println!("{reference}");
-            return Ok(());
+        GetOutputMode::Reveal => {
+            if let Some(value) = &credential.value {
+                println!("{value}");
+                return Ok(());
+            }
+            if let Some(reference) = &credential.reference {
+                println!("{reference}");
+                return Ok(());
+            }
+            Err(CliError::Message(
+                "credential has neither value nor ref".to_string(),
+            ))
         }
-        return Err(CliError::Message(
-            "credential has neither value nor ref".to_string(),
-        ));
+        GetOutputMode::Description => {
+            if let Some(description) = &credential.description {
+                println!("{description}");
+            }
+            Ok(())
+        }
     }
-
-    println!("{REDACTED_OUTPUT}");
-    Ok(())
 }
 
 fn handle_list(args: ListArgs) -> CliResult<()> {
     let secrets = read_secrets_file(&args.file)?;
-    let keys = list_credential_keys(&secrets, args.project.as_deref())?;
-    for key in keys {
-        println!("{key}");
+    if !args.verbose {
+        let keys = list_credential_keys(&secrets, args.project.as_deref())?;
+        for key in keys {
+            println!("{key}");
+        }
+        return Ok(());
     }
+
+    let project_index = resolve_project_index(&secrets, args.project.as_deref())?;
+    let project = &secrets.projects[project_index];
+    for (key, credential) in &project.credentials {
+        if let Some(description) = credential.description.as_deref() {
+            println!("{key}\t{description}");
+        } else {
+            println!("{key}");
+        }
+    }
+
     Ok(())
 }
 
@@ -921,10 +955,43 @@ fn resolve_identities(args: &IdentityArgs, required: bool) -> CliResult<Vec<Iden
     Ok(identities)
 }
 
-fn credential_from_set_args(args: &SetArgs) -> CliResult<Credential> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GetOutputMode {
+    Redacted,
+    Reveal,
+    Description,
+}
+
+fn get_output_mode(args: &GetArgs) -> GetOutputMode {
+    if args.show_description {
+        GetOutputMode::Description
+    } else if args.reveal {
+        GetOutputMode::Reveal
+    } else {
+        GetOutputMode::Redacted
+    }
+}
+
+fn credential_from_set_args(
+    args: &SetArgs,
+    existing_description: Option<String>,
+) -> CliResult<Credential> {
+    let description = match args.description.as_deref() {
+        Some(input) => normalize_description(Some(input)),
+        None => existing_description,
+    };
+
     match (&args.value, &args.reference) {
-        (Some(value), None) => Ok(Credential::with_value(&args.credential_type, value)),
-        (None, Some(reference)) => Ok(Credential::with_ref(&args.credential_type, reference)),
+        (Some(value), None) => {
+            let mut credential = Credential::with_value(&args.credential_type, value);
+            credential.description = description;
+            Ok(credential)
+        }
+        (None, Some(reference)) => {
+            let mut credential = Credential::with_ref(&args.credential_type, reference);
+            credential.description = description;
+            Ok(credential)
+        }
         (Some(_), Some(_)) => Err(CliError::Message(
             "set requires exactly one of --value or --ref".to_string(),
         )),
@@ -1177,6 +1244,10 @@ mod tests {
         secrets
     }
 
+    fn write_fixture_secrets(path: &Path, secrets: &SecretsFile) {
+        write_secrets_file(path, secrets, true).expect("write fixture secrets");
+    }
+
     fn write_raw_json(path: &Path, json: &str) {
         let mut file = fs::File::create(path).expect("create raw json");
         file.write_all(json.as_bytes()).expect("write raw json");
@@ -1221,16 +1292,54 @@ mod tests {
             credential_type: "secret".to_string(),
             value: Some("a".to_string()),
             reference: Some("b".to_string()),
+            description: None,
             create_project: false,
         };
-        assert!(credential_from_set_args(&both).is_err());
+        assert!(credential_from_set_args(&both, None).is_err());
 
         let neither = SetArgs {
             value: None,
             reference: None,
             ..both
         };
-        assert!(credential_from_set_args(&neither).is_err());
+        assert!(credential_from_set_args(&neither, None).is_err());
+    }
+
+    #[test]
+    fn credential_from_set_args_preserves_replaces_and_clears_description() {
+        let base = SetArgs {
+            file: PathBuf::from("x"),
+            project: None,
+            key: "API_KEY".to_string(),
+            credential_type: "secret".to_string(),
+            value: Some("a".to_string()),
+            reference: None,
+            description: None,
+            create_project: false,
+        };
+
+        let preserved = credential_from_set_args(&base, Some("existing note".to_string())).unwrap();
+        assert_eq!(preserved.description.as_deref(), Some("existing note"));
+
+        let replaced = credential_from_set_args(
+            &SetArgs {
+                description: Some("  new note  ".to_string()),
+                ..base.clone()
+            },
+            Some("existing note".to_string()),
+        )
+        .unwrap();
+        assert_eq!(replaced.description.as_deref(), Some("new note"));
+
+        let cleared = credential_from_set_args(
+            &SetArgs {
+                description: Some("   ".to_string()),
+                ..base
+            },
+            Some("existing note".to_string()),
+        )
+        .unwrap();
+        assert!(cleared.description.is_none());
     }
 
     #[test]
@@ -1292,6 +1401,7 @@ mod tests {
             project: Some("demo".to_string()),
             key: "API_KEY".to_string(),
             reveal: false,
+            show_description: false,
             identities: IdentityArgs::default(),
         })
         .expect_err("must reject invalid document");
@@ -1329,6 +1439,7 @@ mod tests {
             project: Some("demo".to_string()),
             key: "API_KEY".to_string(),
             reveal: false,
+            show_description: false,
             identities: IdentityArgs {
                 identity_files: vec![identity_file.clone()],
             },
@@ -1340,6 +1451,7 @@ mod tests {
             project: Some("demo".to_string()),
             key: "API_KEY".to_string(),
             reveal: true,
+            show_description: false,
             identities: IdentityArgs {
                 identity_files: vec![identity_file],
             },
@@ -1371,6 +1483,7 @@ mod tests {
             project: Some("demo".to_string()),
             key: "API_KEY".to_string(),
             reveal: false,
+            show_description: false,
             identities: IdentityArgs::default(),
         })
         .expect_err("bundle runtime must require identities");
@@ -1408,6 +1521,7 @@ mod tests {
             project: Some("demo".to_string()),
             key: "API_KEY".to_string(),
             reveal: false,
+            show_description: false,
             identities: IdentityArgs {
                 identity_files: vec![wrong_identity_file],
             },
@@ -1430,6 +1544,7 @@ mod tests {
         let err = handle_list(ListArgs {
             file: path,
             project: Some("demo".to_string()),
+            verbose: false,
         })
         .expect_err("must reject invalid document");
         assert!(matches!(err, CliError::Core(SeclusorError::Validation(_))));
@@ -1451,6 +1566,7 @@ mod tests {
             credential_type: "secret".to_string(),
             value: Some("new-value".to_string()),
             reference: None,
+            description: None,
             create_project: false,
         })
         .expect_err("must reject invalid document");
@@ -1473,6 +1589,7 @@ mod tests {
             credential_type: "secret".to_string(),
             value: Some("new-value".to_string()),
             reference: None,
+            description: None,
             create_project: false,
         })
         .expect_err("must reject malformed document");
@@ -1480,6 +1597,150 @@ mod tests {
         let rendered = err.to_string();
         assert!(!rendered.contains("cfat_secret_token"));
         assert!(rendered.contains("string \"<redacted>\""));
+    }
+
+    #[test]
+    fn handle_set_preserves_replaces_and_clears_description_for_existing_value_credential() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("secrets.json");
+        let mut secrets = fixture_secrets();
+        secrets.projects[0]
+            .credentials
+            .get_mut("API_KEY")
+            .unwrap()
+            .description = Some("existing value description".to_string());
+        write_fixture_secrets(&path, &secrets);
+
+        handle_set(SetArgs {
+            file: path.clone(),
+            project: Some("demo".to_string()),
+            key: "API_KEY".to_string(),
+            credential_type: "secret".to_string(),
+            value: Some("updated-value".to_string()),
+            reference: None,
+            description: None,
+            create_project: false,
+        })
+        .expect("preserve existing description");
+        let loaded = read_secrets_file(&path).unwrap();
+        assert_eq!(
+            loaded.projects[0].credentials["API_KEY"]
+                .description
+                .as_deref(),
+            Some("existing value description")
+        );
+
+        handle_set(SetArgs {
+            file: path.clone(),
+            project: Some("demo".to_string()),
+            key: "API_KEY".to_string(),
+            credential_type: "secret".to_string(),
+            value: None,
+            reference: Some("vault://rotated".to_string()),
+            description: Some("  replacement value description  ".to_string()),
+            create_project: false,
+        })
+        .expect("replace description");
+        let loaded = read_secrets_file(&path).unwrap();
+        assert_eq!(
+            loaded.projects[0].credentials["API_KEY"]
+                .description
+                .as_deref(),
+            Some("replacement value description")
+        );
+        assert_eq!(
+            loaded.projects[0].credentials["API_KEY"]
+                .reference
+                .as_deref(),
+            Some("vault://rotated")
+        );
+
+        handle_set(SetArgs {
+            file: path.clone(),
+            project: Some("demo".to_string()),
+            key: "API_KEY".to_string(),
+            credential_type: "secret".to_string(),
+            value: Some("final-value".to_string()),
+            reference: None,
+            description: Some("".to_string()),
+            create_project: false,
+        })
+        .expect("clear description");
+        let loaded = read_secrets_file(&path).unwrap();
+        assert!(loaded.projects[0].credentials["API_KEY"]
+            .description
+            .is_none());
+    }
+
+    #[test]
+    fn handle_set_preserves_replaces_and_clears_description_for_existing_ref_credential() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("secrets.json");
+        let mut secrets = fixture_secrets();
+        secrets.projects[0]
+            .credentials
+            .get_mut("VAULT")
+            .unwrap()
+            .description = Some("existing ref description".to_string());
+        write_fixture_secrets(&path, &secrets);
+
+        handle_set(SetArgs {
+            file: path.clone(),
+            project: Some("demo".to_string()),
+            key: "VAULT".to_string(),
+            credential_type: "ref".to_string(),
+            value: None,
+            reference: Some("vault://preserved".to_string()),
+            description: None,
+            create_project: false,
+        })
+        .expect("preserve existing description");
+        let loaded = read_secrets_file(&path).unwrap();
+        assert_eq!(
+            loaded.projects[0].credentials["VAULT"]
+                .description
+                .as_deref(),
+            Some("existing ref description")
+        );
+
+        handle_set(SetArgs {
+            file: path.clone(),
+            project: Some("demo".to_string()),
+            key: "VAULT".to_string(),
+            credential_type: "secret".to_string(),
+            value: Some("plain-secret".to_string()),
+            reference: None,
+            description: Some("  replacement ref description  ".to_string()),
+            create_project: false,
+        })
+        .expect("replace description");
+        let loaded = read_secrets_file(&path).unwrap();
+        assert_eq!(
+            loaded.projects[0].credentials["VAULT"]
+                .description
+                .as_deref(),
+            Some("replacement ref description")
+        );
+        assert_eq!(
+            loaded.projects[0].credentials["VAULT"].value.as_deref(),
+            Some("plain-secret")
+        );
+
+        handle_set(SetArgs {
+            file: path.clone(),
+            project: Some("demo".to_string()),
+            key: "VAULT".to_string(),
+            credential_type: "ref".to_string(),
+            value: None,
+            reference: Some("vault://cleared".to_string()),
+            description: Some("   ".to_string()),
+            create_project: false,
+        })
+        .expect("clear description");
+        let loaded = read_secrets_file(&path).unwrap();
+        assert!(loaded.projects[0].credentials["VAULT"]
+            .description
+            .is_none());
     }
 
     #[test]
