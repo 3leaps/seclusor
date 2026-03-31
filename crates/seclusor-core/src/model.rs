@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::constants::{INLINE_CIPHERTEXT_PREFIX, SCHEMA_VERSION};
+use crate::validate::normalize_description;
 
 /// A seclusor secrets file containing one or more projects.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -12,7 +13,11 @@ pub struct SecretsFile {
     pub schema_version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env_prefix: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_normalized_description_opt"
+    )]
     pub description: Option<String>,
     pub projects: Vec<Project>,
 }
@@ -22,7 +27,11 @@ pub struct SecretsFile {
 #[serde(deny_unknown_fields)]
 pub struct Project {
     pub project_slug: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_normalized_description_opt"
+    )]
     pub description: Option<String>,
     #[serde(deserialize_with = "deserialize_credentials_map")]
     pub credentials: BTreeMap<String, Credential>,
@@ -104,7 +113,7 @@ impl<'de> Deserialize<'de> for Credential {
                 let mut credential_type = None;
                 let mut value = None;
                 let mut reference = None;
-                let mut description = None;
+                let mut description: Option<Option<String>> = None;
 
                 while let Some(field) = map.next_key()? {
                     match field {
@@ -140,7 +149,7 @@ impl<'de> Deserialize<'de> for Credential {
                         .ok_or_else(|| de::Error::missing_field("type"))?,
                     value: value.unwrap_or(None),
                     reference: reference.unwrap_or(None),
-                    description: description.unwrap_or(None),
+                    description: normalize_description(description.unwrap_or(None).as_deref()),
                 })
             }
         }
@@ -172,6 +181,16 @@ where
     }
 
     Ok(credentials)
+}
+
+fn deserialize_normalized_description_opt<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    Ok(normalize_description(raw.as_deref()))
 }
 
 fn credential_shape_message(key: &str, actual_kind: Option<&str>) -> String {
@@ -320,6 +339,35 @@ mod tests {
         let json = r#"["secret1", "secret2"]"#;
         let result: std::result::Result<Credential, _> = serde_json::from_str(json);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn descriptions_normalize_on_deserialize() {
+        let json = r#"{
+          "schema_version": "v1.0.0",
+          "description": "  file doc  ",
+          "projects": [{
+            "project_slug": "demo",
+            "description": "   ",
+            "credentials": {
+              "API_KEY": {
+                "type": "secret",
+                "value": "sk-123",
+                "description": "  operator note  "
+              }
+            }
+          }]
+        }"#;
+
+        let parsed: SecretsFile = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.description.as_deref(), Some("file doc"));
+        assert!(parsed.projects[0].description.is_none());
+        assert_eq!(
+            parsed.projects[0].credentials["API_KEY"]
+                .description
+                .as_deref(),
+            Some("operator note")
+        );
     }
 
     #[test]

@@ -35,7 +35,7 @@ See [agent-identity standard](https://crucible.3leaps.dev/repository/agent-ident
 
 **seclusor** is a git-trackable secrets management library and CLI using age encryption, implemented in Rust with first-class bindings for Go and TypeScript.
 
-**Architecture**: Library-first — core Rust crates provide all domain logic; CLI and FFI are thin consumers. See `.plans/active/v0.1.0/00-bootstrap-plan.md` for crate decomposition.
+**Architecture**: Library-first — core Rust crates provide all domain logic; CLI and FFI are thin consumers. See `docs/guides/development.md` for workspace layout and `docs/decisions/` for architectural decisions.
 
 **Core differentiator**: Two storage codecs (bundle for safety, inline for git-friendliness) with library-level access for programmatic consumers.
 
@@ -64,6 +64,7 @@ See [agent-identity standard](https://crucible.3leaps.dev/repository/agent-ident
 - Keep changes minimal and focused
 - Consider FFI boundary impacts
 - Consider Go and TypeScript binding parity
+- Work on a feature branch (see `CONTRIBUTING.md` for branching model)
 
 ### Before Committing
 
@@ -72,6 +73,7 @@ See [agent-identity standard](https://crucible.3leaps.dev/repository/agent-ident
 - Run `cargo deny check licenses`
 - Verify no unintended changes with `git diff`
 - Use proper commit attribution (see below)
+- Push branch and open PR for review before merging to `main`
 
 ## Commit Attribution
 
@@ -232,24 +234,27 @@ Changes must consider all supported platforms:
 
 - Linux x64/arm64 (glibc + musl)
 - macOS arm64
-- Windows x64 (future)
+- Windows x64/arm64
 
 ## Key Files
 
-| Path                       | Purpose                                     |
-| -------------------------- | ------------------------------------------- |
-| `config/agentic/roles/`    | In-repo role definitions                    |
-| `crates/seclusor-core/`    | Domain types, validation, error model       |
-| `crates/seclusor-crypto/`  | age encryption wrapper                      |
-| `crates/seclusor-codec/`   | Bundle + inline storage codecs              |
-| `crates/seclusor-keyring/` | Key/identity management                     |
-| `crates/seclusor-ffi/`     | C-ABI FFI exports for bindings              |
-| `crates/seclusor/`         | CLI binary (thin adapter)                   |
-| `bindings/go/seclusor/`    | Go CGo wrapper                              |
-| `bindings/typescript/`     | TypeScript NAPI-RS native addon             |
-| `docs/decisions/`          | ADRs, SDRs, DDRs                            |
-| `.plans/`                  | Session planning (gitignored, NEVER commit) |
-| `deny.toml`                | License and security policy                 |
+| Path                         | Purpose                                      |
+| ---------------------------- | -------------------------------------------- |
+| `CONTRIBUTING.md`            | Branching model, PR process, commit style    |
+| `RELEASE_CHECKLIST.md`       | End-to-end release sequence                  |
+| `docs/guides/development.md` | Development setup, testing, workspace layout |
+| `config/agentic/roles/`      | In-repo role definitions                     |
+| `crates/seclusor-core/`      | Domain types, validation, error model        |
+| `crates/seclusor-crypto/`    | age encryption wrapper                       |
+| `crates/seclusor-codec/`     | Bundle + inline storage codecs               |
+| `crates/seclusor-keyring/`   | Key/identity management                      |
+| `crates/seclusor-ffi/`       | C-ABI FFI exports for bindings               |
+| `crates/seclusor/`           | CLI binary (thin adapter)                    |
+| `bindings/go/seclusor/`      | Go CGo wrapper                               |
+| `bindings/typescript/`       | TypeScript NAPI-RS native addon              |
+| `docs/decisions/`            | ADRs, SDRs, DDRs                             |
+| `.plans/`                    | Session planning (gitignored, NEVER commit)  |
+| `deny.toml`                  | License and security policy                  |
 
 ## Standards Reference
 
@@ -265,4 +270,4 @@ Changes must consider all supported platforms:
 
 ---
 
-**Last Updated**: February 28, 2026
+**Last Updated**: March 30, 2026

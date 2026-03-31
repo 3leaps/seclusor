@@ -15,9 +15,11 @@ Add credentials with `seclusor secrets set` rather than hand-writing bare
 ## Set and read secrets
 
 ```bash
-seclusor secrets set --file secrets.json --project demo --key API_KEY --value sk-123
-seclusor secrets get --file secrets.json --project demo --key API_KEY           # redacted
-seclusor secrets get --file secrets.json --project demo --key API_KEY --reveal  # plaintext
+seclusor secrets set --file secrets.json --project demo --key API_KEY --value sk-123 --description "primary demo API key"
+seclusor secrets get --file secrets.json --project demo --key API_KEY                            # redacted
+seclusor secrets get --file secrets.json --project demo --key API_KEY --show-description         # description only
+seclusor secrets get --file secrets.json --project demo --key API_KEY --reveal                   # plaintext
+seclusor secrets list --file secrets.json --project demo --verbose                               # key<TAB>description
 ```
 
 ## Export for app runtime

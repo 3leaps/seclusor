@@ -14,6 +14,15 @@
 - `inline encrypt|decrypt`
 - `convert`
 
+### Description metadata
+
+- `secrets set --description <text>` stores a credential description.
+- Omitting `--description` preserves the existing credential description.
+- `secrets set --description ""` clears the description.
+- `secrets get --show-description` prints description metadata only.
+- `secrets get --show-description` and `--reveal` are mutually exclusive.
+- `secrets list --verbose` prints `KEY<TAB>description`; keys without descriptions print as just `KEY`.
+
 ### Runtime source behavior (`get`, `export-env`, `run`)
 
 - Plaintext JSON input (`--file secrets.json`) works without identities.

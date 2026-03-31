@@ -9,7 +9,12 @@ fn write_fixture(path: &Path) {
     {
       "project_slug": "demo",
       "credentials": {
-        "API_KEY": { "type": "secret", "value": "sk-123" }
+        "API_KEY": {
+          "type": "secret",
+          "value": "sk-123",
+          "description": "primary API token"
+        },
+        "EMPTY_DESC": { "type": "secret", "value": "sk-empty" }
       }
     }
   ]
@@ -40,7 +45,7 @@ fn list_stdout_only_on_success() {
     assert_eq!(String::from_utf8(output.stderr).expect("utf8 stderr"), "");
     assert_eq!(
         String::from_utf8(output.stdout).expect("utf8 stdout"),
-        "API_KEY\n"
+        "API_KEY\nEMPTY_DESC\n"
     );
 }
 
@@ -65,6 +70,101 @@ fn get_redacted_stdout_only_on_success() {
     assert_eq!(
         String::from_utf8(output.stdout).expect("utf8 stdout"),
         "<redacted>\n"
+    );
+}
+
+#[test]
+fn get_show_description_writes_description_only_to_stdout() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let secrets = dir.path().join("secrets.json");
+    write_fixture(&secrets);
+
+    let output = run_seclusor(&[
+        "secrets",
+        "get",
+        "--file",
+        secrets.to_str().expect("utf8 path"),
+        "--project",
+        "demo",
+        "--key",
+        "API_KEY",
+        "--show-description",
+    ]);
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stderr).expect("utf8 stderr"), "");
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("utf8 stdout"),
+        "primary API token\n"
+    );
+}
+
+#[test]
+fn get_show_description_is_empty_when_unset() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let secrets = dir.path().join("secrets.json");
+    write_fixture(&secrets);
+
+    let output = run_seclusor(&[
+        "secrets",
+        "get",
+        "--file",
+        secrets.to_str().expect("utf8 path"),
+        "--project",
+        "demo",
+        "--key",
+        "EMPTY_DESC",
+        "--show-description",
+    ]);
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stderr).expect("utf8 stderr"), "");
+    assert_eq!(String::from_utf8(output.stdout).expect("utf8 stdout"), "");
+}
+
+#[test]
+fn get_rejects_show_description_with_reveal() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let secrets = dir.path().join("secrets.json");
+    write_fixture(&secrets);
+
+    let output = run_seclusor(&[
+        "secrets",
+        "get",
+        "--file",
+        secrets.to_str().expect("utf8 path"),
+        "--project",
+        "demo",
+        "--key",
+        "API_KEY",
+        "--show-description",
+        "--reveal",
+    ]);
+    assert!(!output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).expect("utf8 stdout"), "");
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(stderr.contains("--show-description"));
+    assert!(stderr.contains("--reveal"));
+}
+
+#[test]
+fn list_verbose_writes_tab_separated_descriptions() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let secrets = dir.path().join("secrets.json");
+    write_fixture(&secrets);
+
+    let output = run_seclusor(&[
+        "secrets",
+        "list",
+        "--file",
+        secrets.to_str().expect("utf8 path"),
+        "--project",
+        "demo",
+        "--verbose",
+    ]);
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stderr).expect("utf8 stderr"), "");
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("utf8 stdout"),
+        "API_KEY\tprimary API token\nEMPTY_DESC\n"
     );
 }
 
