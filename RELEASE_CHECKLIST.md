@@ -56,7 +56,7 @@ Use this checklist before tagging and publishing any `vX.Y.Z` release.
     **IMPORTANT**: Both tags must point to the same commit — the Go bindings
     PR merge commit. The Go submodule tag is required so
     `go get github.com/3leaps/seclusor/bindings/go/seclusor@vX.Y.Z` resolves.
-18. Monitor release workflow for all 5 platform archives.
+18. Monitor release workflow for all 5 platform assets.
 
 ## CI and Build Artifacts
 
@@ -66,12 +66,12 @@ Use this checklist before tagging and publishing any `vX.Y.Z` release.
     - macOS arm64: clippy + test.
     - Windows: cross-check (type-check, no link) for x86_64-pc-windows-msvc
       and aarch64-pc-windows-msvc.
-20. `release` workflow produced all required archives:
-    - `x86_64-unknown-linux-gnu` (.tar.gz)
-    - `aarch64-unknown-linux-gnu` (.tar.gz)
-    - `aarch64-apple-darwin` (.tar.gz)
-    - `x86_64-pc-windows-msvc` (.zip)
-    - `aarch64-pc-windows-msvc` (.zip)
+20. `release` workflow produced all required assets (bare binaries, no archives):
+    - `seclusor-linux-amd64`
+    - `seclusor-linux-arm64`
+    - `seclusor-darwin-arm64`
+    - `seclusor-windows-amd64.exe`
+    - `seclusor-windows-arm64.exe`
 21. Draft release contains `SHA256SUMS` and `SHA512SUMS`.
 22. SBOM artifact exists from CI (`bom.json` via CycloneDX).
 
@@ -85,7 +85,7 @@ Use this checklist before tagging and publishing any `vX.Y.Z` release.
 
 ## Publish Gate
 
-27. Draft release notes reflect final asset set (5 platform archives +
+27. Draft release notes reflect final asset set (5 platform binaries +
     checksums).
 28. Optional lanes (if omitted) are called out explicitly in notes.
 29. Draft verified by four-eyes (`devrev`) and security (`secrev`) for
