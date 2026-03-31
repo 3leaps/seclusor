@@ -17,7 +17,8 @@
 .PHONY: ci release-check release-preflight
 .PHONY: release-clean release-download release-checksums release-sign release-export-keys
 .PHONY: release-verify release-verify-checksums release-verify-signatures release-verify-keys
-.PHONY: release-notes release-upload release
+.PHONY: release-notes release-upload release-upload-all release
+.PHONY: update-homebrew-formula update-scoop-manifest
 
 # -----------------------------------------------------------------------------
 # Configuration
@@ -41,6 +42,11 @@ TS_BINDINGS_DIR := bindings/typescript
 GO_OS := $(shell go env GOOS 2>/dev/null || echo "unknown")
 GO_ARCH := $(shell go env GOARCH 2>/dev/null || echo "unknown")
 GO_PLATFORM := $(GO_OS)-$(GO_ARCH)
+
+HOMEBREW_TAP_DIR ?= ../homebrew-tap
+HOMEBREW_TAP_REPO ?= https://github.com/3leaps/homebrew-tap.git
+SCOOP_BUCKET_DIR ?= ../scoop-bucket
+SCOOP_BUCKET_REPO ?= https://github.com/3leaps/scoop-bucket.git
 
 # -----------------------------------------------------------------------------
 # Default and Help
@@ -96,8 +102,11 @@ help: ## Show available targets
 	@echo "  release-export-keys Export public signing keys"
 	@echo "  release-verify     Verify checksums, signatures, and keys"
 	@echo "  release-notes      Copy release notes to dist"
-	@echo "  release-upload     Upload signed artifacts to GitHub"
+	@echo "  release-upload     Upload provenance (checksums, signatures, keys, notes)"
+	@echo "  release-upload-all Upload all assets including platform binaries"
 	@echo "  release            Full signing workflow (clean -> upload)"
+	@echo "  update-homebrew-formula  Update homebrew-tap formula (requires sibling)"
+	@echo "  update-scoop-manifest   Update scoop-bucket manifest (requires sibling)"
 	@echo ""
 	@echo "Version management:"
 	@echo "  version         Print current version"
@@ -730,8 +739,94 @@ release-notes: ## Copy release notes to dist
 		echo "[--] No release notes found at $$src"; \
 	fi
 
-release-upload: release-verify release-notes ## Upload signed artifacts to GitHub release
+release-upload: release-verify release-notes ## Upload provenance only (checksums, signatures, keys, notes)
 	./scripts/upload-release-assets.sh $(SECLUSOR_RELEASE_TAG) $(DIST_RELEASE)
+	@echo ""
+	@echo "Updating Homebrew formula..."
+	@$(MAKE) update-homebrew-formula
+	@echo ""
+	@echo "Updating Scoop manifest..."
+	@$(MAKE) update-scoop-manifest
+
+release-upload-all: release-verify release-notes ## Upload all assets including platform binaries
+	./scripts/upload-release-assets.sh $(SECLUSOR_RELEASE_TAG) $(DIST_RELEASE) --all
+	@echo ""
+	@echo "Updating Homebrew formula..."
+	@$(MAKE) update-homebrew-formula
+	@echo ""
+	@echo "Updating Scoop manifest..."
+	@$(MAKE) update-scoop-manifest
+
+update-homebrew-formula: ## Update homebrew-tap formula (requires sibling ../homebrew-tap)
+	@echo "Updating Homebrew formula for seclusor $(VERSION)..."
+	@echo ""
+	@echo "  Repository: $(HOMEBREW_TAP_REPO)"
+	@echo "  Expected path: $(HOMEBREW_TAP_DIR)"
+	@echo ""
+	@if [ ! -d "$(HOMEBREW_TAP_DIR)" ]; then \
+		echo "[!!] $(HOMEBREW_TAP_DIR) directory not found"; \
+		echo ""; \
+		echo "Please clone the homebrew-tap repository:"; \
+		echo "  cd .. && git clone $(HOMEBREW_TAP_REPO)"; \
+		echo ""; \
+		echo "Directory structure:"; \
+		echo "  3leaps/"; \
+		echo "    ├── seclusor/       (this repository)"; \
+		echo "    ├── homebrew-tap/   (sibling)"; \
+		echo "    └── scoop-bucket/   (sibling)"; \
+		echo ""; \
+		echo "Skipping Homebrew formula update."; \
+	elif [ ! -f "$(HOMEBREW_TAP_DIR)/Formula/seclusor.rb" ]; then \
+		echo "[!!] Formula not found: $(HOMEBREW_TAP_DIR)/Formula/seclusor.rb"; \
+		echo "     Run: cd $(HOMEBREW_TAP_DIR) && make update APP=seclusor"; \
+	else \
+		echo "[ok] Sibling repository found: $(HOMEBREW_TAP_DIR)"; \
+		$(MAKE) -C "$(HOMEBREW_TAP_DIR)" update APP=seclusor; \
+		echo ""; \
+		echo "[ok] Homebrew formula updated"; \
+		echo ""; \
+		echo "Next steps:"; \
+		echo "  1. Review:  cd $(HOMEBREW_TAP_DIR) && git diff Formula/seclusor.rb"; \
+		echo "  2. Audit:   cd $(HOMEBREW_TAP_DIR) && make audit APP=seclusor"; \
+		echo "  3. Test:    cd $(HOMEBREW_TAP_DIR) && make test APP=seclusor"; \
+		echo "  4. Commit:  cd $(HOMEBREW_TAP_DIR) && git add Formula/seclusor.rb && git commit -m 'Update seclusor to v$(VERSION)'"; \
+		echo "  5. Push:    cd $(HOMEBREW_TAP_DIR) && git push"; \
+	fi
+
+update-scoop-manifest: ## Update scoop-bucket manifest (requires sibling ../scoop-bucket)
+	@echo "Updating Scoop manifest for seclusor $(VERSION)..."
+	@echo ""
+	@echo "  Repository: $(SCOOP_BUCKET_REPO)"
+	@echo "  Expected path: $(SCOOP_BUCKET_DIR)"
+	@echo ""
+	@if [ ! -d "$(SCOOP_BUCKET_DIR)" ]; then \
+		echo "[!!] $(SCOOP_BUCKET_DIR) directory not found"; \
+		echo ""; \
+		echo "Please clone the scoop-bucket repository:"; \
+		echo "  cd .. && git clone $(SCOOP_BUCKET_REPO)"; \
+		echo ""; \
+		echo "Directory structure:"; \
+		echo "  3leaps/"; \
+		echo "    ├── seclusor/       (this repository)"; \
+		echo "    ├── homebrew-tap/   (sibling)"; \
+		echo "    └── scoop-bucket/   (sibling)"; \
+		echo ""; \
+		echo "Skipping Scoop manifest update."; \
+	elif [ ! -f "$(SCOOP_BUCKET_DIR)/bucket/seclusor.json" ]; then \
+		echo "[!!] Manifest not found: $(SCOOP_BUCKET_DIR)/bucket/seclusor.json"; \
+		echo "     Create the manifest first, then re-run."; \
+	else \
+		echo "[ok] Sibling repository found: $(SCOOP_BUCKET_DIR)"; \
+		$(MAKE) -C "$(SCOOP_BUCKET_DIR)" update APP=seclusor VERSION=$(VERSION); \
+		echo ""; \
+		echo "[ok] Scoop manifest updated"; \
+		echo ""; \
+		echo "Next steps:"; \
+		echo "  1. Review:  cd $(SCOOP_BUCKET_DIR) && git diff bucket/seclusor.json"; \
+		echo "  2. Validate: python3 -m json.tool $(SCOOP_BUCKET_DIR)/bucket/seclusor.json >/dev/null"; \
+		echo "  3. Commit:  cd $(SCOOP_BUCKET_DIR) && git add bucket/seclusor.json && git commit -m 'Update seclusor to v$(VERSION)'"; \
+		echo "  4. Push:    cd $(SCOOP_BUCKET_DIR) && git push"; \
+	fi
 
 release: release-clean release-download release-checksums release-sign release-export-keys release-upload ## Full signing workflow (after CI build)
 	@echo "[ok] Release $(SECLUSOR_RELEASE_TAG) complete"

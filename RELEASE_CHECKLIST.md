@@ -94,17 +94,27 @@ Use this checklist before tagging and publishing any `vX.Y.Z` release.
 
 ## Post-Publish
 
-31. Upload signed assets and release notes:
+31. Upload signed assets and release notes (also triggers homebrew and scoop
+    update targets automatically):
     ```bash
     make release-upload
     ```
-32. Update homebrew-tap formula (if applicable):
+32. Review and commit homebrew-tap formula update:
     ```bash
     cd ../homebrew-tap
-    make update APP=seclusor
+    git diff Formula/seclusor.rb
     make audit APP=seclusor
     make test APP=seclusor
-    # commit and push
+    git add Formula/seclusor.rb && git commit -m "Update seclusor to vX.Y.Z"
+    git push
+    ```
+33. Review and commit scoop-bucket manifest update:
+    ```bash
+    cd ../scoop-bucket
+    git diff bucket/seclusor.json
+    python3 -m json.tool bucket/seclusor.json >/dev/null
+    git add bucket/seclusor.json && git commit -m "Update seclusor to vX.Y.Z"
+    git push
     ```
 
 ## Troubleshooting: Local/Remote Divergence
