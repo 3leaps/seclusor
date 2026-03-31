@@ -6,6 +6,28 @@ All notable changes to seclusor will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.1.3] - 2026-03-30
+
+### Security
+
+- Redacted all serde JSON error messages across CLI, FFI, and TypeScript bindings so malformed input never leaks secret material to console output or binding error state
+- Defense-in-depth fallback sanitizer catches `invalid type:` and `invalid value:` error segments generically, independent of serde_json token formatting
+
+### Added
+
+- Lenient `secrets unset` recovery: when a secrets file contains malformed credentials (e.g., bare strings instead of credential objects), `unset` now falls back to raw JSON manipulation to remove the targeted entry without requiring the file to fully deserialize
+- Credential format validation errors now include the key name, expected object shape, and a `secrets set` CLI hint — without revealing the malformed value
+- Custom `Credential` deserializer rejects non-object entries (strings, arrays, numbers, booleans) with redaction-safe, actionable error messages
+- Credential descriptions on the CLI: `secrets set --description`, `secrets get --show-description`, and `secrets list --verbose`
+- Shared description normalization and validation for file, project, and credential descriptions, with schema updates to mirror the runtime contract
+
+### Changed
+
+- Quickstart documentation updated to clarify the init → set → encrypt → run workflow and the expected credential JSON shape
+- Description validation now counts Unicode characters rather than UTF-8 bytes, matching the JSON schema contract
+
+See `docs/releases/v0.1.3.md` for full notes.
+
 ## [0.1.2] - 2026-03-19
 
 ### Added
@@ -21,27 +43,6 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 - Updated top-level documentation and release notes to reflect shipped Go signing support in v0.1.2
 
 See `docs/releases/v0.1.2.md` for full notes.
-
-## [0.1.3] - 2026-03-30
-
-### Security
-
-- Redacted all serde JSON error messages across CLI, FFI, and TypeScript bindings so malformed input never leaks secret material to console output or binding error state
-- Defense-in-depth fallback sanitizer catches `invalid type:` and `invalid value:` error segments generically, independent of serde_json token formatting
-
-### Added
-
-- Lenient `secrets unset` recovery: when a secrets file contains malformed credentials (e.g., bare strings instead of credential objects), `unset` now falls back to raw JSON manipulation to remove the targeted entry without requiring the file to fully deserialize
-- Credential format validation errors now include the key name, expected object shape, and a `secrets set` CLI hint — without revealing the malformed value
-- Custom `Credential` deserializer rejects non-object entries (strings, arrays, numbers, booleans) with redaction-safe, actionable error messages
-
-### Changed
-
-- Quickstart documentation updated to clarify the init → set → encrypt → run workflow and the expected credential JSON shape
-- Feature branch model and PR-based workflow documented in CONTRIBUTING.md and AGENTS.md
-- Updated release checklist for Go bindings prep sequencing with feature branches
-
-See `docs/releases/v0.1.3.md` for full notes.
 
 ## [0.1.1] - 2026-03-17
 
