@@ -28,14 +28,14 @@ It also blocks future scoop bucket integration, which expects
 
 Release assets MUST follow the org-wide naming convention:
 
-| Platform      | Asset name                  |
-| ------------- | --------------------------- |
-| Linux amd64   | `seclusor-linux-amd64`      |
-| Linux arm64   | `seclusor-linux-arm64`      |
-| macOS arm64   | `seclusor-darwin-arm64`     |
-| macOS amd64   | `seclusor-darwin-amd64`     |
-| Windows amd64 | `seclusor-windows-amd64.exe`|
-| Windows arm64 | `seclusor-windows-arm64.exe`|
+| Platform      | Asset name                   |
+| ------------- | ---------------------------- |
+| Linux amd64   | `seclusor-linux-amd64`       |
+| Linux arm64   | `seclusor-linux-arm64`       |
+| macOS arm64   | `seclusor-darwin-arm64`      |
+| macOS amd64   | `seclusor-darwin-amd64`      |
+| Windows amd64 | `seclusor-windows-amd64.exe` |
+| Windows arm64 | `seclusor-windows-arm64.exe` |
 
 Rules:
 
