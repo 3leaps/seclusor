@@ -14,6 +14,38 @@
 - `inline encrypt|decrypt`
 - `convert`
 
+### Value vs reference credentials
+
+Every credential stores exactly one of `--value` or `--ref`:
+
+- **`--value`** stores the secret directly. The plaintext is encrypted at rest
+  (bundle or inline codec) and injected into the environment by `secrets run`.
+  Max size: 1 MB.
+
+  ```bash
+  seclusor secrets set --key DB_PASSWORD --value "s3cret"
+  ```
+
+- **`--ref`** stores a pointer to a secret held elsewhere — a vault path,
+  environment variable name, cloud secret manager ARN, or any URI your
+  toolchain resolves at runtime. Seclusor stores and encrypts the reference
+  string but does not resolve it. Max length: 2048 characters.
+
+  ```bash
+  seclusor secrets set --key DB_PASSWORD --ref "vault://prod/db/password"
+  seclusor secrets set --key API_KEY --ref "aws:secretsmanager:us-east-1:prod/api-key"
+  seclusor secrets set --key SIGNING_CERT --ref "env://SIGNING_CERT_PATH"
+  ```
+
+Ref credentials are excluded from `export-env` and `secrets run` by default
+because seclusor cannot resolve them. The library-level `emit_ref` option
+includes them as literal strings for downstream tooling to resolve.
+
+**Path separators**: Use forward slashes (`/`) in ref strings for portability.
+Backslashes are preserved verbatim but may not be portable across platforms.
+On Windows, seclusor does not normalize path separators — what you store is
+what you get back.
+
 ### Description metadata
 
 - `secrets set --description <text>` stores a credential description.

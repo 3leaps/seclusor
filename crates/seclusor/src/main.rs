@@ -185,21 +185,34 @@ struct InitArgs {
 
 #[derive(Debug, Parser, Clone)]
 struct SetArgs {
-    #[arg(long, default_value = DEFAULT_SECRETS_FILE)]
+    #[arg(long, default_value = DEFAULT_SECRETS_FILE, help = "Path to secrets file")]
     file: PathBuf,
-    #[arg(long)]
+    #[arg(long, help = "Project slug (auto-resolved if only one project exists)")]
     project: Option<String>,
-    #[arg(long)]
+    #[arg(long, help = "Credential key name (e.g. DB_PASSWORD)")]
     key: String,
-    #[arg(long, default_value = "secret")]
+    #[arg(long, default_value = "secret", help = "Credential type label")]
     credential_type: String,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Store a direct secret value (mutually exclusive with --ref)"
+    )]
     value: Option<String>,
-    #[arg(long = "ref")]
+    #[arg(
+        long = "ref",
+        help = "Store a reference pointer instead of a value (e.g. vault path, \
+                env var name, URI). Use forward slashes for portability; \
+                backslashes are preserved but may not be portable across \
+                platforms. Mutually exclusive with --value"
+    )]
     reference: Option<String>,
-    #[arg(long)]
+    #[arg(long, help = "Human-readable description (single-line, max 128 chars)")]
     description: Option<String>,
-    #[arg(long, default_value_t = false)]
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Create project if it does not exist"
+    )]
     create_project: bool,
 }
 
