@@ -317,7 +317,10 @@ fn ensure_size_limit(kind: &'static str, actual: usize, max: usize) -> Result<()
     Ok(())
 }
 
-fn assert_secure_permissions(path: &Path) -> Result<()> {
+/// Check that an identity file has secure permissions (0600 on Unix).
+///
+/// On non-Unix platforms this is a no-op.
+pub fn assert_secure_permissions(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

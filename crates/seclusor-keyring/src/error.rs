@@ -58,6 +58,31 @@ pub enum KeyringError {
     #[error("credential {key:?} in project {project:?} decrypted to non-utf8 data")]
     NonUtf8InlineValue { project: String, key: String },
 
+    /// Passphrase-protected identity file exceeds size limit.
+    #[error(
+        "passphrase-protected identity file exceeds maximum size of {max} bytes (actual: {actual})"
+    )]
+    ProtectedIdentityFileTooLarge { actual: u64, max: usize },
+
+    /// Passphrase-protected identity could not be decrypted.
+    #[error("wrong passphrase or corrupted identity file")]
+    ProtectedIdentityDecryptFailed,
+
+    /// Identity file is passphrase-protected but no passphrase was provided.
+    #[error("identity file is passphrase-protected but no passphrase was provided")]
+    ProtectedIdentityNoPassphrase,
+
+    /// Multiple passphrase-protected identity files in one invocation.
+    #[error(
+        "multiple passphrase-protected identity files detected; only one \
+         is supported per invocation"
+    )]
+    MultipleProtectedIdentities,
+
+    /// Passphrase-protected identity file content was not valid UTF-8 after decryption.
+    #[error("passphrase-protected identity file decrypted to non-UTF-8 data")]
+    ProtectedIdentityNotUtf8,
+
     /// Core-domain validation or model error.
     #[error(transparent)]
     Core(#[from] seclusor_core::SeclusorError),

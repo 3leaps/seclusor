@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use seclusor_core::constants::INLINE_CIPHERTEXT_PREFIX;
 use seclusor_core::validate::validate_strict;
 use seclusor_core::SecretsFile;
+use secrecy::{ExposeSecret, SecretString};
 
 pub use error::{KeyringError, Result};
 pub use seclusor_crypto::{Identity, Recipient};
@@ -24,6 +25,12 @@ pub const DEFAULT_RECIPIENTS_ENV_VAR: &str = "SECLUSOR_RECIPIENTS";
 /// Maximum bytes read from recipient file/env sources.
 pub const MAX_RECIPIENT_SOURCE_BYTES: usize = 1024 * 1024;
 const MAX_REPO_ROOT_SEARCH_DEPTH: usize = 32;
+
+/// Maximum size of a passphrase-protected identity file (before decryption).
+pub const MAX_PROTECTED_IDENTITY_FILE_BYTES: usize = 8192;
+
+/// Marker for age-encrypted (passphrase-protected) identity files.
+const AGE_ARMOR_BEGIN: &str = "-----BEGIN AGE ENCRYPTED FILE-----";
 
 /// Generated age identity material.
 #[derive(Clone, PartialEq, Eq)]
@@ -66,6 +73,153 @@ pub fn generate_identity_file(path: impl AsRef<Path>) -> Result<GeneratedIdentit
     writeln!(file, "{}", generated.identity)?;
     file.flush()?;
     Ok(generated)
+}
+
+/// Generate a new identity and create a passphrase-protected identity file.
+///
+/// The file contains a public key comment header followed by an age-encrypted
+/// block containing the secret key. Same pathguard and permission enforcement
+/// as `generate_identity_file`.
+pub fn generate_identity_file_with_passphrase(
+    path: impl AsRef<Path>,
+    passphrase: &SecretString,
+) -> Result<GeneratedIdentity> {
+    let path = path.as_ref();
+    enforce_identity_file_pathguard(path)?;
+    let generated = generate_identity();
+
+    let inner = format!(
+        "# public key: {}\n{}\n",
+        generated.recipient, generated.identity
+    );
+    // Encrypt the inner identity content with passphrase, writing directly
+    // to an armored output so the file is ASCII-safe and contains the
+    // BEGIN AGE ENCRYPTED FILE marker for detection.
+    let encryptor = age::Encryptor::with_user_passphrase(secrecy::SecretString::from(
+        passphrase.expose_secret().to_owned(),
+    ));
+    let mut armored_buf = Vec::new();
+    {
+        let armor_writer = age::armor::ArmoredWriter::wrap_output(
+            &mut armored_buf,
+            age::armor::Format::AsciiArmor,
+        )
+        .map_err(|_| KeyringError::Crypto(seclusor_crypto::CryptoError::EncryptionFailed))?;
+        let mut encrypt_writer = encryptor
+            .wrap_output(armor_writer)
+            .map_err(|_| KeyringError::Crypto(seclusor_crypto::CryptoError::EncryptionFailed))?;
+        encrypt_writer
+            .write_all(inner.as_bytes())
+            .map_err(|_| KeyringError::Crypto(seclusor_crypto::CryptoError::EncryptionFailed))?;
+        encrypt_writer
+            .finish()
+            .and_then(|armor| armor.finish())
+            .map_err(|_| KeyringError::Crypto(seclusor_crypto::CryptoError::EncryptionFailed))?;
+    }
+
+    let mut file = create_new_identity_file(path)?;
+    writeln!(
+        file,
+        "# This is a passphrase-protected seclusor identity file."
+    )?;
+    writeln!(file, "# Public key: {}", generated.recipient)?;
+    writeln!(
+        file,
+        "# To use this identity, you will be prompted for a passphrase."
+    )?;
+    file.write_all(&armored_buf)?;
+    file.flush()?;
+    Ok(generated)
+}
+
+/// Check whether an identity file is passphrase-protected (age-encrypted).
+///
+/// Reads up to 4 KiB to detect the `BEGIN AGE ENCRYPTED FILE` marker.
+pub fn is_passphrase_protected_identity(path: impl AsRef<Path>) -> Result<bool> {
+    let path = path.as_ref();
+    let mut file = File::open(path)?;
+    let mut buf = vec![0u8; 4096];
+    let n = file.read(&mut buf)?;
+    let header = String::from_utf8_lossy(&buf[..n]);
+    Ok(header.contains(AGE_ARMOR_BEGIN))
+}
+
+/// Load identities from a passphrase-protected identity file.
+///
+/// On Unix, file permissions must be exactly `0600` (same contract as
+/// plaintext identity files). Reads through a bounded reader capped at
+/// `MAX_PROTECTED_IDENTITY_FILE_BYTES` to prevent resource exhaustion.
+pub fn load_identity_file_with_passphrase(
+    path: impl AsRef<Path>,
+    passphrase: &SecretString,
+) -> Result<Vec<Identity>> {
+    let path = path.as_ref();
+
+    // Enforce 0600 permissions — same contract as plaintext identities
+    seclusor_crypto::assert_secure_permissions(path)?;
+
+    // Bounded read to enforce size cap at read time (no TOCTOU gap)
+    let max = MAX_PROTECTED_IDENTITY_FILE_BYTES as u64;
+    let mut file = File::open(path)?;
+    let mut limited = std::io::Read::by_ref(&mut file).take(max + 1);
+    let mut raw_bytes = Vec::new();
+    limited
+        .read_to_end(&mut raw_bytes)
+        .map_err(|_| KeyringError::ProtectedIdentityDecryptFailed)?;
+    if raw_bytes.len() as u64 > max {
+        return Err(KeyringError::ProtectedIdentityFileTooLarge {
+            actual: raw_bytes.len() as u64,
+            max: MAX_PROTECTED_IDENTITY_FILE_BYTES,
+        });
+    }
+
+    let raw =
+        String::from_utf8(raw_bytes).map_err(|_| KeyringError::ProtectedIdentityDecryptFailed)?;
+
+    // Extract the age-armored block (skip comment header lines)
+    let armor_start = raw
+        .find(AGE_ARMOR_BEGIN)
+        .ok_or(KeyringError::ProtectedIdentityDecryptFailed)?;
+    let armored = &raw[armor_start..];
+
+    let decrypted = {
+        let armored_reader = age::armor::ArmoredReader::new(armored.as_bytes());
+        let decryptor = age::Decryptor::new_buffered(armored_reader)
+            .map_err(|_| KeyringError::ProtectedIdentityDecryptFailed)?;
+        let pp_identity =
+            age::scrypt::Identity::new(SecretString::from(passphrase.expose_secret().to_owned()));
+        let mut reader = decryptor
+            .decrypt(std::iter::once(&pp_identity as &dyn age::Identity))
+            .map_err(|_| KeyringError::ProtectedIdentityDecryptFailed)?;
+        let mut buf = Vec::new();
+        reader
+            .read_to_end(&mut buf)
+            .map_err(|_| KeyringError::ProtectedIdentityDecryptFailed)?;
+        buf
+    };
+
+    let inner = String::from_utf8(decrypted).map_err(|_| KeyringError::ProtectedIdentityNotUtf8)?;
+
+    Ok(seclusor_crypto::parse_identity_file_contents(&inner)?)
+}
+
+/// Load identities from an identity file, autodetecting plaintext vs protected.
+///
+/// If the file is passphrase-protected and no passphrase is provided, returns
+/// `ProtectedIdentityNoPassphrase`. If plaintext, the passphrase is ignored.
+pub fn load_identity_file_auto(
+    path: impl AsRef<Path>,
+    passphrase: Option<&SecretString>,
+) -> Result<Vec<Identity>> {
+    let path = path.as_ref();
+    if is_passphrase_protected_identity(path)? {
+        match passphrase {
+            Some(pp) => load_identity_file_with_passphrase(path, pp),
+            None => Err(KeyringError::ProtectedIdentityNoPassphrase),
+        }
+    } else {
+        Ok(seclusor_crypto::load_identity_file(path)?)
+    }
 }
 
 /// Parse recipient entries from file contents.
@@ -635,6 +789,184 @@ mod tests {
         let err =
             discover_recipients(&RecipientDiscoveryOptions::default()).expect_err("must fail");
         assert!(matches!(err, KeyringError::MissingRecipientSources));
+    }
+
+    #[test]
+    fn generate_protected_identity_file_roundtrip() {
+        let _guard = cwd_lock().lock().expect("lock cwd");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("identity-protected.txt");
+        let passphrase = SecretString::from("test-passphrase-42");
+
+        let generated = generate_identity_file_with_passphrase(&path, &passphrase)
+            .expect("protected generation should work");
+
+        // File contains armor marker
+        let contents = fs::read_to_string(&path).expect("read file");
+        assert!(contents.contains(AGE_ARMOR_BEGIN));
+        // Public key visible in header comment
+        assert!(contents.contains(&format!("# Public key: {}", generated.recipient)));
+        // Secret key NOT visible in file
+        assert!(!contents.contains("AGE-SECRET-KEY-"));
+
+        // Verify size is well under 8 KiB limit
+        let size = fs::metadata(&path).expect("metadata").len();
+        assert!(
+            size < MAX_PROTECTED_IDENTITY_FILE_BYTES as u64,
+            "protected identity should be well under {} bytes, was {}",
+            MAX_PROTECTED_IDENTITY_FILE_BYTES,
+            size
+        );
+
+        // Roundtrip: load with correct passphrase
+        let identities =
+            load_identity_file_with_passphrase(&path, &passphrase).expect("load should work");
+        assert_eq!(identities.len(), 1);
+
+        // The loaded identity can decrypt something encrypted to the recipient
+        let recipient: Recipient = generated.recipient.parse().expect("parse recipient");
+        let ciphertext =
+            seclusor_crypto::encrypt(b"test-payload", std::slice::from_ref(&recipient))
+                .expect("encrypt");
+        let decrypted =
+            seclusor_crypto::decrypt(&ciphertext, &identities).expect("decrypt should work");
+        assert_eq!(decrypted, b"test-payload");
+    }
+
+    #[test]
+    fn load_protected_identity_wrong_passphrase() {
+        let _guard = cwd_lock().lock().expect("lock cwd");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("identity-wrong-pp.txt");
+        let passphrase = SecretString::from("alpha-green-42");
+        let bad = SecretString::from("beta-red-99");
+
+        generate_identity_file_with_passphrase(&path, &passphrase).expect("generate");
+
+        let err = match load_identity_file_with_passphrase(&path, &bad) {
+            Ok(_) => panic!("must fail with incorrect passphrase"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, KeyringError::ProtectedIdentityDecryptFailed));
+        // Error message must not contain either passphrase value
+        let msg = err.to_string();
+        assert!(!msg.contains("alpha-green"));
+        assert!(!msg.contains("beta-red"));
+    }
+
+    #[test]
+    fn is_passphrase_protected_detects_formats() {
+        let _guard = cwd_lock().lock().expect("lock cwd");
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        // Plaintext identity
+        let plain_path = dir.path().join("plain.txt");
+        generate_identity_file(&plain_path).expect("generate plaintext");
+        assert!(!is_passphrase_protected_identity(&plain_path).expect("detect plain"));
+
+        // Protected identity
+        let prot_path = dir.path().join("protected.txt");
+        let passphrase = SecretString::from("detect-test");
+        generate_identity_file_with_passphrase(&prot_path, &passphrase)
+            .expect("generate protected");
+        assert!(is_passphrase_protected_identity(&prot_path).expect("detect protected"));
+    }
+
+    #[test]
+    fn load_identity_file_auto_plaintext() {
+        let _guard = cwd_lock().lock().expect("lock cwd");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("auto-plain.txt");
+        generate_identity_file(&path).expect("generate");
+
+        // Plaintext: passphrase ignored
+        let ids = load_identity_file_auto(&path, None).expect("load plain without passphrase");
+        assert_eq!(ids.len(), 1);
+    }
+
+    #[test]
+    fn load_identity_file_auto_protected_no_passphrase() {
+        let _guard = cwd_lock().lock().expect("lock cwd");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("auto-prot-no-pp.txt");
+        let passphrase = SecretString::from("auto-test");
+        generate_identity_file_with_passphrase(&path, &passphrase).expect("generate");
+
+        let err = match load_identity_file_auto(&path, None) {
+            Ok(_) => panic!("must fail without passphrase"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, KeyringError::ProtectedIdentityNoPassphrase),
+            "expected ProtectedIdentityNoPassphrase, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_identity_file_auto_protected_with_passphrase() {
+        let _guard = cwd_lock().lock().expect("lock cwd");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("auto-prot-with-pp.txt");
+        let passphrase = SecretString::from("auto-test-2");
+        generate_identity_file_with_passphrase(&path, &passphrase).expect("generate");
+
+        let ids = load_identity_file_auto(&path, Some(&passphrase)).expect("load");
+        assert_eq!(ids.len(), 1);
+    }
+
+    #[test]
+    fn protected_identity_file_size_limit_enforced() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("oversized.txt");
+
+        // Write a file that exceeds the limit with valid-looking header
+        let mut content = String::from("# comment\n");
+        content.push_str(AGE_ARMOR_BEGIN);
+        content.push('\n');
+        while content.len() <= MAX_PROTECTED_IDENTITY_FILE_BYTES {
+            content.push_str("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n");
+        }
+        fs::write(&path, &content).expect("write oversized");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("set perms");
+        }
+
+        let passphrase = SecretString::from("irrelevant");
+        let err = match load_identity_file_with_passphrase(&path, &passphrase) {
+            Ok(_) => panic!("must reject oversized file"),
+            Err(e) => e,
+        };
+        assert!(matches!(
+            err,
+            KeyringError::ProtectedIdentityFileTooLarge { .. }
+        ));
+    }
+
+    #[test]
+    fn protected_identity_malformed_armor_fails_closed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("malformed.txt");
+
+        // Has the marker but garbage content — must not fall back to plaintext
+        let content = format!(
+            "# Public key: age1fake\n{}\nnot-valid-age-data\n-----END AGE ENCRYPTED FILE-----\n",
+            AGE_ARMOR_BEGIN
+        );
+        fs::write(&path, &content).expect("write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("set perms");
+        }
+
+        let passphrase = SecretString::from("any");
+        let err = match load_identity_file_with_passphrase(&path, &passphrase) {
+            Ok(_) => panic!("must fail on malformed armor"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, KeyringError::ProtectedIdentityDecryptFailed));
     }
 
     #[test]

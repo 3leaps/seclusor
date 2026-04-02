@@ -9,8 +9,10 @@ repository.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+age = { workspace = true, features = ["armor"] }
 seclusor-core = { workspace = true }
 seclusor-crypto = { workspace = true }
+secrecy = "0.10"
 thiserror = { workspace = true }
 
 [dev-dependencies]
