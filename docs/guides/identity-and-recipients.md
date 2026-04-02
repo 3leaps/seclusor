@@ -178,8 +178,8 @@ Any team member can decrypt with their own identity file.
 
 ## See also
 
-- [Security model](../README.md#security-model) — encryption algorithms,
-  size limits, safety defaults
+- [Security model](security.md) — threat model, safety defaults, and
+  secret handling
 - [CLI reference](cli-reference.md) — full command and flag documentation
 - [Key management guide](key-management.md) — rekeying and recipient rotation
 - [App Note 01](../appnotes/01-git-armored-storage.md) — storing encrypted

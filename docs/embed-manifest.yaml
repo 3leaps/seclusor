@@ -24,6 +24,12 @@ topics:
     tags: [keys, identity, recipients, rekey]
     include:
       - guides/key-management.md
+  identity-and-recipients:
+    title: "Identity Files and Recipients"
+    description: "Identities, recipients, permissions, and team workflows"
+    tags: [keys, identity, recipients, encryption]
+    include:
+      - guides/identity-and-recipients.md
   security:
     title: "Security Model"
     description: "Threat model, safety defaults, and secret handling"

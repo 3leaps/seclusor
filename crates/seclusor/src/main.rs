@@ -291,9 +291,9 @@ struct ExportEnvArgs {
         help = "Include ref credentials as literal strings (default: excluded)"
     )]
     emit_ref: bool,
-    #[arg(long = "allow")]
+    #[arg(long = "allow", help = "Glob pattern for keys to export (repeatable)")]
     allow: Vec<String>,
-    #[arg(long = "deny")]
+    #[arg(long = "deny", help = "Glob pattern for keys to exclude (repeatable)")]
     deny: Vec<String>,
     #[command(flatten)]
     identities: IdentityArgs,
