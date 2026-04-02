@@ -28,7 +28,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ### Security
 
-- Passphrase-protected identity files enforce 0600 permissions and current-user ownership on Unix, same as plaintext identities
+- Passphrase-protected identity files enforce 0600 permissions on Unix, same as plaintext identities. Passphrase files (`--passphrase-file`) additionally enforce current-user ownership
 - Passphrases held as `SecretString` (zeroized on drop) at all CLI boundaries; never stored as plain `String`
 - Protected identity file size capped at 8 KiB before decryption attempt
 - Malformed armor in protected identity files fails closed (no plaintext fallback)
