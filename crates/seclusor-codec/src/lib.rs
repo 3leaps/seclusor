@@ -323,10 +323,13 @@ pub fn decrypt_bundle_from_file(
     decrypt_bundle(&ciphertext, identities)
 }
 
-/// Resolve runtime source bytes as either plaintext JSON or bundle ciphertext.
+/// Resolve runtime source bytes as plaintext JSON, bundle ciphertext, or
+/// inline-encrypted JSON.
 ///
 /// Classification is fail-closed: bundle marker detection takes precedence and
-/// never falls back to plaintext JSON if bundle decryption fails.
+/// never falls back to plaintext JSON if bundle decryption fails. When
+/// identities are provided and the document contains inline-encrypted values,
+/// they are decrypted before returning.
 pub fn resolve_runtime_source(input: &[u8], identities: &[Identity]) -> Result<SecretsFile> {
     if is_bundle_ciphertext(input) {
         if identities.is_empty() {
@@ -335,7 +338,13 @@ pub fn resolve_runtime_source(input: &[u8], identities: &[Identity]) -> Result<S
         return decrypt_bundle(input, identities);
     }
 
-    deserialize_json(input)
+    let secrets = deserialize_json(input)?;
+
+    if !identities.is_empty() && secrets.has_inline_ciphertext() {
+        return decrypt_inline(&secrets, identities);
+    }
+
+    Ok(secrets)
 }
 
 /// Resolve runtime source from file as either plaintext JSON or bundle ciphertext.
@@ -622,6 +631,83 @@ mod tests {
         let json = serde_json::to_vec(&secrets).expect("serialize should succeed");
         let resolved = resolve_runtime_source(&json, &[]).expect("resolve should succeed");
         assert_eq!(resolved, secrets);
+    }
+
+    #[test]
+    fn resolve_runtime_source_inline_encrypted_with_identities_decrypts() {
+        let secrets = fixture_secrets();
+        let recipient = fixture_recipient();
+        let identity = fixture_identity();
+        let encrypted = encrypt_inline(&secrets, &[recipient]).expect("inline encrypt");
+        let json = serde_json::to_vec(&encrypted).expect("serialize");
+
+        let resolved =
+            resolve_runtime_source(&json, std::slice::from_ref(&identity)).expect("should decrypt");
+
+        // Values should be decrypted
+        let project = &resolved.projects[0];
+        assert_eq!(
+            project.credentials["A_KEY"].value.as_deref(),
+            Some("a-value")
+        );
+        assert_eq!(
+            project.credentials["B_KEY"].value.as_deref(),
+            Some("b-value")
+        );
+        // Ref credentials preserved
+        assert_eq!(
+            project.credentials["REF_ONLY"].reference.as_deref(),
+            Some("vault://secret/path")
+        );
+    }
+
+    #[test]
+    fn resolve_runtime_source_inline_encrypted_without_identities_preserves_ciphertext() {
+        let secrets = fixture_secrets();
+        let recipient = fixture_recipient();
+        let encrypted = encrypt_inline(&secrets, &[recipient]).expect("inline encrypt");
+        let json = serde_json::to_vec(&encrypted).expect("serialize");
+
+        let resolved = resolve_runtime_source(&json, &[]).expect("should succeed");
+
+        // Values should still be inline-encrypted (no identities to decrypt with)
+        let project = &resolved.projects[0];
+        assert!(project.credentials["A_KEY"]
+            .value
+            .as_ref()
+            .unwrap()
+            .starts_with(INLINE_CIPHERTEXT_PREFIX));
+    }
+
+    #[test]
+    fn resolve_runtime_source_mixed_plaintext_and_inline_with_identities() {
+        let mut secrets = fixture_secrets();
+        let recipient = fixture_recipient();
+        let identity = fixture_identity();
+
+        // Encrypt only B_KEY inline, leave A_KEY as plaintext
+        let b_encrypted =
+            seclusor_crypto::encrypt_inline_value(b"b-value", std::slice::from_ref(&recipient))
+                .expect("inline encrypt value");
+        secrets.projects[0]
+            .credentials
+            .get_mut("B_KEY")
+            .unwrap()
+            .value = Some(b_encrypted);
+
+        let json = serde_json::to_vec(&secrets).expect("serialize");
+        let resolved =
+            resolve_runtime_source(&json, std::slice::from_ref(&identity)).expect("should decrypt");
+
+        let project = &resolved.projects[0];
+        assert_eq!(
+            project.credentials["A_KEY"].value.as_deref(),
+            Some("a-value")
+        );
+        assert_eq!(
+            project.credentials["B_KEY"].value.as_deref(),
+            Some("b-value")
+        );
     }
 
     #[test]
