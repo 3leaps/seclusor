@@ -722,18 +722,39 @@ fn handle_blob_command(command: BlobSubcommand) -> CliResult<()> {
 /// Default blob file size limit (10 MB).
 const BLOB_MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
 
-fn handle_blob_encrypt(args: BlobEncryptArgs) -> CliResult<()> {
-    let meta = fs::metadata(&args.input)?;
-    if !args.allow_large && meta.len() > BLOB_MAX_FILE_BYTES {
-        return Err(CliError::Message(format!(
-            "input file exceeds {} MB limit (actual: {} bytes). \
-             Use --allow-large to override.",
-            BLOB_MAX_FILE_BYTES / (1024 * 1024),
-            meta.len()
-        )));
+/// Read a file with an optional size cap enforced at read time (no TOCTOU gap).
+fn read_file_bounded(path: &Path, max: Option<u64>) -> CliResult<Vec<u8>> {
+    let mut file = fs::File::open(path)?;
+    match max {
+        Some(limit) => {
+            let mut limited = std::io::Read::by_ref(&mut file).take(limit + 1);
+            let mut buf = Vec::new();
+            limited.read_to_end(&mut buf)?;
+            if buf.len() as u64 > limit {
+                return Err(CliError::Message(format!(
+                    "input file exceeds {} MB limit (read {} bytes). \
+                     Use --allow-large to override.",
+                    limit / (1024 * 1024),
+                    buf.len()
+                )));
+            }
+            Ok(buf)
+        }
+        None => {
+            let mut buf = Vec::new();
+            file.read_to_end(&mut buf)?;
+            Ok(buf)
+        }
     }
+}
 
-    let plaintext = fs::read(&args.input)?;
+fn handle_blob_encrypt(args: BlobEncryptArgs) -> CliResult<()> {
+    let limit = if args.allow_large {
+        None
+    } else {
+        Some(BLOB_MAX_FILE_BYTES)
+    };
+    let plaintext = read_file_bounded(&args.input, limit)?;
     let recipients = resolve_recipients(&args.recipients)?;
     let ciphertext = seclusor_crypto::encrypt(&plaintext, &recipients)?;
     fs::write(&args.output, &ciphertext)?;
@@ -741,45 +762,33 @@ fn handle_blob_encrypt(args: BlobEncryptArgs) -> CliResult<()> {
 }
 
 fn handle_blob_decrypt(args: BlobDecryptArgs) -> CliResult<()> {
-    let meta = fs::metadata(&args.input)?;
-    if !args.allow_large && meta.len() > BLOB_MAX_FILE_BYTES {
-        return Err(CliError::Message(format!(
-            "input file exceeds {} MB limit (actual: {} bytes). \
-             Use --allow-large to override.",
-            BLOB_MAX_FILE_BYTES / (1024 * 1024),
-            meta.len()
-        )));
-    }
-
+    let limit = if args.allow_large {
+        None
+    } else {
+        Some(BLOB_MAX_FILE_BYTES)
+    };
     let identities = resolve_identities(&args.identities, &args.passphrase, true)?;
-    let ciphertext = fs::read(&args.input)?;
+    let ciphertext = read_file_bounded(&args.input, limit)?;
     let plaintext = seclusor_crypto::decrypt(&ciphertext, &identities)?;
 
-    // Atomic write: temp file + rename to avoid partial output on failure
+    // Atomic write via unique temp file (create_new semantics, no symlink risk)
     let output_dir = args.output.parent().unwrap_or(Path::new("."));
-    let temp_path = output_dir.join(format!(".seclusor-blob-{}.tmp", std::process::id()));
+    let mut temp = tempfile::NamedTempFile::new_in(output_dir)?;
 
-    // Write to temp file with 0600 permissions (decrypted content is sensitive)
+    // Set 0600 before writing sensitive content
+    #[cfg(unix)]
     {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&temp_path)?;
-            std::io::Write::write_all(&mut file, &plaintext)?;
-        }
-
-        #[cfg(not(unix))]
-        {
-            fs::write(&temp_path, &plaintext)?;
-        }
+        use std::os::unix::fs::PermissionsExt;
+        temp.as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))?;
     }
 
-    fs::rename(&temp_path, &args.output)?;
+    std::io::Write::write_all(&mut temp, &plaintext)?;
+
+    // persist() replaces the target atomically on Unix; on Windows it
+    // falls back to a non-atomic but correct rename-with-overwrite.
+    temp.persist(&args.output)
+        .map_err(|e| CliError::Io(e.error))?;
     Ok(())
 }
 
