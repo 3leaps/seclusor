@@ -146,23 +146,33 @@ pub fn is_passphrase_protected_identity(path: impl AsRef<Path>) -> Result<bool> 
 
 /// Load identities from a passphrase-protected identity file.
 ///
-/// Reads the file (capped at `MAX_PROTECTED_IDENTITY_FILE_BYTES`), decrypts
-/// with the passphrase, and parses the inner identity content.
+/// On Unix, file permissions must be exactly `0600` (same contract as
+/// plaintext identity files). Reads through a bounded reader capped at
+/// `MAX_PROTECTED_IDENTITY_FILE_BYTES` to prevent resource exhaustion.
 pub fn load_identity_file_with_passphrase(
     path: impl AsRef<Path>,
     passphrase: &SecretString,
 ) -> Result<Vec<Identity>> {
     let path = path.as_ref();
 
-    let meta = fs::metadata(path)?;
-    if meta.len() > MAX_PROTECTED_IDENTITY_FILE_BYTES as u64 {
+    // Enforce 0600 permissions — same contract as plaintext identities
+    seclusor_crypto::assert_secure_permissions(path)?;
+
+    // Bounded read to enforce size cap at read time (no TOCTOU gap)
+    let max = MAX_PROTECTED_IDENTITY_FILE_BYTES as u64;
+    let mut file = File::open(path)?;
+    let mut limited = std::io::Read::by_ref(&mut file).take(max + 1);
+    let mut raw_bytes = Vec::new();
+    limited
+        .read_to_end(&mut raw_bytes)
+        .map_err(|_| KeyringError::ProtectedIdentityDecryptFailed)?;
+    if raw_bytes.len() as u64 > max {
         return Err(KeyringError::ProtectedIdentityFileTooLarge {
-            actual: meta.len(),
+            actual: raw_bytes.len() as u64,
             max: MAX_PROTECTED_IDENTITY_FILE_BYTES,
         });
     }
 
-    let raw_bytes = fs::read(path)?;
     let raw =
         String::from_utf8(raw_bytes).map_err(|_| KeyringError::ProtectedIdentityDecryptFailed)?;
 
@@ -917,6 +927,11 @@ mod tests {
             content.push_str("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n");
         }
         fs::write(&path, &content).expect("write oversized");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("set perms");
+        }
 
         let passphrase = SecretString::from("irrelevant");
         let err = match load_identity_file_with_passphrase(&path, &passphrase) {
@@ -940,6 +955,11 @@ mod tests {
             AGE_ARMOR_BEGIN
         );
         fs::write(&path, &content).expect("write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("set perms");
+        }
 
         let passphrase = SecretString::from("any");
         let err = match load_identity_file_with_passphrase(&path, &passphrase) {
