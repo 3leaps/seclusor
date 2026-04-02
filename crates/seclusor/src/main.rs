@@ -152,13 +152,13 @@ enum DocsSubcommand {
 
 #[derive(Debug, Parser)]
 struct DocsListArgs {
-    #[arg(long, value_enum, default_value_t = DocsFormatArg::Plain)]
+    #[arg(long, value_enum, default_value_t = DocsFormatArg::Plain, help = "Output format")]
     format: DocsFormatArg,
 }
 
 #[derive(Debug, Parser)]
 struct DocsShowArgs {
-    #[arg(long, value_enum, default_value_t = DocsFormatArg::Plain)]
+    #[arg(long, value_enum, default_value_t = DocsFormatArg::Plain, help = "Output format")]
     format: DocsFormatArg,
     slug: String,
 }
