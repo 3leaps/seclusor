@@ -33,13 +33,18 @@ seclusor secrets export-env --file secrets.json --project demo --format export
 The most common and safest pattern is using `seclusor run` to inject secrets without exposing them in shell history or process lists.
 
 ```bash
-# Run a command with secrets injected from an armored bundle
+# Generate a passphrase-protected identity (recommended):
+seclusor keys age identity generate --output ~/.config/seclusor/identity.txt --passphrase
+# Note the age1... recipient printed to stdout
+
+# Run a command with secrets injected from an armored bundle:
 seclusor secrets run \
   --file secrets.age \
   --identity-file ~/.config/seclusor/identity.txt \
   --project demo \
   --allow APP_* \
   -- env | grep APP_
+# You'll be prompted for the passphrase if the identity is protected
 ```
 
 Other patterns (export to .env, library calls, or building a secret server) are also supported.

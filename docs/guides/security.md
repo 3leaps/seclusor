@@ -14,14 +14,28 @@ Seclusor is a security-sensitive library and tool for managing encrypted secrets
 
 ## Key Rotation and Rekeying
 
-Rekeying allows you to change the recipient set on existing armored files without decrypting the plaintext values.
+Rekeying allows you to change the recipient set on existing armored files
+without decrypting the plaintext values. Rekeying functions are available
+as a library API (`seclusor-keyring`); a CLI subcommand is planned.
+
+See `docs/guides/key-management.md` for the full rekeying workflow.
+
+## Identity Protection
+
+Passphrase-protected identity files encrypt the secret key at rest using
+age scrypt mode. This is the recommended default for non-ephemeral
+environments — the same principle as SSH keys with passphrases.
 
 ```bash
-# Rekey a bundle to new recipients
-seclusor secrets rekey --file secrets.age --identity-file old.txt --recipient age1...new1 --recipient age1...new2
+# Generate a passphrase-protected identity
+seclusor keys age identity generate --output ~/.config/seclusor/identity.txt --passphrase
 ```
 
-See `docs/guides/key-management.md` for full rekeying workflow, especially for **glassbreak credentials** (root keys, master passphrases, long-term signing keys, and emergency break-glass accounts). These are the highest-sensitivity secrets and should almost never be stored in git.
+For high-sensitivity keys (root keys, long-term signing keys, emergency
+break-glass accounts), always use passphrase-protected identities and
+store them outside of version control. See the
+[identity and recipients guide](identity-and-recipients.md) for full
+details on passphrase input channels and migration.
 
 ## Compromise Response
 
