@@ -122,7 +122,7 @@ When you generate an identity, the corresponding recipient is printed to
 stdout. You can also extract it from an existing identity file:
 
 ```bash
-grep "^# public key:" ~/.config/seclusor/identity.txt
+grep -i '^# public key:' ~/.config/seclusor/identity.txt
 ```
 
 ## How they work together
@@ -221,6 +221,18 @@ Any team member can decrypt with their own identity file.
 | Linux    | `0600` enforced        | `chmod 600 identity.txt`             |
 | macOS    | `0600` enforced        | Same as Linux                        |
 | Windows  | Not enforced           | Use NTFS ACLs or user-only directory |
+
+## Troubleshooting protected identities
+
+When decrypting with a passphrase-protected identity:
+
+- **`wrong passphrase or corrupted identity file`** means seclusor could
+  not unlock the identity file with the supplied passphrase.
+- **`decryption failed`** means the identity unlocked successfully, but
+  it does not match the ciphertext's recipient set.
+
+In migration workflows, this usually means you are trying an old identity
+against ciphertext encrypted for a new recipient.
 
 ## See also
 
