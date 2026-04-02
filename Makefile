@@ -742,20 +742,18 @@ release-notes: ## Copy release notes to dist
 release-upload: release-verify release-notes ## Upload provenance only (checksums, signatures, keys, notes)
 	./scripts/upload-release-assets.sh $(SECLUSOR_RELEASE_TAG) $(DIST_RELEASE)
 	@echo ""
-	@echo "Updating Homebrew formula..."
-	@$(MAKE) update-homebrew-formula
-	@echo ""
-	@echo "Updating Scoop manifest..."
-	@$(MAKE) update-scoop-manifest
+	@echo "Next steps:"
+	@echo "  1. Undraft the release on GitHub"
+	@echo "  2. make update-homebrew-formula"
+	@echo "  3. make update-scoop-manifest"
 
 release-upload-all: release-verify release-notes ## Upload all assets including platform binaries
 	./scripts/upload-release-assets.sh $(SECLUSOR_RELEASE_TAG) $(DIST_RELEASE) --all
 	@echo ""
-	@echo "Updating Homebrew formula..."
-	@$(MAKE) update-homebrew-formula
-	@echo ""
-	@echo "Updating Scoop manifest..."
-	@$(MAKE) update-scoop-manifest
+	@echo "Next steps:"
+	@echo "  1. Undraft the release on GitHub"
+	@echo "  2. make update-homebrew-formula"
+	@echo "  3. make update-scoop-manifest"
 
 update-homebrew-formula: ## Update homebrew-tap formula (requires sibling ../homebrew-tap)
 	@echo "Updating Homebrew formula for seclusor $(VERSION)..."

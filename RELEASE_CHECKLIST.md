@@ -90,17 +90,18 @@ Use this checklist before tagging and publishing any `vX.Y.Z` release.
 28. Optional lanes (if omitted) are called out explicitly in notes.
 29. Draft verified by four-eyes (`devrev`) and security (`secrev`) for
     release readiness.
-30. Only after all checks pass: undraft/publish the GitHub release.
 
 ## Post-Publish
 
-31. Upload signed assets and release notes (also triggers homebrew and scoop
-    update targets automatically):
+30. Upload signed assets and release notes:
     ```bash
     make release-upload
     ```
-32. Review and commit homebrew-tap formula update:
+31. Undraft/publish the GitHub release.
+32. Update and commit homebrew-tap formula (**must run after undraft** —
+    the tap script queries the latest published release):
     ```bash
+    make update-homebrew-formula
     cd ../homebrew-tap
     git diff Formula/seclusor.rb
     make audit APP=seclusor
@@ -108,8 +109,9 @@ Use this checklist before tagging and publishing any `vX.Y.Z` release.
     git add Formula/seclusor.rb && git commit -m "Update seclusor to vX.Y.Z"
     git push
     ```
-33. Review and commit scoop-bucket manifest update:
+33. Update and commit scoop-bucket manifest:
     ```bash
+    make update-scoop-manifest
     cd ../scoop-bucket
     git diff bucket/seclusor.json
     python3 -m json.tool bucket/seclusor.json >/dev/null
