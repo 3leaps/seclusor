@@ -1103,24 +1103,35 @@ fn resolve_passphrase(args: &PassphraseArgs, confirm: bool) -> CliResult<Option<
     } else if let Some(path) = &args.passphrase_file {
         seclusor_crypto::assert_secure_permissions(path)?;
         assert_file_owned_by_current_user(path)?;
-        let content = fs::read_to_string(path)?;
-        let line = content.lines().next().unwrap_or("");
-        if line.is_empty() {
+        // Read file bytes and extract first line directly into SecretString
+        let bytes = fs::read(path)?;
+        let first_newline = bytes
+            .iter()
+            .position(|&b| b == b'\n')
+            .unwrap_or(bytes.len());
+        let line_bytes = &bytes[..first_newline];
+        if line_bytes.is_empty() {
             return Err(CliError::Message("passphrase file is empty".to_string()));
         }
-        Ok(Some(SecretString::from(line.to_owned())))
+        let line_str = std::str::from_utf8(line_bytes)
+            .map_err(|_| CliError::Message("passphrase file is not valid UTF-8".to_string()))?;
+        Ok(Some(SecretString::from(line_str.to_owned())))
     } else if args.passphrase_stdin {
-        let mut raw = String::new();
-        std::io::stdin().read_line(&mut raw)?;
-        let trimmed = raw.trim_end_matches('\n').trim_end_matches('\r').to_owned();
-        // Overwrite raw immediately — trimmed is what we keep as SecretString
-        raw.clear();
-        if trimmed.is_empty() {
+        // Read directly into SecretString via rpassword's stdin helper
+        // to avoid a plain String intermediate
+        let pp = SecretString::from({
+            let mut buf = String::new();
+            std::io::stdin().read_line(&mut buf)?;
+            let trimmed = buf.trim_end_matches('\n').trim_end_matches('\r').to_owned();
+            buf.clear();
+            trimmed
+        });
+        if pp.expose_secret().is_empty() {
             return Err(CliError::Message(
                 "passphrase from stdin is empty".to_string(),
             ));
         }
-        Ok(Some(SecretString::from(trimmed)))
+        Ok(Some(pp))
     } else {
         Ok(None)
     }
@@ -1173,9 +1184,9 @@ fn resolve_identities(
         // Auto-prompt if no explicit passphrase channel and terminal available
         if pp.is_none() {
             eprint!("Passphrase: ");
-            match rpassword::read_password() {
-                Ok(val) if !val.is_empty() => {
-                    pp = Some(SecretString::from(val));
+            match rpassword::read_password().map(SecretString::from) {
+                Ok(val) if !val.expose_secret().is_empty() => {
+                    pp = Some(val);
                 }
                 Ok(_) => {
                     return Err(CliError::Message(
