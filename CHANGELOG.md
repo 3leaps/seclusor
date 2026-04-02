@@ -6,6 +6,35 @@ All notable changes to seclusor will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.1.4] - 2026-04-02
+
+### Added
+
+- Passphrase-protected identity files: generate and use age identity files encrypted with scrypt passphrases (SC-008). Four input channels: interactive prompt (`--passphrase`), environment variable (`--passphrase-env`), file (`--passphrase-file`), stdin (`--passphrase-stdin`).
+- Library API for passphrase-protected identities in `seclusor-keyring`: `generate_identity_file_with_passphrase`, `load_identity_file_with_passphrase`, `load_identity_file_auto`, `is_passphrase_protected_identity`
+- Help text on all CLI arguments across all commands (SC-007 Part A)
+- Identity and recipients documentation guide (`docs/guides/identity-and-recipients.md`) explaining the conceptual model, file format, permissions, passphrase protection, and team workflows (SC-007 Part B)
+- Homebrew formula and Scoop manifest for seclusor
+- `update-homebrew-formula` and `update-scoop-manifest` Makefile targets wired into `release-upload`
+- `release-upload-all` target for uploading platform binaries alongside provenance
+
+### Changed
+
+- Release assets now use org-standard bare binary naming (`seclusor-darwin-arm64`, `seclusor-linux-amd64`, etc.) instead of versioned archives (DDR-0003)
+- `release-upload` now uploads provenance only (checksums, signatures, keys, notes); use `release-upload-all` for full assets
+- CLI help text for `--value` and `--ref` explains the distinction and portability guidance (SC-007, carried from v0.1.3 cycle)
+- `InlineEncrypted` error message no longer references passphrase (deferred until CLI support existed; now delivered in this release)
+- Security guide updated: removed premature `secrets rekey` CLI example, added identity protection section
+
+### Security
+
+- Passphrase-protected identity files enforce 0600 permissions on Unix, same as plaintext identities. Passphrase files (`--passphrase-file`) additionally enforce current-user ownership
+- Passphrases held as `SecretString` (zeroized on drop) at all CLI boundaries; never stored as plain `String`
+- Protected identity file size capped at 8 KiB before decryption attempt
+- Malformed armor in protected identity files fails closed (no plaintext fallback)
+
+See `docs/releases/v0.1.4.md` for full notes.
+
 ## [0.1.3] - 2026-03-30
 
 ### Security

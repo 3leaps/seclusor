@@ -19,12 +19,15 @@ AGE-SECRET-KEY-1QFWZNC...
 ### Generating an identity
 
 ```bash
+# Passphrase-protected (recommended for non-ephemeral environments):
+seclusor keys age identity generate --output ~/.config/seclusor/identity.txt --passphrase
+
+# Plaintext (for automated pipelines with hardware-secured storage):
 seclusor keys age identity generate --output ~/.config/seclusor/identity.txt
 ```
 
-This creates a new identity file and prints the corresponding recipient
-(public key) to stdout. Share the recipient freely; keep the identity file
-private.
+Both forms print the corresponding recipient (public key) to stdout.
+Share the recipient freely; keep the identity file private.
 
 ### File permissions
 
@@ -47,6 +50,49 @@ Seclusor refuses to write identity files under the repository root
 (pathguard). This prevents accidentally committing private keys. Store
 identity files outside your repository — `~/.config/seclusor/` is a
 good default.
+
+### Passphrase-protected identities
+
+A passphrase-protected identity file encrypts the secret key at rest using
+age's scrypt passphrase mode. The public key remains visible in a header
+comment so you can encrypt without decrypting the identity. This is the
+equivalent of an SSH key with a passphrase.
+
+```
+# This is a passphrase-protected seclusor identity file.
+# Public key: age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p
+# To use this identity, you will be prompted for a passphrase.
+-----BEGIN AGE ENCRYPTED FILE-----
+<scrypt-encrypted identity>
+-----END AGE ENCRYPTED FILE-----
+```
+
+When you use a protected identity, seclusor detects the format
+automatically and prompts for the passphrase. For non-interactive
+environments (CI, automation), provide the passphrase via:
+
+| Channel              | Flag                     | Use case                       |
+| -------------------- | ------------------------ | ------------------------------ |
+| Interactive prompt   | `--passphrase`           | Developer workstation          |
+| Environment variable | `--passphrase-env VAR`   | CI/automation                  |
+| File                 | `--passphrase-file PATH` | Local dev (0600, owned by you) |
+| Stdin pipe           | `--passphrase-stdin`     | Automation chaining            |
+
+Only one passphrase channel can be used per command. If a protected identity
+is detected and no channel is specified, seclusor auto-prompts if a terminal
+is available.
+
+**When to use each**:
+
+- **Passphrase-protected**: shared infrastructure, backups, laptops,
+  compliance environments — anywhere the identity file might be exposed
+- **Plaintext**: automated pipelines with hardware-secured storage,
+  ephemeral environments where passphrase management adds friction
+  without security benefit
+
+**Migrating to passphrase-protected**: generate a new protected identity,
+add the new recipient to your recipient set, and rekey existing bundles.
+The old plaintext identity can then be securely deleted.
 
 ## Recipients
 
