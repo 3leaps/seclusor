@@ -1169,8 +1169,10 @@ dependencies = [
 name = "seclusor-keyring"
 version = "0.1.4"
 dependencies = [
+ "age",
  "seclusor-core",
  "seclusor-crypto",
+ "secrecy",
  "tempfile",
  "thiserror",
 ]
