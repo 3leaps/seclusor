@@ -152,34 +152,37 @@ enum DocsSubcommand {
 
 #[derive(Debug, Parser)]
 struct DocsListArgs {
-    #[arg(long, value_enum, default_value_t = DocsFormatArg::Plain)]
+    #[arg(long, value_enum, default_value_t = DocsFormatArg::Plain, help = "Output format")]
     format: DocsFormatArg,
 }
 
 #[derive(Debug, Parser)]
 struct DocsShowArgs {
-    #[arg(long, value_enum, default_value_t = DocsFormatArg::Plain)]
+    #[arg(long, value_enum, default_value_t = DocsFormatArg::Plain, help = "Output format")]
     format: DocsFormatArg,
     slug: String,
 }
 
 #[derive(Debug, Parser)]
 struct IdentityGenerateArgs {
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Path to write the new identity file (must not exist; 0600 on Unix)"
+    )]
     output: PathBuf,
 }
 
 #[derive(Debug, Parser)]
 struct InitArgs {
-    #[arg(long, default_value = DEFAULT_SECRETS_FILE)]
+    #[arg(long, default_value = DEFAULT_SECRETS_FILE, help = "Path to secrets file")]
     file: PathBuf,
-    #[arg(long, default_value = "default")]
+    #[arg(long, default_value = "default", help = "Project slug")]
     project: String,
-    #[arg(long)]
+    #[arg(long, help = "Default env var prefix for this project")]
     env_prefix: Option<String>,
-    #[arg(long)]
+    #[arg(long, help = "Project description")]
     description: Option<String>,
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, help = "Overwrite existing file")]
     force: bool,
 }
 
@@ -218,15 +221,24 @@ struct SetArgs {
 
 #[derive(Debug, Parser)]
 struct GetArgs {
-    #[arg(long, default_value = DEFAULT_SECRETS_FILE)]
+    #[arg(long, default_value = DEFAULT_SECRETS_FILE, help = "Path to secrets file")]
     file: PathBuf,
-    #[arg(long)]
+    #[arg(long, help = "Project slug (auto-resolved if only one project exists)")]
     project: Option<String>,
-    #[arg(long)]
+    #[arg(long, help = "Credential key name")]
     key: String,
-    #[arg(long, default_value_t = false)]
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Show the decrypted value (default: redacted)"
+    )]
     reveal: bool,
-    #[arg(long, default_value_t = false, conflicts_with = "reveal")]
+    #[arg(
+        long,
+        default_value_t = false,
+        conflicts_with = "reveal",
+        help = "Show description metadata only (no value)"
+    )]
     show_description: bool,
     #[command(flatten)]
     identities: IdentityArgs,
@@ -234,45 +246,54 @@ struct GetArgs {
 
 #[derive(Debug, Parser)]
 struct ListArgs {
-    #[arg(long, default_value = DEFAULT_SECRETS_FILE)]
+    #[arg(long, default_value = DEFAULT_SECRETS_FILE, help = "Path to secrets file")]
     file: PathBuf,
-    #[arg(long)]
+    #[arg(long, help = "Project slug (auto-resolved if only one project exists)")]
     project: Option<String>,
-    #[arg(long, short = 'v', default_value_t = false)]
+    #[arg(
+        long,
+        short = 'v',
+        default_value_t = false,
+        help = "Show KEY<TAB>description (no values)"
+    )]
     verbose: bool,
 }
 
 #[derive(Debug, Parser)]
 struct UnsetArgs {
-    #[arg(long, default_value = DEFAULT_SECRETS_FILE)]
+    #[arg(long, default_value = DEFAULT_SECRETS_FILE, help = "Path to secrets file")]
     file: PathBuf,
-    #[arg(long)]
+    #[arg(long, help = "Project slug (auto-resolved if only one project exists)")]
     project: Option<String>,
-    #[arg(long)]
+    #[arg(long, help = "Credential key name to remove")]
     key: String,
 }
 
 #[derive(Debug, Parser)]
 struct ValidateArgs {
-    #[arg(long, default_value = DEFAULT_SECRETS_FILE)]
+    #[arg(long, default_value = DEFAULT_SECRETS_FILE, help = "Path to secrets file")]
     file: PathBuf,
 }
 
 #[derive(Debug, Parser)]
 struct ExportEnvArgs {
-    #[arg(long, default_value = DEFAULT_SECRETS_FILE)]
+    #[arg(long, default_value = DEFAULT_SECRETS_FILE, help = "Path to secrets file")]
     file: PathBuf,
-    #[arg(long)]
+    #[arg(long, help = "Project slug (auto-resolved if only one project exists)")]
     project: Option<String>,
-    #[arg(long, value_enum, default_value_t = EnvFormatArg::Dotenv)]
+    #[arg(long, value_enum, default_value_t = EnvFormatArg::Dotenv, help = "Output format")]
     format: EnvFormatArg,
-    #[arg(long)]
+    #[arg(long, help = "Prefix to add to exported variable names")]
     prefix: Option<String>,
-    #[arg(long, default_value_t = false)]
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Include ref credentials as literal strings (default: excluded)"
+    )]
     emit_ref: bool,
-    #[arg(long = "allow")]
+    #[arg(long = "allow", help = "Glob pattern for keys to export (repeatable)")]
     allow: Vec<String>,
-    #[arg(long = "deny")]
+    #[arg(long = "deny", help = "Glob pattern for keys to exclude (repeatable)")]
     deny: Vec<String>,
     #[command(flatten)]
     identities: IdentityArgs,
@@ -280,35 +301,50 @@ struct ExportEnvArgs {
 
 #[derive(Debug, Parser)]
 struct ImportEnvArgs {
-    #[arg(long, default_value = DEFAULT_SECRETS_FILE)]
+    #[arg(long, default_value = DEFAULT_SECRETS_FILE, help = "Path to secrets file")]
     file: PathBuf,
-    #[arg(long)]
+    #[arg(long, help = "Project slug (auto-resolved if only one project exists)")]
     project: Option<String>,
-    #[arg(long, default_value = DEFAULT_CREDENTIAL_TYPE)]
+    #[arg(long, default_value = DEFAULT_CREDENTIAL_TYPE, help = "Credential type label")]
     credential_type: String,
-    #[arg(long)]
+    #[arg(long, help = "Only import env vars with this prefix")]
     prefix: Option<String>,
-    #[arg(long, default_value_t = true)]
+    #[arg(
+        long,
+        default_value_t = true,
+        help = "Strip prefix from imported key names"
+    )]
     strip_prefix: bool,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Import from a .env file instead of the current environment"
+    )]
     dotenv_file: Option<PathBuf>,
-    #[arg(long, default_value_t = false)]
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Create project if it does not exist"
+    )]
     create_project: bool,
 }
 
 #[derive(Debug, Parser)]
 struct RunArgs {
-    #[arg(long, default_value = DEFAULT_SECRETS_FILE)]
+    #[arg(long, default_value = DEFAULT_SECRETS_FILE, help = "Path to secrets file")]
     file: PathBuf,
-    #[arg(long)]
+    #[arg(long, help = "Project slug (auto-resolved if only one project exists)")]
     project: Option<String>,
-    #[arg(long)]
+    #[arg(long, help = "Prefix to add to injected variable names")]
     prefix: Option<String>,
-    #[arg(long, default_value_t = false)]
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Include ref credentials as literal strings (default: excluded)"
+    )]
     emit_ref: bool,
-    #[arg(long = "allow")]
+    #[arg(long = "allow", help = "Glob pattern for keys to inject (repeatable)")]
     allow: Vec<String>,
-    #[arg(long = "deny")]
+    #[arg(long = "deny", help = "Glob pattern for keys to exclude (repeatable)")]
     deny: Vec<String>,
     #[command(flatten)]
     identities: IdentityArgs,
@@ -330,9 +366,9 @@ enum BundleSubcommand {
 
 #[derive(Debug, Parser)]
 struct BundleEncryptArgs {
-    #[arg(long)]
+    #[arg(long, help = "Path to plaintext secrets file")]
     input: PathBuf,
-    #[arg(long)]
+    #[arg(long, help = "Path for encrypted .age output")]
     output: PathBuf,
     #[command(flatten)]
     recipients: RecipientArgs,
@@ -340,9 +376,9 @@ struct BundleEncryptArgs {
 
 #[derive(Debug, Parser)]
 struct BundleDecryptArgs {
-    #[arg(long)]
+    #[arg(long, help = "Path to encrypted .age bundle")]
     input: PathBuf,
-    #[arg(long)]
+    #[arg(long, help = "Path for decrypted output")]
     output: PathBuf,
     #[command(flatten)]
     identities: IdentityArgs,
@@ -362,9 +398,9 @@ enum InlineSubcommand {
 
 #[derive(Debug, Parser)]
 struct InlineEncryptArgs {
-    #[arg(long)]
+    #[arg(long, help = "Path to plaintext secrets file")]
     input: PathBuf,
-    #[arg(long)]
+    #[arg(long, help = "Path for inline-encrypted output")]
     output: PathBuf,
     #[command(flatten)]
     recipients: RecipientArgs,
@@ -372,9 +408,9 @@ struct InlineEncryptArgs {
 
 #[derive(Debug, Parser)]
 struct InlineDecryptArgs {
-    #[arg(long)]
+    #[arg(long, help = "Path to inline-encrypted secrets file")]
     input: PathBuf,
-    #[arg(long)]
+    #[arg(long, help = "Path for decrypted output")]
     output: PathBuf,
     #[command(flatten)]
     identities: IdentityArgs,
@@ -382,13 +418,13 @@ struct InlineDecryptArgs {
 
 #[derive(Debug, Parser)]
 struct ConvertArgs {
-    #[arg(long)]
+    #[arg(long, help = "Path to input secrets file")]
     input: PathBuf,
-    #[arg(long)]
+    #[arg(long, help = "Path for converted output")]
     output: PathBuf,
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, help = "Source codec (bundle or inline)")]
     from: StorageCodecArg,
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, help = "Target codec (bundle or inline)")]
     to: StorageCodecArg,
     #[command(flatten)]
     recipients: RecipientArgs,
@@ -398,17 +434,30 @@ struct ConvertArgs {
 
 #[derive(Debug, Clone, Args, Default)]
 struct RecipientArgs {
-    #[arg(long = "recipient")]
+    #[arg(
+        long = "recipient",
+        help = "Age public key (age1...) to encrypt for; repeatable for multi-recipient"
+    )]
     recipients: Vec<String>,
-    #[arg(long = "recipient-file")]
+    #[arg(
+        long = "recipient-file",
+        help = "Path to a file containing age recipients (one per line, # comments allowed)"
+    )]
     recipient_file: Option<PathBuf>,
-    #[arg(long = "recipient-env-var")]
+    #[arg(
+        long = "recipient-env-var",
+        help = "Environment variable containing age recipients (comma or newline separated)"
+    )]
     recipient_env_var: Option<String>,
 }
 
 #[derive(Debug, Clone, Args, Default)]
 struct IdentityArgs {
-    #[arg(long = "identity-file")]
+    #[arg(
+        long = "identity-file",
+        help = "Path to an age identity file (private key) for decryption; \
+                repeatable. File must be 0600 on Unix"
+    )]
     identity_files: Vec<PathBuf>,
 }
 
