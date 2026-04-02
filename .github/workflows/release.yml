@@ -161,10 +161,10 @@ jobs:
           mkdir -p dist
           find artifacts -type f -name "seclusor-*" -exec cp {} dist/ \;
           cd dist
-          ls -1 seclusor-* | sort | while read -r f; do
+          find . -maxdepth 1 -name "seclusor-*" -printf '%f\n' | sort | while read -r f; do
             shasum -a 256 "$f"
           done > SHA256SUMS
-          ls -1 seclusor-* | sort | while read -r f; do
+          find . -maxdepth 1 -name "seclusor-*" -printf '%f\n' | sort | while read -r f; do
             shasum -a 512 "$f"
           done > SHA512SUMS
       - name: Create draft release
