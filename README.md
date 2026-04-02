@@ -9,7 +9,7 @@ Seclusor is a library-first Rust project that lets developers, DevSecOps enginee
 
 **Important**: While armored secrets _can_ be stored in git, this is not always advisable. See [App Note 01: Git Storage of Armored Secrets](docs/appnotes/01-git-armored-storage.md) for the risk continuum and guidance by sensitivity level.
 
-**Lifecycle Phase**: `alpha` | Current version: **v0.1.3** (error redaction & credential recovery) | See [VERSION](VERSION) and [CHANGELOG.md](CHANGELOG.md)
+**Lifecycle Phase**: `alpha` | Current version: **v0.1.5** (blob encryption, passphrase-protected identities) | See [VERSION](VERSION) and [CHANGELOG.md](CHANGELOG.md)
 
 ## The Problem
 
@@ -30,6 +30,8 @@ Seclusor fills the gap for teams that want local-first, library-native, git-comp
 - **Two storage codecs**: Bundle (opaque, safest) and inline (`sec:age:v1:`) for when you need readable structure. Convert between them easily.
 - **Ed25519 signing** (`seclusor-crypto/signing` feature): Generate keypairs, sign messages, and verify signatures. Available in Rust (v0.1.1) and Go (v0.1.2). Secret keys are zeroized on drop and stored encrypted at rest using the existing age backend.
 - **Library-first design**: Use `seclusor-crypto`, `seclusor-codec`, and `seclusor-keyring` directly from Rust, Go, or TypeScript. No shelling out.
+- **Blob encryption**: Encrypt any file (shell scripts, configs, binary tokens) with `secrets blob encrypt`/`decrypt`. No JSON required.
+- **Passphrase-protected identities**: Encrypt identity files at rest with a passphrase, like SSH keys. Four input channels for automation.
 - **Secure CLI**: Full command set including `secrets run` (injects secrets without exposing them in CLI args, history, or process lists).
 - **Safe by default**: Redaction, stdout purity, no secrets in arguments, strict validation.
 - **Audience-focused**: Great for developers (local workflows), DevSecOps (secure pipelines), and integrators (library usage).

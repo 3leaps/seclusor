@@ -6,6 +6,26 @@ All notable changes to seclusor will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.1.5] - 2026-04-02
+
+### Added
+
+- `secrets blob encrypt` and `secrets blob decrypt` commands for opaque file encryption (SC-010). Encrypt any file (shell scripts, configs, binary tokens) using age identity/recipient keys — no JSON parsing or schema validation
+- 10 MB default size limit with `--allow-large` override (guardrail, not security boundary)
+- Atomic writes on blob decrypt via `tempfile::NamedTempFile` + `persist()` to avoid partial output on failure
+- Decrypt output created with 0600 permissions on Unix (decrypted content is assumed sensitive)
+
+### Changed
+
+- Release workflow checksum generation now uses `find` instead of `ls` (fixes shellcheck SC2012)
+
+### Security
+
+- Blob decrypt uses unique temp files with exclusive creation (no symlink or pre-existing file risk)
+- Blob file size limit enforced at read time via bounded reader (no TOCTOU gap)
+
+See `docs/releases/v0.1.5.md` for full notes.
+
 ## [0.1.4] - 2026-04-02
 
 ### Added
