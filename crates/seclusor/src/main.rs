@@ -26,7 +26,7 @@ use seclusor_keyring::{
     is_passphrase_protected_identity, load_identity_file_auto, KeyringError, Recipient,
     RecipientDiscoveryOptions, DEFAULT_RECIPIENTS_ENV_VAR,
 };
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
 
 const DEFAULT_SECRETS_FILE: &str = "secrets.json";
@@ -479,13 +479,17 @@ struct IdentityArgs {
 
 #[derive(Debug, Clone, Args, Default)]
 struct PassphraseArgs {
-    #[arg(long, help = "Prompt interactively for a passphrase (no echo)")]
+    #[arg(
+        long,
+        conflicts_with_all = ["passphrase_env", "passphrase_file", "passphrase_stdin"],
+        help = "Prompt interactively for a passphrase (no echo)"
+    )]
     passphrase: bool,
 
     #[arg(
         long,
         value_name = "VAR",
-        conflicts_with = "passphrase",
+        conflicts_with_all = ["passphrase", "passphrase_file", "passphrase_stdin"],
         help = "Read passphrase from the named environment variable"
     )]
     passphrase_env: Option<String>,
@@ -493,14 +497,14 @@ struct PassphraseArgs {
     #[arg(
         long,
         value_name = "PATH",
-        conflicts_with = "passphrase",
+        conflicts_with_all = ["passphrase", "passphrase_env", "passphrase_stdin"],
         help = "Read passphrase from a file (first line, 0600 enforced on Unix)"
     )]
     passphrase_file: Option<PathBuf>,
 
     #[arg(
         long,
-        conflicts_with = "passphrase",
+        conflicts_with_all = ["passphrase", "passphrase_env", "passphrase_file"],
         help = "Read passphrase from stdin (one line)"
     )]
     passphrase_stdin: bool,
@@ -1056,51 +1060,49 @@ fn resolve_recipients(args: &RecipientArgs) -> CliResult<Vec<Recipient>> {
 /// (identity generation), the interactive prompt asks twice.
 fn resolve_passphrase(args: &PassphraseArgs, confirm: bool) -> CliResult<Option<SecretString>> {
     if args.passphrase {
-        // Interactive prompt via rpassword
         let prompt = if confirm {
             "Enter passphrase: "
         } else {
             "Passphrase: "
         };
         eprint!("{prompt}");
-        let pp = rpassword::read_password().map_err(|_| {
+        let pp = SecretString::from(rpassword::read_password().map_err(|_| {
             CliError::Message(
-                "identity file is passphrase-protected but no interactive terminal \
-                 is available. Provide --passphrase-env, --passphrase-file, or \
-                 --passphrase-stdin."
+                "no interactive terminal available for passphrase prompt. \
+                 Provide --passphrase-env, --passphrase-file, or --passphrase-stdin."
                     .to_string(),
             )
-        })?;
-        if pp.is_empty() {
+        })?);
+        if pp.expose_secret().is_empty() {
             return Err(CliError::Message(
                 "passphrase must not be empty".to_string(),
             ));
         }
         if confirm {
             eprint!("Confirm passphrase: ");
-            let pp2 = rpassword::read_password().map_err(|_| {
+            let pp2 = SecretString::from(rpassword::read_password().map_err(|_| {
                 CliError::Message("failed to read passphrase confirmation".to_string())
-            })?;
-            if pp != pp2 {
+            })?);
+            if pp.expose_secret() != pp2.expose_secret() {
                 return Err(CliError::Message("passphrases do not match".to_string()));
             }
         }
-        Ok(Some(SecretString::from(pp)))
+        Ok(Some(pp))
     } else if let Some(var_name) = &args.passphrase_env {
-        let value = std::env::var(var_name).map_err(|_| {
+        let pp = SecretString::from(std::env::var(var_name).map_err(|_| {
             CliError::Message(format!(
                 "passphrase environment variable {var_name} is not set"
             ))
-        })?;
-        if value.is_empty() {
+        })?);
+        if pp.expose_secret().is_empty() {
             return Err(CliError::Message(format!(
                 "passphrase environment variable {var_name} is set but empty"
             )));
         }
-        Ok(Some(SecretString::from(value)))
+        Ok(Some(pp))
     } else if let Some(path) = &args.passphrase_file {
-        // Enforce 0600 permissions on passphrase file (same as identity files)
         seclusor_crypto::assert_secure_permissions(path)?;
+        assert_file_owned_by_current_user(path)?;
         let content = fs::read_to_string(path)?;
         let line = content.lines().next().unwrap_or("");
         if line.is_empty() {
@@ -1108,18 +1110,44 @@ fn resolve_passphrase(args: &PassphraseArgs, confirm: bool) -> CliResult<Option<
         }
         Ok(Some(SecretString::from(line.to_owned())))
     } else if args.passphrase_stdin {
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line)?;
-        let line = line.trim_end_matches('\n').trim_end_matches('\r');
-        if line.is_empty() {
+        let mut raw = String::new();
+        std::io::stdin().read_line(&mut raw)?;
+        let trimmed = raw.trim_end_matches('\n').trim_end_matches('\r').to_owned();
+        // Overwrite raw immediately — trimmed is what we keep as SecretString
+        raw.clear();
+        if trimmed.is_empty() {
             return Err(CliError::Message(
                 "passphrase from stdin is empty".to_string(),
             ));
         }
-        Ok(Some(SecretString::from(line.to_owned())))
+        Ok(Some(SecretString::from(trimmed)))
     } else {
         Ok(None)
     }
+}
+
+/// Assert that a file is owned by the current user (Unix only).
+fn assert_file_owned_by_current_user(path: &Path) -> CliResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::metadata(path)?;
+        let file_uid = meta.uid();
+        let my_uid = unsafe { libc::getuid() };
+        if file_uid != my_uid {
+            return Err(CliError::Message(format!(
+                "passphrase file must be owned by the current user (file uid: {file_uid}, \
+                 current uid: {my_uid})"
+            )));
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+
+    Ok(())
 }
 
 fn resolve_identities(
