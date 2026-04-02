@@ -780,8 +780,14 @@ update-homebrew-formula: ## Update homebrew-tap formula (requires sibling ../hom
 	else \
 		echo "[ok] Sibling repository found: $(HOMEBREW_TAP_DIR)"; \
 		$(MAKE) -C "$(HOMEBREW_TAP_DIR)" update APP=seclusor; \
+		formula_ver=$$(grep 'version "' "$(HOMEBREW_TAP_DIR)/Formula/seclusor.rb" | head -1 | sed 's/.*version "//;s/".*//'); \
+		if [ "$$formula_ver" != "$(VERSION)" ]; then \
+			echo "[!!] Version mismatch: formula has $$formula_ver, expected $(VERSION)"; \
+			echo "     Is the GitHub release published? Homebrew queries the latest published release."; \
+			exit 1; \
+		fi; \
 		echo ""; \
-		echo "[ok] Homebrew formula updated"; \
+		echo "[ok] Homebrew formula updated to $(VERSION)"; \
 		echo ""; \
 		echo "Next steps:"; \
 		echo "  1. Review:  cd $(HOMEBREW_TAP_DIR) && git diff Formula/seclusor.rb"; \
@@ -816,8 +822,13 @@ update-scoop-manifest: ## Update scoop-bucket manifest (requires sibling ../scoo
 	else \
 		echo "[ok] Sibling repository found: $(SCOOP_BUCKET_DIR)"; \
 		$(MAKE) -C "$(SCOOP_BUCKET_DIR)" update APP=seclusor VERSION=$(VERSION); \
+		manifest_ver=$$(python3 -c "import json; print(json.load(open('$(SCOOP_BUCKET_DIR)/bucket/seclusor.json'))['version'])"); \
+		if [ "$$manifest_ver" != "$(VERSION)" ]; then \
+			echo "[!!] Version mismatch: manifest has $$manifest_ver, expected $(VERSION)"; \
+			exit 1; \
+		fi; \
 		echo ""; \
-		echo "[ok] Scoop manifest updated"; \
+		echo "[ok] Scoop manifest updated to $(VERSION)"; \
 		echo ""; \
 		echo "Next steps:"; \
 		echo "  1. Review:  cd $(SCOOP_BUCKET_DIR) && git diff bucket/seclusor.json"; \
