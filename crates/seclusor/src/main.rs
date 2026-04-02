@@ -20,11 +20,13 @@ use seclusor_core::env::{
 use seclusor_core::error::sanitize_serde_json_error_message;
 use seclusor_core::validate::{normalize_description, validate_strict};
 use seclusor_core::{Credential, SeclusorError, SecretsFile};
-use seclusor_crypto::{load_identity_file, parse_recipients, CryptoError, Identity};
+use seclusor_crypto::{parse_recipients, CryptoError, Identity};
 use seclusor_keyring::{
-    discover_recipients, generate_identity_file, KeyringError, Recipient,
+    discover_recipients, generate_identity_file, generate_identity_file_with_passphrase,
+    is_passphrase_protected_identity, load_identity_file_auto, KeyringError, Recipient,
     RecipientDiscoveryOptions, DEFAULT_RECIPIENTS_ENV_VAR,
 };
+use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
 
 const DEFAULT_SECRETS_FILE: &str = "secrets.json";
@@ -170,6 +172,8 @@ struct IdentityGenerateArgs {
         help = "Path to write the new identity file (must not exist; 0600 on Unix)"
     )]
     output: PathBuf,
+    #[command(flatten)]
+    passphrase: PassphraseArgs,
 }
 
 #[derive(Debug, Parser)]
@@ -242,6 +246,8 @@ struct GetArgs {
     show_description: bool,
     #[command(flatten)]
     identities: IdentityArgs,
+    #[command(flatten)]
+    passphrase: PassphraseArgs,
 }
 
 #[derive(Debug, Parser)]
@@ -297,6 +303,8 @@ struct ExportEnvArgs {
     deny: Vec<String>,
     #[command(flatten)]
     identities: IdentityArgs,
+    #[command(flatten)]
+    passphrase: PassphraseArgs,
 }
 
 #[derive(Debug, Parser)]
@@ -348,6 +356,8 @@ struct RunArgs {
     deny: Vec<String>,
     #[command(flatten)]
     identities: IdentityArgs,
+    #[command(flatten)]
+    passphrase: PassphraseArgs,
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
 }
@@ -382,6 +392,8 @@ struct BundleDecryptArgs {
     output: PathBuf,
     #[command(flatten)]
     identities: IdentityArgs,
+    #[command(flatten)]
+    passphrase: PassphraseArgs,
 }
 
 #[derive(Debug, Parser)]
@@ -414,6 +426,8 @@ struct InlineDecryptArgs {
     output: PathBuf,
     #[command(flatten)]
     identities: IdentityArgs,
+    #[command(flatten)]
+    passphrase: PassphraseArgs,
 }
 
 #[derive(Debug, Parser)]
@@ -430,6 +444,8 @@ struct ConvertArgs {
     recipients: RecipientArgs,
     #[command(flatten)]
     identities: IdentityArgs,
+    #[command(flatten)]
+    passphrase: PassphraseArgs,
 }
 
 #[derive(Debug, Clone, Args, Default)]
@@ -459,6 +475,39 @@ struct IdentityArgs {
                 repeatable. File must be 0600 on Unix"
     )]
     identity_files: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args, Default)]
+struct PassphraseArgs {
+    #[arg(
+        long,
+        conflicts_with_all = ["passphrase_env", "passphrase_file", "passphrase_stdin"],
+        help = "Prompt interactively for a passphrase (no echo)"
+    )]
+    passphrase: bool,
+
+    #[arg(
+        long,
+        value_name = "VAR",
+        conflicts_with_all = ["passphrase", "passphrase_file", "passphrase_stdin"],
+        help = "Read passphrase from the named environment variable"
+    )]
+    passphrase_env: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with_all = ["passphrase", "passphrase_env", "passphrase_stdin"],
+        help = "Read passphrase from a file (first line, 0600 enforced on Unix)"
+    )]
+    passphrase_file: Option<PathBuf>,
+
+    #[arg(
+        long,
+        conflicts_with_all = ["passphrase", "passphrase_env", "passphrase_file"],
+        help = "Read passphrase from stdin (one line)"
+    )]
+    passphrase_stdin: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -624,7 +673,11 @@ fn handle_inline_command(command: InlineSubcommand) -> CliResult<()> {
 }
 
 fn handle_identity_generate(args: IdentityGenerateArgs) -> CliResult<()> {
-    let generated = generate_identity_file(&args.output)?;
+    let passphrase = resolve_passphrase(&args.passphrase, true)?;
+    let generated = match passphrase {
+        Some(pp) => generate_identity_file_with_passphrase(&args.output, &pp)?,
+        None => generate_identity_file(&args.output)?,
+    };
     println!("{}", generated.recipient);
     Ok(())
 }
@@ -666,7 +719,7 @@ fn handle_set(args: SetArgs) -> CliResult<()> {
 }
 
 fn handle_get(args: GetArgs) -> CliResult<()> {
-    let identities = resolve_identities(&args.identities, false)?;
+    let identities = resolve_identities(&args.identities, &args.passphrase, false)?;
     let secrets = read_runtime_secrets_file(&args.file, &identities)?;
     let credential = get_credential(&secrets, args.project.as_deref(), &args.key)?;
     match get_output_mode(&args) {
@@ -749,7 +802,7 @@ fn handle_validate(args: ValidateArgs) -> CliResult<()> {
 }
 
 fn handle_export_env(args: ExportEnvArgs) -> CliResult<()> {
-    let identities = resolve_identities(&args.identities, false)?;
+    let identities = resolve_identities(&args.identities, &args.passphrase, false)?;
     let secrets = read_runtime_secrets_file(&args.file, &identities)?;
     let output = render_export_env_output(&secrets, args.project.as_deref(), &args)?;
     println!("{output}");
@@ -815,7 +868,7 @@ fn handle_import_env(args: ImportEnvArgs) -> CliResult<()> {
 }
 
 fn handle_run(args: RunArgs) -> CliResult<()> {
-    let identities = resolve_identities(&args.identities, false)?;
+    let identities = resolve_identities(&args.identities, &args.passphrase, false)?;
     let secrets = read_runtime_secrets_file(&args.file, &identities)?;
     let env_vars = resolve_export_env_vars(
         &secrets,
@@ -851,7 +904,7 @@ fn handle_bundle_encrypt(args: BundleEncryptArgs) -> CliResult<()> {
 }
 
 fn handle_bundle_decrypt(args: BundleDecryptArgs) -> CliResult<()> {
-    let identities = resolve_identities(&args.identities, true)?;
+    let identities = resolve_identities(&args.identities, &args.passphrase, true)?;
     let secrets = decrypt_bundle_from_file(&args.input, &identities)?;
     write_secrets_file(&args.output, &secrets, false)?;
     println!("{}", args.output.display());
@@ -869,7 +922,7 @@ fn handle_inline_encrypt(args: InlineEncryptArgs) -> CliResult<()> {
 
 fn handle_inline_decrypt(args: InlineDecryptArgs) -> CliResult<()> {
     let secrets = read_secrets_file(&args.input)?;
-    let identities = resolve_identities(&args.identities, false)?;
+    let identities = resolve_identities(&args.identities, &args.passphrase, false)?;
     let decrypted = decrypt_inline(&secrets, &identities)?;
     write_secrets_file(&args.output, &decrypted, false)?;
     println!("{}", args.output.display());
@@ -886,7 +939,7 @@ fn handle_convert(args: ConvertArgs) -> CliResult<()> {
     }
 
     let recipients = resolve_recipients(&args.recipients)?;
-    let identities = resolve_identities(&args.identities, true)?;
+    let identities = resolve_identities(&args.identities, &args.passphrase, true)?;
 
     match (from, to) {
         (StorageCodec::Bundle, StorageCodec::Inline) => {
@@ -1001,11 +1054,163 @@ fn resolve_recipients(args: &RecipientArgs) -> CliResult<Vec<Recipient>> {
     Ok(recipients)
 }
 
-fn resolve_identities(args: &IdentityArgs, required: bool) -> CliResult<Vec<Identity>> {
-    let mut identities = Vec::new();
+/// Resolve a passphrase from the configured input channel.
+///
+/// Returns `None` if no passphrase flags are set. When `confirm` is true
+/// (identity generation), the interactive prompt asks twice.
+fn resolve_passphrase(args: &PassphraseArgs, confirm: bool) -> CliResult<Option<SecretString>> {
+    if args.passphrase {
+        let prompt = if confirm {
+            "Enter passphrase: "
+        } else {
+            "Passphrase: "
+        };
+        eprint!("{prompt}");
+        let pp = SecretString::from(rpassword::read_password().map_err(|_| {
+            CliError::Message(
+                "no interactive terminal available for passphrase prompt. \
+                 Provide --passphrase-env, --passphrase-file, or --passphrase-stdin."
+                    .to_string(),
+            )
+        })?);
+        if pp.expose_secret().is_empty() {
+            return Err(CliError::Message(
+                "passphrase must not be empty".to_string(),
+            ));
+        }
+        if confirm {
+            eprint!("Confirm passphrase: ");
+            let pp2 = SecretString::from(rpassword::read_password().map_err(|_| {
+                CliError::Message("failed to read passphrase confirmation".to_string())
+            })?);
+            if pp.expose_secret() != pp2.expose_secret() {
+                return Err(CliError::Message("passphrases do not match".to_string()));
+            }
+        }
+        Ok(Some(pp))
+    } else if let Some(var_name) = &args.passphrase_env {
+        let pp = SecretString::from(std::env::var(var_name).map_err(|_| {
+            CliError::Message(format!(
+                "passphrase environment variable {var_name} is not set"
+            ))
+        })?);
+        if pp.expose_secret().is_empty() {
+            return Err(CliError::Message(format!(
+                "passphrase environment variable {var_name} is set but empty"
+            )));
+        }
+        Ok(Some(pp))
+    } else if let Some(path) = &args.passphrase_file {
+        seclusor_crypto::assert_secure_permissions(path)?;
+        assert_file_owned_by_current_user(path)?;
+        // Read file bytes and extract first line directly into SecretString
+        let bytes = fs::read(path)?;
+        let first_newline = bytes
+            .iter()
+            .position(|&b| b == b'\n')
+            .unwrap_or(bytes.len());
+        let line_bytes = &bytes[..first_newline];
+        if line_bytes.is_empty() {
+            return Err(CliError::Message("passphrase file is empty".to_string()));
+        }
+        let line_str = std::str::from_utf8(line_bytes)
+            .map_err(|_| CliError::Message("passphrase file is not valid UTF-8".to_string()))?;
+        Ok(Some(SecretString::from(line_str.to_owned())))
+    } else if args.passphrase_stdin {
+        // Read directly into SecretString via rpassword's stdin helper
+        // to avoid a plain String intermediate
+        let pp = SecretString::from({
+            let mut buf = String::new();
+            std::io::stdin().read_line(&mut buf)?;
+            let trimmed = buf.trim_end_matches('\n').trim_end_matches('\r').to_owned();
+            buf.clear();
+            trimmed
+        });
+        if pp.expose_secret().is_empty() {
+            return Err(CliError::Message(
+                "passphrase from stdin is empty".to_string(),
+            ));
+        }
+        Ok(Some(pp))
+    } else {
+        Ok(None)
+    }
+}
 
+/// Assert that a file is owned by the current user (Unix only).
+fn assert_file_owned_by_current_user(path: &Path) -> CliResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::metadata(path)?;
+        let file_uid = meta.uid();
+        let my_uid = unsafe { libc::getuid() };
+        if file_uid != my_uid {
+            return Err(CliError::Message(format!(
+                "passphrase file must be owned by the current user (file uid: {file_uid}, \
+                 current uid: {my_uid})"
+            )));
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+
+    Ok(())
+}
+
+fn resolve_identities(
+    args: &IdentityArgs,
+    passphrase_args: &PassphraseArgs,
+    required: bool,
+) -> CliResult<Vec<Identity>> {
+    // Per SC-008 settled decision 1: scan all identity files first,
+    // error if more than one is passphrase-protected.
+    let mut protected_count = 0usize;
     for path in &args.identity_files {
-        identities.extend(load_identity_file(path)?);
+        if is_passphrase_protected_identity(path)? {
+            protected_count += 1;
+        }
+    }
+    if protected_count > 1 {
+        return Err(CliError::Keyring(KeyringError::MultipleProtectedIdentities));
+    }
+
+    // Resolve passphrase only if needed (at least one protected identity)
+    let passphrase = if protected_count > 0 {
+        let mut pp = resolve_passphrase(passphrase_args, false)?;
+        // Auto-prompt if no explicit passphrase channel and terminal available
+        if pp.is_none() {
+            eprint!("Passphrase: ");
+            match rpassword::read_password().map(SecretString::from) {
+                Ok(val) if !val.expose_secret().is_empty() => {
+                    pp = Some(val);
+                }
+                Ok(_) => {
+                    return Err(CliError::Message(
+                        "passphrase must not be empty".to_string(),
+                    ));
+                }
+                Err(_) => {
+                    return Err(CliError::Message(
+                        "identity file is passphrase-protected but no interactive \
+                         terminal is available. Provide --passphrase-env, \
+                         --passphrase-file, or --passphrase-stdin."
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        pp
+    } else {
+        None
+    };
+
+    let mut identities = Vec::new();
+    for path in &args.identity_files {
+        identities.extend(load_identity_file_auto(path, passphrase.as_ref())?);
     }
 
     if required && identities.is_empty() {
@@ -1465,6 +1670,7 @@ mod tests {
             reveal: false,
             show_description: false,
             identities: IdentityArgs::default(),
+            passphrase: PassphraseArgs::default(),
         })
         .expect_err("must reject invalid document");
         assert!(matches!(
@@ -1505,6 +1711,7 @@ mod tests {
             identities: IdentityArgs {
                 identity_files: vec![identity_file.clone()],
             },
+            passphrase: PassphraseArgs::default(),
         })
         .expect("get redacted from bundle");
 
@@ -1517,6 +1724,7 @@ mod tests {
             identities: IdentityArgs {
                 identity_files: vec![identity_file],
             },
+            passphrase: PassphraseArgs::default(),
         })
         .expect("get reveal from bundle");
     }
@@ -1547,6 +1755,7 @@ mod tests {
             reveal: false,
             show_description: false,
             identities: IdentityArgs::default(),
+            passphrase: PassphraseArgs::default(),
         })
         .expect_err("bundle runtime must require identities");
 
@@ -1587,6 +1796,7 @@ mod tests {
             identities: IdentityArgs {
                 identity_files: vec![wrong_identity_file],
             },
+            passphrase: PassphraseArgs::default(),
         })
         .expect_err("wrong identity should fail");
 
@@ -1929,6 +2139,7 @@ mod tests {
             allow: vec!["APP_API_*".to_string()],
             deny: vec![],
             identities: IdentityArgs::default(),
+            passphrase: PassphraseArgs::default(),
         };
 
         let output = render_export_env_output(&secrets, Some("demo"), &args).expect("export");
@@ -1959,6 +2170,7 @@ mod tests {
             allow: vec![],
             deny: vec![],
             identities: IdentityArgs::default(),
+            passphrase: PassphraseArgs::default(),
             command,
         })
         .expect_err("run should fail with command exit status");
@@ -1997,6 +2209,7 @@ mod tests {
             identities: IdentityArgs {
                 identity_files: vec![identity_file],
             },
+            passphrase: PassphraseArgs::default(),
         })
         .expect("export env from bundle");
     }
@@ -2029,6 +2242,7 @@ mod tests {
             allow: vec!["*".to_string()],
             deny: vec![],
             identities: IdentityArgs::default(),
+            passphrase: PassphraseArgs::default(),
         })
         .expect_err("bundle runtime must require identities");
 
@@ -2082,6 +2296,7 @@ mod tests {
             identities: IdentityArgs {
                 identity_files: vec![identity_file],
             },
+            passphrase: PassphraseArgs::default(),
             command,
         })
         .expect("run from bundle");
@@ -2124,6 +2339,7 @@ mod tests {
             identities: IdentityArgs {
                 identity_files: vec![wrong_identity_file],
             },
+            passphrase: PassphraseArgs::default(),
             command,
         })
         .expect_err("wrong identity should fail");
@@ -2165,6 +2381,7 @@ mod tests {
             identities: IdentityArgs {
                 identity_files: vec![wrong_identity_file],
             },
+            passphrase: PassphraseArgs::default(),
         })
         .expect_err("wrong identity should fail");
 
@@ -2232,6 +2449,7 @@ mod tests {
             identities: IdentityArgs {
                 identity_files: vec![identity_file],
             },
+            passphrase: PassphraseArgs::default(),
         })
         .expect("bundle decrypt");
 
@@ -2265,6 +2483,7 @@ mod tests {
             identities: IdentityArgs {
                 identity_files: vec![],
             },
+            passphrase: PassphraseArgs::default(),
         })
         .expect_err("missing identity-file should fail");
 
@@ -2305,6 +2524,7 @@ mod tests {
             identities: IdentityArgs {
                 identity_files: vec![identity_file],
             },
+            passphrase: PassphraseArgs::default(),
         })
         .expect("inline decrypt");
 
@@ -2342,6 +2562,7 @@ mod tests {
             identities: IdentityArgs {
                 identity_files: vec![identity_file.clone()],
             },
+            passphrase: PassphraseArgs::default(),
         })
         .expect("inline->bundle");
 
@@ -2358,6 +2579,7 @@ mod tests {
             identities: IdentityArgs {
                 identity_files: vec![identity_file],
             },
+            passphrase: PassphraseArgs::default(),
         })
         .expect("bundle->inline");
 
@@ -2372,6 +2594,7 @@ mod tests {
 
         handle_identity_generate(IdentityGenerateArgs {
             output: output.clone(),
+            passphrase: PassphraseArgs::default(),
         })
         .expect("generate identity");
 
