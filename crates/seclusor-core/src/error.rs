@@ -102,7 +102,7 @@ pub enum SeclusorError {
     CannotAutoCreateProject,
 
     /// Value is inline-encrypted and requires decryption.
-    #[error("{0} is inline-encrypted; provide identity/passphrase to decrypt")]
+    #[error("{0} is inline-encrypted; provide --identity-file to decrypt")]
     InlineEncrypted(String),
 
     /// Credential is a ref and --emit-ref was not specified.
