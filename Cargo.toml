@@ -10,16 +10,16 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/3leaps/seclusor"
 
 [workspace.dependencies]
-seclusor-core = { path = "crates/seclusor-core", version = "0.1.4" }
-seclusor-crypto = { path = "crates/seclusor-crypto", version = "0.1.4" }
-seclusor-codec = { path = "crates/seclusor-codec", version = "0.1.4" }
-seclusor-keyring = { path = "crates/seclusor-keyring", version = "0.1.4" }
+seclusor-core = { path = "crates/seclusor-core", version = "0.1.5" }
+seclusor-crypto = { path = "crates/seclusor-crypto", version = "0.1.5" }
+seclusor-codec = { path = "crates/seclusor-codec", version = "0.1.5" }
+seclusor-keyring = { path = "crates/seclusor-keyring", version = "0.1.5" }
 age = "0.11"
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
