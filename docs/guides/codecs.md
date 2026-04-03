@@ -27,3 +27,10 @@ seclusor secrets convert --file secrets.age --to-codec inline --recipient age1..
 ```
 
 Use `seclusor secrets convert` to switch formats.
+
+## Scenarios
+
+For end-to-end workflows using each codec:
+
+- [Bundle Credentials](scenarios/bundle-credentials.md) — full init → encrypt → run workflow
+- [Inline Credentials](scenarios/inline-credentials.md) — inline encrypt with git workflow

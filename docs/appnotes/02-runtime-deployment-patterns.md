@@ -38,3 +38,5 @@ Beyond git storage, seclusor supports several secure runtime patterns.
 - **High-sensitivity**: Local secure files + `seclusor run` or direct library use. Avoid persistent storage in shared systems.
 
 See [App Note 01: Git Storage of Armored Secrets](01-git-armored-storage.md) for the full risk continuum.
+
+For complete end-to-end runtime workflows, see [Workflow Scenarios](../guides/scenarios/index.md).

@@ -51,6 +51,12 @@ topics:
     tags: [appnotes, guidance, security, deployment]
     include:
       - appnotes/*.md
+  scenarios:
+    title: "Workflow Scenarios"
+    description: "End-to-end workflow guides for common use cases"
+    tags: [scenarios, howto, workflow, cookbook]
+    include:
+      - guides/scenarios/*.md
   releases:
     title: "Release Notes"
     description: "Version history and release summaries"

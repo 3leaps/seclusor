@@ -49,6 +49,8 @@ seclusor secrets run \
 
 Other patterns (export to .env, library calls, or building a secret server) are also supported.
 
+See [Workflow Scenarios](scenarios/index.md) for complete end-to-end guides covering bundle, inline, blob, CI, and team workflows.
+
 ## Encrypt for sharing and runtime
 
 Bundle files can be used directly as runtime input (recommended for security). Plaintext JSON works for local editing.

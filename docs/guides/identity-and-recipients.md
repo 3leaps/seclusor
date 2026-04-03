@@ -236,6 +236,9 @@ against ciphertext encrypted for a new recipient.
 
 ## See also
 
+- [Workflow Scenarios](scenarios/index.md) — end-to-end guides for common use cases
+- [Team Recipients](scenarios/team-recipients.md) — multi-recipient team workflows
+- [CI/Automation](scenarios/ci-automation.md) — passphrase channels in non-interactive pipelines
 - [Security model](security.md) — threat model, safety defaults, and
   secret handling
 - [CLI reference](cli-reference.md) — full command and flag documentation
