@@ -9,7 +9,7 @@ Seclusor is a library-first Rust project that lets developers, DevSecOps enginee
 
 **Important**: While armored secrets _can_ be stored in git, this is not always advisable. See [App Note 01: Git Storage of Armored Secrets](docs/appnotes/01-git-armored-storage.md) for the risk continuum and guidance by sensitivity level.
 
-**Lifecycle Phase**: `alpha` | Current version: **v0.1.5** (blob encryption, passphrase-protected identities) | See [VERSION](VERSION) and [CHANGELOG.md](CHANGELOG.md)
+**Lifecycle Phase**: `alpha` | Current version: **v0.1.6** (inline runtime fix, workflow scenarios guide) | See [VERSION](VERSION) and [CHANGELOG.md](CHANGELOG.md)
 
 ## The Problem
 
@@ -164,8 +164,8 @@ seclusor (CLI)         ← depends on all library crates
 Convert between them freely:
 
 ```bash
-seclusor secrets convert --file secrets.json --to-codec inline --recipient age1...
-seclusor secrets convert --file secrets.json --to-codec bundle --recipient age1...
+seclusor secrets convert --input secrets.age --output secrets-inline.json --from bundle --to inline --identity-file ./identity.txt --recipient age1...
+seclusor secrets convert --input secrets-inline.json --output secrets.age --from inline --to bundle --identity-file ./identity.txt --recipient age1...
 ```
 
 ## Language Bindings

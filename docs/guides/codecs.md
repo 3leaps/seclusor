@@ -22,11 +22,11 @@ See [App Note 01: Git Storage](../appnotes/01-git-armored-storage.md) for detail
 ## Convert
 
 ```bash
-seclusor secrets convert --file secrets.json --to-codec bundle --recipient age1...
-seclusor secrets convert --file secrets.age --to-codec inline --recipient age1...
+seclusor secrets convert --input secrets.json --output secrets.age --from inline --to bundle --identity-file ./identity.txt --recipient age1...
+seclusor secrets convert --input secrets.age --output secrets-inline.json --from bundle --to inline --identity-file ./identity.txt --recipient age1...
 ```
 
-Use `seclusor secrets convert` to switch formats.
+Use `seclusor secrets convert` to switch formats. Conversion requires an identity (to decrypt the source) and a recipient (to re-encrypt the target).
 
 ## Scenarios
 
