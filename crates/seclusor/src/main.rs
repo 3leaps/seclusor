@@ -849,6 +849,11 @@ fn handle_get(args: GetArgs) -> CliResult<()> {
         }
         GetOutputMode::Reveal => {
             if let Some(value) = &credential.value {
+                if value.starts_with(seclusor_core::constants::INLINE_CIPHERTEXT_PREFIX) {
+                    return Err(CliError::Core(SeclusorError::InlineEncrypted(
+                        args.key.clone(),
+                    )));
+                }
                 println!("{value}");
                 return Ok(());
             }
@@ -3055,5 +3060,157 @@ mod tests {
         // Error must not contain plaintext
         let msg = err.to_string();
         assert!(!msg.contains("secret data"));
+    }
+
+    // --- inline-encrypted runtime tests (SC-012) ---
+
+    fn write_inline_encrypted_file(dir: &std::path::Path) -> (PathBuf, PathBuf) {
+        let input = dir.join("plaintext.json");
+        let inline = dir.join("inline-encrypted.json");
+        let identity_file = dir.join("inline-identity.txt");
+        let secrets = fixture_secrets();
+        write_secrets_file(&input, &secrets, true).expect("write input");
+        write_identity_file(&identity_file, TEST_IDENTITY);
+
+        handle_inline_encrypt(InlineEncryptArgs {
+            input,
+            output: inline.clone(),
+            recipients: RecipientArgs {
+                recipients: vec![fixture_recipient_string()],
+                recipient_file: None,
+                recipient_env_var: None,
+            },
+        })
+        .expect("inline encrypt");
+
+        (inline, identity_file)
+    }
+
+    #[test]
+    fn handle_get_inline_encrypted_with_identity_reveals_value() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (inline, identity_file) = write_inline_encrypted_file(dir.path());
+
+        // Verify redacted mode works (doesn't need to decrypt)
+        handle_get(GetArgs {
+            file: inline.clone(),
+            project: Some("demo".to_string()),
+            key: "API_KEY".to_string(),
+            reveal: false,
+            show_description: false,
+            identities: IdentityArgs {
+                identity_files: vec![identity_file.clone()],
+            },
+            passphrase: PassphraseArgs::default(),
+        })
+        .expect("get redacted should work");
+
+        // Verify reveal mode decrypts (not just prints ciphertext)
+        handle_get(GetArgs {
+            file: inline,
+            project: Some("demo".to_string()),
+            key: "API_KEY".to_string(),
+            reveal: true,
+            show_description: false,
+            identities: IdentityArgs {
+                identity_files: vec![identity_file],
+            },
+            passphrase: PassphraseArgs::default(),
+        })
+        .expect("get reveal should work with identity");
+    }
+
+    #[test]
+    fn handle_get_inline_encrypted_without_identity_errors_on_reveal() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (inline, _identity_file) = write_inline_encrypted_file(dir.path());
+
+        let err = handle_get(GetArgs {
+            file: inline,
+            project: Some("demo".to_string()),
+            key: "API_KEY".to_string(),
+            reveal: true,
+            show_description: false,
+            identities: IdentityArgs::default(),
+            passphrase: PassphraseArgs::default(),
+        })
+        .expect_err("get reveal without identity should fail");
+
+        let msg = err.to_string();
+        assert!(msg.contains("inline-encrypted"), "error: {msg}");
+    }
+
+    #[test]
+    fn handle_export_env_inline_encrypted_with_identity() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (inline, identity_file) = write_inline_encrypted_file(dir.path());
+
+        let result = handle_export_env(ExportEnvArgs {
+            file: inline,
+            project: Some("demo".to_string()),
+            format: EnvFormatArg::Dotenv,
+            prefix: None,
+            emit_ref: true,
+            allow: vec![],
+            deny: vec![],
+            identities: IdentityArgs {
+                identity_files: vec![identity_file],
+            },
+            passphrase: PassphraseArgs::default(),
+        });
+        assert!(result.is_ok(), "export-env failed: {}", result.unwrap_err());
+    }
+
+    #[test]
+    fn handle_run_inline_encrypted_with_identity() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (inline, identity_file) = write_inline_encrypted_file(dir.path());
+
+        #[cfg(unix)]
+        let command = vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()];
+        #[cfg(windows)]
+        let command = vec!["cmd".to_string(), "/C".to_string(), "exit 0".to_string()];
+
+        let result = handle_run(RunArgs {
+            file: inline,
+            project: Some("demo".to_string()),
+            prefix: None,
+            emit_ref: true,
+            allow: vec![],
+            deny: vec![],
+            identities: IdentityArgs {
+                identity_files: vec![identity_file],
+            },
+            passphrase: PassphraseArgs::default(),
+            command,
+        });
+        assert!(result.is_ok(), "run failed: {}", result.unwrap_err());
+    }
+
+    #[test]
+    fn handle_run_inline_encrypted_without_identity_errors() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (inline, _identity_file) = write_inline_encrypted_file(dir.path());
+
+        #[cfg(unix)]
+        let command = vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()];
+        #[cfg(windows)]
+        let command = vec!["cmd".to_string(), "/C".to_string(), "exit 0".to_string()];
+
+        let err = handle_run(RunArgs {
+            file: inline,
+            project: Some("demo".to_string()),
+            prefix: None,
+            emit_ref: false,
+            allow: vec![],
+            deny: vec![],
+            identities: IdentityArgs::default(),
+            passphrase: PassphraseArgs::default(),
+            command,
+        })
+        .expect_err("should fail without identity");
+
+        let msg = err.to_string();
+        assert!(msg.contains("inline-encrypted"));
     }
 }
