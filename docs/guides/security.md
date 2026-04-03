@@ -71,4 +71,5 @@ Please report potential vulnerabilities privately to `security@3leaps.net` or @3
 - Review release artifacts and signatures before distribution.
 
 For key management workflows see [Key Management](key-management.md).  
-For storage risk guidance see [App Note 01: Git Storage of Armored Secrets](../appnotes/01-git-armored-storage.md).
+For storage risk guidance see [App Note 01: Git Storage of Armored Secrets](../appnotes/01-git-armored-storage.md).  
+For CI/automation security patterns see [CI/Automation Scenario](scenarios/ci-automation.md).

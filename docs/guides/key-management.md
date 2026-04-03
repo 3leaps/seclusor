@@ -50,3 +50,8 @@ For critical archives (root keys, master passphrases):
 5. Update all consuming systems.
 
 See [Security Model](../guides/security.md) for compromise response guidance.
+
+## Scenarios
+
+For end-to-end team key management workflows, see
+[Team Recipients](scenarios/team-recipients.md).

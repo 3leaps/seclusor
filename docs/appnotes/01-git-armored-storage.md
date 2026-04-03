@@ -47,3 +47,5 @@ Seclusor allows you to store encrypted ("armored") secrets alongside code. Howev
 ---
 
 **Next**: See [App Note 02: Runtime & Deployment Patterns](02-runtime-deployment-patterns.md) for secure local and server-side usage models.
+
+For end-to-end guides using inline encryption with git, see [Inline Credentials Scenario](../guides/scenarios/inline-credentials.md).

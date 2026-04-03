@@ -94,3 +94,9 @@ seclusor secrets run --file secrets.age --identity-file .\\identity.txt --projec
 
 - `docs list [--format plain|json]`
 - `docs show [--format plain|json] <slug>`
+
+## Scenarios
+
+For end-to-end examples of each command in context, see
+[Workflow Scenarios](scenarios/index.md) and the
+[Quick Reference](scenarios/quick-reference.md) command lookup table.
