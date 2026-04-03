@@ -849,6 +849,11 @@ fn handle_get(args: GetArgs) -> CliResult<()> {
         }
         GetOutputMode::Reveal => {
             if let Some(value) = &credential.value {
+                if value.starts_with(seclusor_core::constants::INLINE_CIPHERTEXT_PREFIX) {
+                    return Err(CliError::Core(SeclusorError::InlineEncrypted(
+                        args.key.clone(),
+                    )));
+                }
                 println!("{value}");
                 return Ok(());
             }
@@ -3086,7 +3091,22 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let (inline, identity_file) = write_inline_encrypted_file(dir.path());
 
-        let result = handle_get(GetArgs {
+        // Verify redacted mode works (doesn't need to decrypt)
+        handle_get(GetArgs {
+            file: inline.clone(),
+            project: Some("demo".to_string()),
+            key: "API_KEY".to_string(),
+            reveal: false,
+            show_description: false,
+            identities: IdentityArgs {
+                identity_files: vec![identity_file.clone()],
+            },
+            passphrase: PassphraseArgs::default(),
+        })
+        .expect("get redacted should work");
+
+        // Verify reveal mode decrypts (not just prints ciphertext)
+        handle_get(GetArgs {
             file: inline,
             project: Some("demo".to_string()),
             key: "API_KEY".to_string(),
@@ -3096,8 +3116,28 @@ mod tests {
                 identity_files: vec![identity_file],
             },
             passphrase: PassphraseArgs::default(),
-        });
-        assert!(result.is_ok(), "get failed: {}", result.unwrap_err());
+        })
+        .expect("get reveal should work with identity");
+    }
+
+    #[test]
+    fn handle_get_inline_encrypted_without_identity_errors_on_reveal() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (inline, _identity_file) = write_inline_encrypted_file(dir.path());
+
+        let err = handle_get(GetArgs {
+            file: inline,
+            project: Some("demo".to_string()),
+            key: "API_KEY".to_string(),
+            reveal: true,
+            show_description: false,
+            identities: IdentityArgs::default(),
+            passphrase: PassphraseArgs::default(),
+        })
+        .expect_err("get reveal without identity should fail");
+
+        let msg = err.to_string();
+        assert!(msg.contains("inline-encrypted"), "error: {msg}");
     }
 
     #[test]
