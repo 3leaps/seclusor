@@ -45,16 +45,20 @@ replaced with a `sec:age:v1:<base64>` ciphertext string:
 
 ```json
 {
-  "projects": {
-    "myapp": {
+  "schema_version": "v1.0.0",
+  "env_prefix": "MYAPP_",
+  "projects": [
+    {
+      "project_slug": "myapp",
       "credentials": {
         "DEPLOY_HOOK_URL": {
           "type": "secret",
-          "value": "sec:age:v1:YWdlLWVuY3J5cHRpb24ub3Jn..."
+          "value": "sec:age:v1:YWdlLWVuY3J5cHRpb24ub3Jn...",
+          "description": "deployment notification webhook"
         }
       }
     }
-  }
+  ]
 }
 ```
 
