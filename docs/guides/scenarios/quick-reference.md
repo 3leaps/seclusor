@@ -49,11 +49,12 @@ See [Inline Credentials](inline-credentials.md) for the full workflow.
 
 ## Blob encryption
 
-| I want to...                  | Command                                                                                                           |
-| ----------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| Encrypt a file                | `seclusor secrets blob encrypt --input deploy-key.pem --output deploy-key.pem.age --recipient age1...`            |
-| Decrypt a file                | `seclusor secrets blob decrypt --input deploy-key.pem.age --output deploy-key.pem --identity-file ./identity.txt` |
-| Encrypt a large file (>10 MB) | `seclusor secrets blob encrypt --input large.tar.gz --output large.tar.gz.age --recipient age1... --allow-large`  |
+| I want to...                  | Command                                                                                                                     |
+| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| Encrypt a file                | `seclusor secrets blob encrypt --input deploy-key.pem --output deploy-key.pem.age --recipient age1...`                      |
+| Decrypt a file                | `seclusor secrets blob decrypt --input deploy-key.pem.age --output deploy-key.pem --identity-file ./identity.txt`           |
+| Encrypt a large file (>10 MB) | `seclusor secrets blob encrypt --input large.tar.gz --output large.tar.gz.age --recipient age1... --allow-large`            |
+| Decrypt a large file (>10 MB) | `seclusor secrets blob decrypt --input large.tar.gz.age --output large.tar.gz --identity-file ./identity.txt --allow-large` |
 
 See [Blob Encryption](blob-encryption.md) for the full workflow.
 
