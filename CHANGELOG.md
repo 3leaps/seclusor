@@ -6,6 +6,25 @@ All notable changes to seclusor will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.1.6] - 2026-04-03
+
+### Fixed
+
+- Inline-encrypted values (`sec:age:v1:`) are now decrypted at runtime by `secrets run`, `secrets get`, and `secrets export-env` when identity files are provided (SC-012). Previously these commands returned the raw ciphertext string for inline-encrypted documents
+- `secrets get --reveal` now correctly rejects inline ciphertext when no identity is provided, with a clear error message instead of returning the ciphertext
+- Fixed stale flag names in `docs/guides/codecs.md` (`--to-codec`/`--file` → `--from`/`--to` and `--input`/`--output`)
+
+### Added
+
+- Workflow scenarios guide: 7 new embedded docs in `docs/guides/scenarios/` covering bundle, inline, blob, CI/automation, team recipients, and quick-reference workflows (SC-014)
+- Cross-links between scenario guides and existing concept docs (bidirectional)
+
+### Changed
+
+- Updated Go prebuilt static libraries for v0.1.5 platform targets
+
+See `docs/releases/v0.1.6.md` for full notes.
+
 ## [0.1.5] - 2026-04-02
 
 ### Added
