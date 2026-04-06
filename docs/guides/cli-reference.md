@@ -46,6 +46,35 @@ Backslashes are preserved verbatim but may not be portable across platforms.
 On Windows, seclusor does not normalize path separators — what you store is
 what you get back.
 
+### Credential type
+
+Each credential has a `type` field (`--credential-type`, default `"secret"`).
+This is a free-form metadata label — any non-empty string up to 64
+characters is valid. Seclusor does not enforce a fixed set of values and
+does not change behavior based on the type.
+
+```bash
+seclusor secrets set --key DB_PASSWORD --value "s3cret"                          # type: "secret" (default)
+seclusor secrets set --key DB_PASSWORD --value "s3cret" --credential-type token   # type: "token"
+seclusor secrets set --key APP_ENV --value "production" --credential-type config  # type: "config"
+```
+
+Suggested conventions:
+
+| Type          | Intent                                                          |
+| ------------- | --------------------------------------------------------------- |
+| `secret`      | Sensitive credential (API key, password, token value). Default. |
+| `token`       | Authentication token (PAT, JWT, bearer token)                   |
+| `config`      | Non-sensitive configuration value (URL, region, project ID)     |
+| `certificate` | TLS certificate or key material                                 |
+| `signing-key` | Cryptographic signing key                                       |
+| `ref`         | Often paired with `--ref` for external store pointers           |
+
+These are conventions, not restrictions. All values are treated equally
+by seclusor — redacted by `get`, encrypted by inline/bundle, injected
+by `run`. The type helps operators and downstream tooling categorize
+credentials.
+
 ### Description metadata
 
 - `secrets set --description <text>` stores a credential description.
