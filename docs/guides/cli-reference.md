@@ -46,6 +46,55 @@ Backslashes are preserved verbatim but may not be portable across platforms.
 On Windows, seclusor does not normalize path separators — what you store is
 what you get back.
 
+### Special characters in values
+
+Some passwords and tokens contain characters that are problematic for
+shells or JSON: backslashes (`\`), dollar signs (`$`), quotes, and
+other metacharacters.
+
+**Using `secrets set` (recommended)**: Use single quotes around the
+value to prevent shell interpretation. Seclusor handles JSON escaping
+automatically:
+
+```bash
+# Single quotes pass the value literally to seclusor:
+seclusor secrets set --key DB_PASSWORD --value 'GXY\$fzDiIofvN8n3EuuW1'
+# Stored correctly, retrieved correctly
+seclusor secrets get --key DB_PASSWORD --reveal
+# GXY\$fzDiIofvN8n3EuuW1
+```
+
+**Hand-editing JSON (not recommended)**: If you paste a value containing
+backslashes directly into a JSON file, you must escape each backslash
+as `\\`. JSON only recognizes `\"`, `\\`, `\/`, `\b`, `\f`, `\n`,
+`\r`, `\t`, and `\uXXXX` as valid escape sequences. A literal `\$` in
+JSON is invalid and will produce an "invalid escape" error.
+
+```json
+// WRONG — \$ is not a valid JSON escape:
+{"type": "secret", "value": "GXY\$fzDiIofvN8n3EuuW1"}
+
+// CORRECT — backslash escaped:
+{"type": "secret", "value": "GXY\\$fzDiIofvN8n3EuuW1"}
+```
+
+You can also pass the value from an environment variable to avoid
+shell quoting issues entirely:
+
+```bash
+# Shell expands $LAKEHOUSE_PASSWORD before seclusor sees it:
+seclusor secrets set --key DB_PASSWORD --value "$LAKEHOUSE_PASSWORD"
+```
+
+This works because the shell resolves the variable and passes the
+raw value to seclusor, bypassing any quoting or escaping concerns.
+
+If you encounter an "invalid escape" error on a file you edited
+manually, either fix the escaping or re-enter the value using
+`secrets set` which handles this automatically. If the credential
+system allows it, regenerating the password without backslashes
+avoids the issue entirely.
+
 ### Credential type
 
 Each credential has a `type` field (`--credential-type`, default `"secret"`).
