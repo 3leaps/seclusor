@@ -61,14 +61,27 @@ seclusor secrets set --key APP_ENV --value "production" --credential-type config
 
 Suggested conventions:
 
-| Type          | Intent                                                          |
-| ------------- | --------------------------------------------------------------- |
-| `secret`      | Sensitive credential (API key, password, token value). Default. |
-| `token`       | Authentication token (PAT, JWT, bearer token)                   |
-| `config`      | Non-sensitive configuration value (URL, region, project ID)     |
-| `certificate` | TLS certificate or key material                                 |
-| `signing-key` | Cryptographic signing key                                       |
-| `ref`         | Often paired with `--ref` for external store pointers           |
+| Type          | Intent                                                                                                |
+| ------------- | ----------------------------------------------------------------------------------------------------- |
+| `secret`      | Sensitive credential (API key, password, secret key value). Default.                                  |
+| `id`          | Non-sensitive identifier paired with a secret (key ID, token ID, account ID). Safe to display or log. |
+| `token`       | Authentication token (PAT, JWT, bearer token)                                                         |
+| `config`      | Non-sensitive configuration value (URL, region, project name)                                         |
+| `certificate` | TLS certificate or key material                                                                       |
+| `signing-key` | Cryptographic signing key                                                                             |
+| `ref`         | Often paired with `--ref` for external store pointers                                                 |
+
+A common pattern is pairing an `id` with a `secret` for the same service:
+
+```bash
+seclusor secrets set --key AWS_ACCESS_KEY_ID --value "AKIA..." --credential-type id --description "AWS access key ID"
+seclusor secrets set --key AWS_SECRET_ACCESS_KEY --value "wJalr..." --credential-type secret --description "AWS secret key"
+seclusor secrets set --key CF_TOKEN_ID --value "abc123" --credential-type id --description "Cloudflare API token ID"
+seclusor secrets set --key CF_TOKEN --value "v1.0-..." --credential-type secret --description "Cloudflare API token"
+```
+
+This makes intent clear to operators reading `secrets list --verbose`
+even though seclusor treats both types identically.
 
 These are conventions, not restrictions. All values are treated equally
 by seclusor — redacted by `get`, encrypted by inline/bundle, injected
