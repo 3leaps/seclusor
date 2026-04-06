@@ -65,8 +65,10 @@ Suggested conventions:
 | ------------- | ----------------------------------------------------------------------------------------------------- |
 | `secret`      | Sensitive credential (API key, password, secret key value). Default.                                  |
 | `id`          | Non-sensitive identifier paired with a secret (key ID, token ID, account ID). Safe to display or log. |
+| `username`    | Login name or service account identifier paired with a password or token.                             |
 | `token`       | Authentication token (PAT, JWT, bearer token)                                                         |
-| `config`      | Non-sensitive configuration value (URL, region, project name)                                         |
+| `uri`         | Endpoint address (server URL, API base URL, connection string). `url` works equally.                  |
+| `config`      | Non-sensitive configuration value (region, project name, feature flag)                                |
 | `certificate` | TLS certificate or key material                                                                       |
 | `signing-key` | Cryptographic signing key                                                                             |
 | `ref`         | Often paired with `--ref` for external store pointers                                                 |
