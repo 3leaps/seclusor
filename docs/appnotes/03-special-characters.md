@@ -19,16 +19,25 @@ be represented in different formats:
 
 ### In a `.env` file
 
-`.env` files use shell-like escaping. `$` triggers variable expansion
-and `\` is the escape character, so both must be escaped:
+`.env` files support several quoting styles. Escaping behavior depends
+on whether the value is quoted:
 
 ```env
+# Double-quoted — escape sequences are processed (\$ → $, \\ → \):
+DB_PASSWORD="xK9\$mPq2\\nR8vT+fL3wY7hJ6bN4cE1dA"
+
+# Single-quoted — literal content, no escaping processed:
+DB_PASSWORD='xK9$mPq2\nR8vT+fL3wY7hJ6bN4cE1dA'
+
+# Unquoted — NO escaping processed, characters are taken literally:
 DB_PASSWORD=xK9\$mPq2\\nR8vT+fL3wY7hJ6bN4cE1dA
+# ⚠ This stores the backslashes as literal characters!
 ```
 
-- `\$` means "literal `$`" (the backslash is syntax, not part of the password)
-- `\\` means "literal `\`" (doubled because `\` is the escape character)
-- `+` needs no escaping in `.env`
+**Important**: seclusor's `import-env --dotenv-file` parser only
+unescapes values inside double quotes. Unquoted values are read
+literally — `\$` stays as two characters (`\` and `$`), not one.
+Use double-quoted values in `.env` files for correct import.
 
 ### In a JSON string
 
@@ -121,8 +130,17 @@ seclusor secrets set --key DB_PASSWORD --value 'it'\''s-a-password'
 
 ## Importing from a `.env` File
 
-If you already have a working `.env` file, `import-env` reads values
-after `.env` unescaping and stores them correctly:
+If you already have a working `.env` file, `import-env` can read it —
+but **values must be double-quoted** for escape sequences to be
+processed correctly:
+
+```env
+# This works — double-quoted, escapes processed:
+DB_PASSWORD="xK9\$mPq2\\nR8vT+fL3wY7hJ6bN4cE1dA"
+
+# This does NOT work — unquoted, escapes preserved literally:
+DB_PASSWORD=xK9\$mPq2\\nR8vT+fL3wY7hJ6bN4cE1dA
+```
 
 ```bash
 seclusor secrets import-env \
@@ -131,8 +149,9 @@ seclusor secrets import-env \
   --project myapp
 ```
 
-This is the safest migration path — the `.env` parser handles the
-format-specific escaping and seclusor receives the raw values.
+If your `.env` file uses unquoted values with escape characters,
+either add double quotes around the values before importing, or use
+`secrets set` with single quotes instead.
 
 ## Passing via Environment Variable
 
@@ -151,19 +170,18 @@ Without quotes, the shell word-splits on spaces.
 
 ## Verification
 
-After setting a credential, verify the length matches your source:
+After setting a credential, verify the length matches what you expect.
+The raw password length is the authoritative reference — count from the
+system that generated it (web UI, API response, password manager).
 
 ```bash
-# Stored value length:
+# Stored value length in seclusor:
 seclusor secrets get --key DB_PASSWORD --reveal | tr -d '\n' | wc -c
-
-# .env source length (after unescaping):
-grep '^DB_PASSWORD=' .env | sed 's/^DB_PASSWORD=//' | tr -d '\n' | wc -c
 ```
 
-**Note**: The `.env` length includes escape characters, so it may be
-longer than the stored value. If the seclusor length is _longer_ than
-expected, you likely pasted `.env`-escaped text into JSON.
+If the seclusor length is longer than the raw password, the value was
+likely corrupted by pasting `.env`-escaped text (with extra backslashes)
+into JSON or `secrets set`.
 
 ## Quick Reference
 
