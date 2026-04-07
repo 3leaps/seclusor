@@ -48,52 +48,27 @@ what you get back.
 
 ### Special characters in values
 
-Some passwords and tokens contain characters that are problematic for
-shells or JSON: backslashes (`\`), dollar signs (`$`), quotes, and
-other metacharacters.
+Passwords and tokens from external systems sometimes contain characters
+that have special meaning in shells, `.env` files, or JSON. The most
+common offenders are `$`, `\`, `"`, and `!`. The critical thing to
+understand is that **the same raw value is represented differently in
+each format**. See [App Note 03: Special Characters in Credentials](../appnotes/03-special-characters.md) for the full guide with examples.
 
-**Using `secrets set` (recommended)**: Use single quotes around the
-value to prevent shell interpretation. Seclusor handles JSON escaping
-automatically:
+**Quick rules**:
 
-```bash
-# Single quotes pass the value literally to seclusor:
-seclusor secrets set --key DB_PASSWORD --value 'GXY\$fzDiIofvN8n3EuuW1'
-# Stored correctly, retrieved correctly
-seclusor secrets get --key DB_PASSWORD --reveal
-# GXY\$fzDiIofvN8n3EuuW1
-```
-
-**Hand-editing JSON (not recommended)**: If you paste a value containing
-backslashes directly into a JSON file, you must escape each backslash
-as `\\`. JSON only recognizes `\"`, `\\`, `\/`, `\b`, `\f`, `\n`,
-`\r`, `\t`, and `\uXXXX` as valid escape sequences. A literal `\$` in
-JSON is invalid and will produce an "invalid escape" error.
-
-```json
-// WRONG — \$ is not a valid JSON escape:
-{"type": "secret", "value": "GXY\$fzDiIofvN8n3EuuW1"}
-
-// CORRECT — backslash escaped:
-{"type": "secret", "value": "GXY\\$fzDiIofvN8n3EuuW1"}
-```
-
-You can also pass the value from an environment variable to avoid
-shell quoting issues entirely:
-
-```bash
-# Shell expands $LAKEHOUSE_PASSWORD before seclusor sees it:
-seclusor secrets set --key DB_PASSWORD --value "$LAKEHOUSE_PASSWORD"
-```
-
-This works because the shell resolves the variable and passes the
-raw value to seclusor, bypassing any quoting or escaping concerns.
-
-If you encounter an "invalid escape" error on a file you edited
-manually, either fix the escaping or re-enter the value using
-`secrets set` which handles this automatically. If the credential
-system allows it, regenerating the password without backslashes
-avoids the issue entirely.
+- **`secrets set` with single quotes** is the safest CLI path — it
+  bypasses shell interpretation and seclusor handles JSON escaping:
+  ```bash
+  seclusor secrets set --key DB_PASSWORD --value 'GXY$fzDiIofvN8n3'
+  ```
+- **Do not copy escaped values between formats** — a `.env` file
+  escapes `$` as `\$`, but the actual password has no backslash.
+  Pasting the `.env` representation into JSON adds a character that
+  isn't in the password.
+- **Verify with length check** after setting:
+  ```bash
+  seclusor secrets get --key DB_PASSWORD --reveal | tr -d '\n' | wc -c
+  ```
 
 ### Credential type
 
