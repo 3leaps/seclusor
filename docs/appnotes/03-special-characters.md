@@ -155,15 +155,18 @@ either add double quotes around the values before importing, or use
 
 ## Passing via Environment Variable
 
-If the value is already loaded in an environment variable:
+If the value is already in an environment variable (set by your process
+manager, CI system, or exported in your shell profile):
 
 ```bash
-# Source the .env first (the shell resolves \$ to $):
-source /path/to/.env
-
-# The variable now holds the raw value:
+# The variable already holds the raw value:
 seclusor secrets set --key DB_PASSWORD --value "$DB_PASSWORD"
 ```
+
+**Do not `source` a `.env` file to load variables** — `source` executes
+the file as shell code, which can run command substitutions or other
+shell syntax. Use `secrets import-env --dotenv-file` instead, which
+parses the file as data.
 
 **Warning**: Double quotes around `"$DB_PASSWORD"` are required.
 Without quotes, the shell word-splits on spaces.
