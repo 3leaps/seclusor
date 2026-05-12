@@ -332,7 +332,7 @@ fmt: ## Format code (cargo fmt + goneat format)
 	@GONEAT_BIN="$(GONEAT)"; \
 	if [ -n "$$GONEAT_BIN" ]; then \
 		echo "Formatting markdown, YAML, JSON..."; \
-		PATH="$(TOOL_PATH)" "$$GONEAT_BIN" format --quiet; \
+		PATH="$(TOOL_PATH)" "$$GONEAT_BIN" format --quiet --fallback-sequential; \
 	else \
 		echo "[!!] goneat not found — run 'make bootstrap'"; \
 		exit 1; \
@@ -345,7 +345,7 @@ fmt-check: ## Check formatting without modifying
 	@GONEAT_BIN="$(GONEAT)"; \
 	if [ -n "$$GONEAT_BIN" ]; then \
 		echo "Checking markdown, YAML, JSON formatting..."; \
-		PATH="$(TOOL_PATH)" "$$GONEAT_BIN" format --check --quiet; \
+		PATH="$(TOOL_PATH)" "$$GONEAT_BIN" format --check --quiet --fallback-sequential; \
 	else \
 		echo "[!!] goneat not found — run 'make bootstrap'"; \
 		exit 1; \
