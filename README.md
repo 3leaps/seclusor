@@ -260,8 +260,8 @@ cargo build
 # Test
 cargo test
 
-# Full quality check
-make check-all
+# Final local PR gate
+make pr-final
 ```
 
 ### Quality Gates
@@ -270,6 +270,7 @@ make check-all
 - `cargo clippy --workspace -- -Dwarnings` — zero warnings
 - `cargo test` — all tests pass
 - `cargo deny check` — all dependencies permissively licensed
+- `make pr-final` — CI-equivalent Rust checks plus Go/TypeScript binding tests
 
 ## Supply Chain
 

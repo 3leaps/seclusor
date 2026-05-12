@@ -1,0 +1,17 @@
+version: "1.0.0"
+hooks:
+  pre-commit:
+    - command: "assess"
+      args: ["--categories", "format,lint", "--fail-on", "medium"]
+      priority: 10
+      timeout: "90s"
+  pre-push:
+    - command: "assess"
+      args: ["--categories", "format,lint,security", "--fail-on", "high"]
+      priority: 10
+      timeout: "2m"
+optimization:
+  cache_results: true
+  content_source: index
+  only_changed_files: true
+  parallel: auto

@@ -10,7 +10,7 @@
 
 .PHONY: all help bootstrap bootstrap-force tools check check-all test fmt fmt-check lint build build-release clean
 .PHONY: ffi-header build-ffi go-bindings-sync go-bindings-ci go-build go-test go-test-committed ts-build ts-test embed-verify
-.PHONY: precommit prepush repo-status deny deny-all audit miri msrv
+.PHONY: precommit prepush pr-final repo-status deny deny-all audit miri msrv
 .PHONY: check-windows check-windows-msvc check-windows-gnu
 .PHONY: install dogfood-cli
 .PHONY: version version-patch version-minor version-major version-set version-sync version-check
@@ -29,12 +29,12 @@ VERSION := $(shell cargo metadata --format-version 1 --no-deps 2>/dev/null | \
 
 BIN_DIR := $(CURDIR)/bin
 
-SFETCH_VERSION ?= v0.4.5
+SFETCH_VERSION ?= v0.4.7
 SFETCH_INSTALL_URL ?= https://github.com/3leaps/sfetch/releases/download/$(SFETCH_VERSION)/install-sfetch.sh
-GONEAT_VERSION ?= v0.5.1
+GONEAT_VERSION ?= v0.5.10
 
 SFETCH = $(shell [ -x "$(BIN_DIR)/sfetch" ] && echo "$(BIN_DIR)/sfetch" || command -v sfetch 2>/dev/null)
-GONEAT = $(shell command -v goneat 2>/dev/null)
+GONEAT = $(shell [ -x "$(BIN_DIR)/goneat" ] && echo "$(BIN_DIR)/goneat" || command -v goneat 2>/dev/null)
 
 CARGO = cargo
 GO_BINDINGS_DIR := bindings/go/seclusor
@@ -85,6 +85,7 @@ help: ## Show available targets
 	@echo "  lint            Run linting (cargo clippy + goneat lint)"
 	@echo "  precommit       Pre-commit checks (fast: fmt, clippy)"
 	@echo "  prepush         Pre-push checks (thorough: fmt, clippy, test, deny, version-check)"
+	@echo "  pr-final        Final local PR gate before pushing a branch"
 	@echo "  msrv            Verify build+test on MSRV toolchain"
 	@echo "  miri            Run Miri UB detection on FFI crate (nightly)"
 	@echo "  deny            Run cargo-deny license checks (offline-safe)"
@@ -141,7 +142,7 @@ bootstrap: ## Install required tools (sfetch -> goneat)
 	@echo "[ok] cargo: $$(cargo --version)"
 	@echo ""
 	@mkdir -p "$(BIN_DIR)"
-	@if [ ! -x "$(BIN_DIR)/sfetch" ] && ! command -v sfetch >/dev/null 2>&1; then \
+	@if [ "$(FORCE)" = "1" ] || { [ ! -x "$(BIN_DIR)/sfetch" ] && ! command -v sfetch >/dev/null 2>&1; }; then \
 		echo "[..] Installing sfetch (trust anchor)..."; \
 		curl -fsSL "$(SFETCH_INSTALL_URL)" | bash -s -- --dir "$(BIN_DIR)" --yes; \
 	else \
@@ -156,13 +157,15 @@ bootstrap: ## Install required tools (sfetch -> goneat)
 	@SFETCH_BIN=""; \
 	if [ -x "$(BIN_DIR)/sfetch" ]; then SFETCH_BIN="$(BIN_DIR)/sfetch"; \
 	elif command -v sfetch >/dev/null 2>&1; then SFETCH_BIN="$$(command -v sfetch)"; fi; \
-	if [ "$(FORCE)" = "1" ] || ! command -v goneat >/dev/null 2>&1; then \
-		echo "[..] Installing goneat $(GONEAT_VERSION) via sfetch (user-space)..."; \
-		$$SFETCH_BIN --repo fulmenhq/goneat --tag $(GONEAT_VERSION); \
+	if [ "$(FORCE)" = "1" ] || { [ ! -x "$(BIN_DIR)/goneat" ] && ! command -v goneat >/dev/null 2>&1; }; then \
+		echo "[..] Installing goneat $(GONEAT_VERSION) via sfetch (repo-local)..."; \
+		$$SFETCH_BIN --repo fulmenhq/goneat --tag $(GONEAT_VERSION) --dest-dir "$(BIN_DIR)"; \
 	else \
 		echo "[ok] goneat already installed"; \
 	fi
-	@if command -v goneat >/dev/null 2>&1; then \
+	@if [ -x "$(BIN_DIR)/goneat" ]; then \
+		echo "[ok] goneat: $$("$(BIN_DIR)/goneat" version 2>&1 | head -n1)"; \
+	elif command -v goneat >/dev/null 2>&1; then \
 		echo "[ok] goneat: $$(goneat version 2>&1 | head -n1)"; \
 	else \
 		echo "[!!] goneat installation failed"; exit 1; \
@@ -243,7 +246,9 @@ tools: ## Verify external tools are available
 	else \
 		echo "[!!] sfetch not found (run 'make bootstrap')"; \
 	fi
-	@if command -v goneat >/dev/null 2>&1; then \
+	@if [ -x "$(BIN_DIR)/goneat" ]; then \
+		echo "[ok] goneat: $$("$(BIN_DIR)/goneat" version 2>&1 | head -n1)"; \
+	elif command -v goneat >/dev/null 2>&1; then \
 		echo "[ok] goneat: $$(goneat version 2>&1 | head -n1)"; \
 	else \
 		echo "[!!] goneat not found (run 'make bootstrap')"; \
@@ -267,38 +272,44 @@ test: ## Run test suite
 fmt: ## Format code (cargo fmt + goneat format)
 	@echo "Formatting Rust..."
 	$(CARGO) fmt --all
-	@if command -v goneat >/dev/null 2>&1; then \
+	@GONEAT_BIN="$(GONEAT)"; \
+	if [ -n "$$GONEAT_BIN" ]; then \
 		echo "Formatting markdown, YAML, JSON..."; \
-		goneat format --quiet; \
+		"$$GONEAT_BIN" format --quiet; \
 	else \
-		echo "[!!] goneat not found — skipping non-Rust formatting (run 'make bootstrap')"; \
+		echo "[!!] goneat not found — run 'make bootstrap'"; \
+		exit 1; \
 	fi
 	@echo "[ok] Formatting complete"
 
 fmt-check: ## Check formatting without modifying
 	@echo "Checking Rust formatting..."
 	$(CARGO) fmt --all -- --check
-	@if command -v goneat >/dev/null 2>&1; then \
+	@GONEAT_BIN="$(GONEAT)"; \
+	if [ -n "$$GONEAT_BIN" ]; then \
 		echo "Checking markdown, YAML, JSON formatting..."; \
-		goneat format --check --quiet; \
+		"$$GONEAT_BIN" format --check --quiet; \
 	else \
-		echo "[!!] goneat not found — skipping non-Rust format check (run 'make bootstrap')"; \
+		echo "[!!] goneat not found — run 'make bootstrap'"; \
+		exit 1; \
 	fi
 	@echo "[ok] Formatting check passed"
 
 lint: ## Run linting (cargo clippy + goneat lint)
 	@echo "Linting Rust..."
 	$(CARGO) clippy --workspace --all-targets --all-features -- -D warnings
-	@if command -v goneat >/dev/null 2>&1; then \
+	@GONEAT_BIN="$(GONEAT)"; \
+	if [ -n "$$GONEAT_BIN" ]; then \
 		echo "Linting YAML, shell, workflows..."; \
-		goneat assess --categories lint --fail-on medium --ci-summary --log-level warn --output /dev/null --scope \
+		"$$GONEAT_BIN" assess --categories lint --fail-on medium --ci-summary --log-level warn --output /dev/null --scope \
 			--include '.github/workflows/**/*.yml' \
 			--include '.github/workflows/**/*.yaml' \
 			--include '.goneat/**/*.yaml' \
 			--include '**/*.sh' \
 			--include '**/Makefile'; \
 	else \
-		echo "[!!] goneat not found — skipping non-Rust linting (run 'make bootstrap')"; \
+		echo "[!!] goneat not found — run 'make bootstrap'"; \
+		exit 1; \
 	fi
 	@echo "[ok] Linting passed"
 
@@ -487,9 +498,13 @@ precommit: fmt-check lint ## Run pre-commit checks (fast)
 prepush: repo-status check version-check go-test ts-test ## Run pre-push checks (thorough)
 	@echo "[ok] Pre-push checks passed"
 
+pr-final: ci go-test ts-test ## Final local PR gate before pushing a branch
+	@echo "[ok] PR final gate passed"
+
 repo-status: ## Fail if working tree has uncommitted changes (goneat assess repo-status)
-	@if command -v goneat >/dev/null 2>&1; then \
-		goneat assess --categories repo-status --fail-on high --ci-summary --log-level warn; \
+	@GONEAT_BIN="$(GONEAT)"; \
+	if [ -n "$$GONEAT_BIN" ]; then \
+		"$$GONEAT_BIN" assess --categories repo-status --fail-on high --ci-summary --log-level warn; \
 	else \
 		echo "Checking working tree..."; \
 		if [ -n "$$(git status --porcelain 2>/dev/null)" ]; then \
