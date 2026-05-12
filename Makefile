@@ -30,7 +30,6 @@ VERSION := $(shell cargo metadata --format-version 1 --no-deps 2>/dev/null | \
 BIN_DIR := $(CURDIR)/bin
 
 SFETCH_VERSION ?= v0.4.7
-SFETCH_INSTALL_URL ?= https://github.com/3leaps/sfetch/releases/download/$(SFETCH_VERSION)/install-sfetch.sh
 GONEAT_VERSION ?= v0.5.10
 PRETTIER_VERSION ?= 3.8.3
 BIOME_VERSION ?= 2.4.15
@@ -167,8 +166,26 @@ bootstrap-prereqs:
 bootstrap-release-tools:
 	@mkdir -p "$(BIN_DIR)"
 	@if [ "$(FORCE)" = "1" ] || { [ ! -x "$(BIN_DIR)/sfetch" ] && ! command -v sfetch >/dev/null 2>&1; }; then \
-		echo "[..] Installing sfetch (trust anchor)..."; \
-		curl -fsSL "$(SFETCH_INSTALL_URL)" | bash -s -- --dir "$(BIN_DIR)" --yes; \
+		echo "[..] Installing sfetch $(SFETCH_VERSION) repo-local..."; \
+		tmp_dir="$$(mktemp -d)"; \
+		trap 'rm -rf "$$tmp_dir"' EXIT; \
+		case "$$(uname -s)-$$(uname -m)" in \
+			Darwin-arm64|Darwin-aarch64) asset="sfetch_darwin_arm64.tar.gz" ;; \
+			Linux-x86_64|Linux-amd64) asset="sfetch_linux_amd64.tar.gz" ;; \
+			Linux-aarch64|Linux-arm64) asset="sfetch_linux_arm64.tar.gz" ;; \
+			*) echo "[!!] Unsupported sfetch platform: $$(uname -s)-$$(uname -m)"; exit 1 ;; \
+		esac; \
+		base_url="https://github.com/3leaps/sfetch/releases/download/$(SFETCH_VERSION)"; \
+		curl -fsSL "$$base_url/$$asset" -o "$$tmp_dir/$$asset"; \
+		curl -fsSL "$$base_url/SHA256SUMS" -o "$$tmp_dir/SHA256SUMS"; \
+		cd "$$tmp_dir" && grep "  $$asset$$" SHA256SUMS > "$$asset.sha256"; \
+		if command -v sha256sum >/dev/null 2>&1; then \
+			cd "$$tmp_dir" && sha256sum -c "$$asset.sha256"; \
+		else \
+			cd "$$tmp_dir" && shasum -a 256 -c "$$asset.sha256"; \
+		fi; \
+		tar -xzf "$$tmp_dir/$$asset" -C "$$tmp_dir"; \
+		install -m 0755 "$$tmp_dir/sfetch" "$(BIN_DIR)/sfetch"; \
 	else \
 		echo "[ok] sfetch already installed"; \
 	fi
