@@ -8,7 +8,7 @@
 #   make fmt        - Format code (cargo fmt + goneat format)
 #   make build      - Build all crates
 
-.PHONY: all help bootstrap bootstrap-force tools check check-all test fmt fmt-check lint build build-release clean
+.PHONY: all help bootstrap bootstrap-prereqs bootstrap-release-tools bootstrap-format-tools bootstrap-rust-tools bootstrap-force tools check check-all test fmt fmt-check lint build build-release clean
 .PHONY: ffi-header build-ffi go-bindings-sync go-bindings-ci go-build go-test go-test-committed ts-build ts-test embed-verify
 .PHONY: precommit prepush pr-final repo-status deny deny-all audit miri msrv
 .PHONY: check-windows check-windows-msvc check-windows-gnu
@@ -32,6 +32,9 @@ BIN_DIR := $(CURDIR)/bin
 SFETCH_VERSION ?= v0.4.7
 SFETCH_INSTALL_URL ?= https://github.com/3leaps/sfetch/releases/download/$(SFETCH_VERSION)/install-sfetch.sh
 GONEAT_VERSION ?= v0.5.10
+PRETTIER_VERSION ?= 3.8.3
+YAMLFMT_VERSION ?= v0.21.0
+TOOL_PATH := $(BIN_DIR):$(BIN_DIR)/node/bin:$(PATH)
 
 SFETCH = $(shell [ -x "$(BIN_DIR)/sfetch" ] && echo "$(BIN_DIR)/sfetch" || command -v sfetch 2>/dev/null)
 GONEAT = $(shell [ -x "$(BIN_DIR)/goneat" ] && echo "$(BIN_DIR)/goneat" || command -v goneat 2>/dev/null)
@@ -127,6 +130,14 @@ help: ## Show available targets
 bootstrap: ## Install required tools (sfetch -> goneat)
 	@echo "Bootstrapping seclusor development environment..."
 	@echo ""
+	@$(MAKE) bootstrap-prereqs
+	@$(MAKE) bootstrap-release-tools
+	@$(MAKE) bootstrap-format-tools
+	@$(MAKE) bootstrap-rust-tools
+	@echo ""
+	@echo "[ok] Bootstrap complete"
+
+bootstrap-prereqs:
 	@if ! command -v curl >/dev/null 2>&1; then \
 		echo "[!!] curl not found (required for bootstrap)"; \
 		exit 1; \
@@ -140,7 +151,19 @@ bootstrap: ## Install required tools (sfetch -> goneat)
 		exit 1; \
 	fi
 	@echo "[ok] cargo: $$(cargo --version)"
+	@if ! command -v go >/dev/null 2>&1; then \
+		echo "[!!] go not found (required for yamlfmt/gofmt)"; \
+		exit 1; \
+	fi
+	@echo "[ok] go: $$(go version)"
+	@if ! command -v npm >/dev/null 2>&1; then \
+		echo "[!!] npm not found (required for pinned prettier)"; \
+		exit 1; \
+	fi
+	@echo "[ok] npm: $$(npm --version)"
 	@echo ""
+
+bootstrap-release-tools:
 	@mkdir -p "$(BIN_DIR)"
 	@if [ "$(FORCE)" = "1" ] || { [ ! -x "$(BIN_DIR)/sfetch" ] && ! command -v sfetch >/dev/null 2>&1; }; then \
 		echo "[..] Installing sfetch (trust anchor)..."; \
@@ -171,6 +194,30 @@ bootstrap: ## Install required tools (sfetch -> goneat)
 		echo "[!!] goneat installation failed"; exit 1; \
 	fi
 	@echo ""
+
+bootstrap-format-tools:
+	@echo "[..] Checking Goneat formatter dependencies..."
+	@if [ "$(FORCE)" = "1" ] || [ ! -x "$(BIN_DIR)/yamlfmt" ]; then \
+		echo "[..] Installing yamlfmt $(YAMLFMT_VERSION) repo-local..."; \
+		GOBIN="$(BIN_DIR)" go install github.com/google/yamlfmt/cmd/yamlfmt@$(YAMLFMT_VERSION); \
+	else \
+		echo "[ok] yamlfmt installed"; \
+	fi
+	@if [ "$(FORCE)" = "1" ] || [ ! -x "$(BIN_DIR)/node/bin/prettier" ]; then \
+		echo "[..] Installing prettier $(PRETTIER_VERSION) repo-local..."; \
+		mkdir -p "$(BIN_DIR)/node"; \
+		npm install --global --prefix "$(BIN_DIR)/node" prettier@$(PRETTIER_VERSION); \
+	else \
+		echo "[ok] prettier installed"; \
+	fi
+	@PATH="$(TOOL_PATH)"; \
+	if ! command -v yamlfmt >/dev/null 2>&1; then echo "[!!] yamlfmt installation failed"; exit 1; fi; \
+	if ! command -v prettier >/dev/null 2>&1; then echo "[!!] prettier installation failed"; exit 1; fi; \
+	echo "[ok] yamlfmt: $$(yamlfmt -version 2>&1 | head -n1)"; \
+	echo "[ok] prettier: $$(prettier --version)"
+	@echo ""
+
+bootstrap-rust-tools:
 	@echo "[..] Checking Rust dev tools..."
 	@if ! command -v cargo-deny >/dev/null 2>&1; then \
 		echo "[..] Installing cargo-deny..."; \
@@ -196,8 +243,6 @@ bootstrap: ## Install required tools (sfetch -> goneat)
 	else \
 		echo "[ok] cargo-edit installed"; \
 	fi
-	@echo ""
-	@echo "[ok] Bootstrap complete"
 
 bootstrap-force: ## Force reinstall all tools
 	@$(MAKE) bootstrap FORCE=1
@@ -239,6 +284,18 @@ tools: ## Verify external tools are available
 	else \
 		echo "[!!] cargo-edit not found (cargo install cargo-edit)"; \
 	fi
+	@PATH="$(TOOL_PATH)"; \
+	if command -v yamlfmt >/dev/null 2>&1; then \
+		echo "[ok] yamlfmt: $$(yamlfmt -version 2>&1 | head -n1)"; \
+	else \
+		echo "[!!] yamlfmt not found (run 'make bootstrap')"; \
+	fi
+	@PATH="$(TOOL_PATH)"; \
+	if command -v prettier >/dev/null 2>&1; then \
+		echo "[ok] prettier: $$(prettier --version)"; \
+	else \
+		echo "[!!] prettier not found (run 'make bootstrap')"; \
+	fi
 	@if [ -x "$(BIN_DIR)/sfetch" ]; then \
 		echo "[ok] sfetch: $(BIN_DIR)/sfetch"; \
 	elif command -v sfetch >/dev/null 2>&1; then \
@@ -275,7 +332,7 @@ fmt: ## Format code (cargo fmt + goneat format)
 	@GONEAT_BIN="$(GONEAT)"; \
 	if [ -n "$$GONEAT_BIN" ]; then \
 		echo "Formatting markdown, YAML, JSON..."; \
-		"$$GONEAT_BIN" format --quiet; \
+		PATH="$(TOOL_PATH)" "$$GONEAT_BIN" format --quiet; \
 	else \
 		echo "[!!] goneat not found — run 'make bootstrap'"; \
 		exit 1; \
@@ -288,7 +345,7 @@ fmt-check: ## Check formatting without modifying
 	@GONEAT_BIN="$(GONEAT)"; \
 	if [ -n "$$GONEAT_BIN" ]; then \
 		echo "Checking markdown, YAML, JSON formatting..."; \
-		"$$GONEAT_BIN" format --check --quiet; \
+		PATH="$(TOOL_PATH)" "$$GONEAT_BIN" format --check --quiet; \
 	else \
 		echo "[!!] goneat not found — run 'make bootstrap'"; \
 		exit 1; \
@@ -301,7 +358,7 @@ lint: ## Run linting (cargo clippy + goneat lint)
 	@GONEAT_BIN="$(GONEAT)"; \
 	if [ -n "$$GONEAT_BIN" ]; then \
 		echo "Linting YAML, shell, workflows..."; \
-		"$$GONEAT_BIN" assess --categories lint --fail-on medium --ci-summary --log-level warn --output /dev/null --scope \
+		PATH="$(TOOL_PATH)" "$$GONEAT_BIN" assess --categories lint --fail-on medium --ci-summary --log-level warn --output /dev/null --scope \
 			--include '.github/workflows/**/*.yml' \
 			--include '.github/workflows/**/*.yaml' \
 			--include '.goneat/**/*.yaml' \
@@ -504,7 +561,7 @@ pr-final: ci go-test ts-test ## Final local PR gate before pushing a branch
 repo-status: ## Fail if working tree has uncommitted changes (goneat assess repo-status)
 	@GONEAT_BIN="$(GONEAT)"; \
 	if [ -n "$$GONEAT_BIN" ]; then \
-		"$$GONEAT_BIN" assess --categories repo-status --fail-on high --ci-summary --log-level warn; \
+		PATH="$(TOOL_PATH)" "$$GONEAT_BIN" assess --categories repo-status --fail-on high --ci-summary --log-level warn; \
 	else \
 		echo "Checking working tree..."; \
 		if [ -n "$$(git status --porcelain 2>/dev/null)" ]; then \
