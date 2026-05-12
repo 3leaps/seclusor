@@ -33,6 +33,7 @@ SFETCH_VERSION ?= v0.4.7
 SFETCH_INSTALL_URL ?= https://github.com/3leaps/sfetch/releases/download/$(SFETCH_VERSION)/install-sfetch.sh
 GONEAT_VERSION ?= v0.5.10
 PRETTIER_VERSION ?= 3.8.3
+BIOME_VERSION ?= 2.4.15
 YAMLFMT_VERSION ?= v0.21.0
 TOOL_PATH := $(BIN_DIR):$(BIN_DIR)/node/bin:$(PATH)
 
@@ -157,7 +158,7 @@ bootstrap-prereqs:
 	fi
 	@echo "[ok] go: $$(go version)"
 	@if ! command -v npm >/dev/null 2>&1; then \
-		echo "[!!] npm not found (required for pinned prettier)"; \
+		echo "[!!] npm not found (required for pinned prettier/biome)"; \
 		exit 1; \
 	fi
 	@echo "[ok] npm: $$(npm --version)"
@@ -210,11 +211,20 @@ bootstrap-format-tools:
 	else \
 		echo "[ok] prettier installed"; \
 	fi
+	@if [ "$(FORCE)" = "1" ] || [ ! -x "$(BIN_DIR)/node/bin/biome" ]; then \
+		echo "[..] Installing biome $(BIOME_VERSION) repo-local..."; \
+		mkdir -p "$(BIN_DIR)/node"; \
+		npm install --global --prefix "$(BIN_DIR)/node" @biomejs/biome@$(BIOME_VERSION); \
+	else \
+		echo "[ok] biome installed"; \
+	fi
 	@PATH="$(TOOL_PATH)"; \
 	if ! command -v yamlfmt >/dev/null 2>&1; then echo "[!!] yamlfmt installation failed"; exit 1; fi; \
 	if ! command -v prettier >/dev/null 2>&1; then echo "[!!] prettier installation failed"; exit 1; fi; \
+	if ! command -v biome >/dev/null 2>&1; then echo "[!!] biome installation failed"; exit 1; fi; \
 	echo "[ok] yamlfmt: $$(yamlfmt -version 2>&1 | head -n1)"; \
-	echo "[ok] prettier: $$(prettier --version)"
+	echo "[ok] prettier: $$(prettier --version)"; \
+	echo "[ok] biome: $$(biome --version 2>&1 | head -n1)"
 	@echo ""
 
 bootstrap-rust-tools:
@@ -295,6 +305,12 @@ tools: ## Verify external tools are available
 		echo "[ok] prettier: $$(prettier --version)"; \
 	else \
 		echo "[!!] prettier not found (run 'make bootstrap')"; \
+	fi
+	@PATH="$(TOOL_PATH)"; \
+	if command -v biome >/dev/null 2>&1; then \
+		echo "[ok] biome: $$(biome --version 2>&1 | head -n1)"; \
+	else \
+		echo "[!!] biome not found (run 'make bootstrap')"; \
 	fi
 	@if [ -x "$(BIN_DIR)/sfetch" ]; then \
 		echo "[ok] sfetch: $(BIN_DIR)/sfetch"; \
