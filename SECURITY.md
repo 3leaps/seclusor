@@ -22,7 +22,23 @@ We will acknowledge receipt within 48 hours and aim to provide a timeline for re
 
 ## Supported Versions
 
-We currently provide security updates for the latest stable release and the in-development main branch.
+We provide security updates for the latest stable release and the active
+in-development release branch/PR line. Security fixes use private coordination
+until disclosure is appropriate.
+
+## Security-Sensitive Pull Requests
+
+Do not put exploit details, plaintext secrets, private keys, or operational
+credentials in public PR text, commit messages, logs, fixtures, screenshots, or
+CI artifacts.
+
+For crypto, key-management, and FFI changes:
+
+- Run `make pr-final` before pushing a PR branch.
+- Request normal correctness review (`devrev`).
+- Request security review (`secrev`) before merge.
+- Verify errors, logs, and FFI return values do not disclose plaintext, key
+  material, passphrases, or raw ciphertext payloads.
 
 ## Upstream Dependencies
 

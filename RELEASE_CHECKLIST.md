@@ -9,44 +9,59 @@ Use this checklist before tagging and publishing any `vX.Y.Z` release.
 3. `make release-preflight` passes on local `main` (in sync with remote).
 4. Working tree is clean (`git status` empty).
 5. `VERSION` matches workspace Cargo version (`make version-check`).
-6. Run `make clean` then `make build` (build depends on `embed-verify`,
+6. Run `make pr-final`.
+7. Run `make clean` then `make build` (build depends on `embed-verify`,
    validating docs embedding path).
-7. Release notes exist at `docs/releases/vX.Y.Z.md`.
-8. All planned briefs for this release show done status.
+8. Release notes exist at `docs/releases/vX.Y.Z.md`.
+9. All planned briefs for this release show done status.
 
 ## Version Bump
 
-9. Update `VERSION` and workspace `Cargo.toml` version:
-   ```bash
-   make version-bump VERSION=X.Y.Z
-   git push origin main
-   ```
-10. Wait for CI green on version bump commit.
+10. Create a release/version branch from `main`:
+
+```bash
+git switch -c chore/release-vX.Y.Z
+```
+
+11. Update `VERSION` and workspace `Cargo.toml` version:
+
+```bash
+make version-set V=X.Y.Z
+make pr-final
+```
+
+12. Push the branch, open a PR, and merge after review and green CI.
+13. Pull the merge commit locally:
+
+```bash
+git switch main
+git pull origin main
+```
 
 ## Go Bindings Prep
 
-11. Verify local and remote are in sync before triggering the workflow:
+14. Verify local and remote are in sync before triggering the workflow:
     ```bash
     git fetch origin
     git log --oneline origin/main..HEAD   # must be empty
     git log --oneline HEAD..origin/main   # must be empty
     ```
-12. Trigger Go bindings prep workflow:
+15. Trigger Go bindings prep workflow:
     ```bash
     make go-bindings-ci
     ```
-13. Review and merge the auto-created PR (adds platform `.a` files).
-14. Wait for CI green on the merge commit.
-15. Pull the merge commit locally:
+16. Review and merge the auto-created PR (adds platform `.a` files).
+17. Wait for CI green on the merge commit.
+18. Pull the merge commit locally:
     ```bash
     git pull origin main
     ```
-16. Confirm `bindings/go/seclusor/lib/<platform>/libseclusor_ffi.a` exists
+19. Confirm `bindings/go/seclusor/lib/<platform>/libseclusor_ffi.a` exists
     for all release platforms.
 
 ## Tag and Release
 
-17. Create annotated tags on the merge commit:
+20. Create annotated tags on the merge commit:
     ```bash
     VERSION=$(cat VERSION)
     git tag -a "v${VERSION}" -m "v${VERSION}"
@@ -56,49 +71,49 @@ Use this checklist before tagging and publishing any `vX.Y.Z` release.
     **IMPORTANT**: Both tags must point to the same commit — the Go bindings
     PR merge commit. The Go submodule tag is required so
     `go get github.com/3leaps/seclusor/bindings/go/seclusor@vX.Y.Z` resolves.
-18. Monitor release workflow for all 5 platform assets.
+21. Monitor release workflow for all 5 platform assets.
 
 ## CI and Build Artifacts
 
-19. `ci` workflow is green for the release commit.
+22. `ci` workflow is green for the release commit.
     - Linux: full quality gates (fmt, clippy, test, deny, version-check,
       Go/TS bindings).
     - macOS arm64: clippy + test.
     - Windows: cross-check (type-check, no link) for x86_64-pc-windows-msvc
       and aarch64-pc-windows-msvc.
-20. `release` workflow produced all required assets (bare binaries, no archives):
+23. `release` workflow produced all required assets (bare binaries, no archives):
     - `seclusor-linux-amd64`
     - `seclusor-linux-arm64`
     - `seclusor-darwin-arm64`
     - `seclusor-windows-amd64.exe`
     - `seclusor-windows-arm64.exe`
-21. Draft release contains `SHA256SUMS` and `SHA512SUMS`.
-22. SBOM artifact exists from CI (`bom.json` via CycloneDX).
+24. Draft release contains `SHA256SUMS` and `SHA512SUMS`.
+25. SBOM artifact exists from CI (`bom.json` via CycloneDX).
 
 ## Security and Integrity
 
-23. `cargo deny check licenses advisories` passed.
-24. `cargo audit` passed.
-25. Signatures created locally (`make release-sign`) and verified
+26. `cargo deny check licenses advisories` passed.
+27. `cargo audit` passed.
+28. Signatures created locally (`make release-sign`) and verified
     (`make release-verify`).
-26. Public keys exported and attached (`make release-export-keys`).
+29. Public keys exported and attached (`make release-export-keys`).
 
 ## Publish Gate
 
-27. Draft release notes reflect final asset set (5 platform binaries +
+30. Draft release notes reflect final asset set (5 platform binaries +
     checksums).
-28. Optional lanes (if omitted) are called out explicitly in notes.
-29. Draft verified by four-eyes (`devrev`) and security (`secrev`) for
+31. Optional lanes (if omitted) are called out explicitly in notes.
+32. Draft verified by four-eyes (`devrev`) and security (`secrev`) for
     release readiness.
 
 ## Post-Publish
 
-30. Upload signed assets and release notes:
+33. Upload signed assets and release notes:
     ```bash
     make release-upload
     ```
-31. Undraft/publish the GitHub release.
-32. Update and commit homebrew-tap formula (**must run after undraft** —
+34. Undraft/publish the GitHub release.
+35. Update and commit homebrew-tap formula (**must run after undraft** —
     the tap script queries the latest published release):
     ```bash
     make update-homebrew-formula
@@ -109,7 +124,7 @@ Use this checklist before tagging and publishing any `vX.Y.Z` release.
     git add Formula/seclusor.rb && git commit -m "Update seclusor to vX.Y.Z"
     git push
     ```
-33. Update and commit scoop-bucket manifest:
+36. Update and commit scoop-bucket manifest:
     ```bash
     make update-scoop-manifest
     cd ../scoop-bucket

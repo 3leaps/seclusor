@@ -8,5 +8,10 @@ This repository is security-sensitive (encryption + secrets management).
 
 ## Review Policy
 
-- Changes are supervised and require human review before commit/merge.
-- Crypto/FFI changes should involve security review (`secrev`) in addition to normal review (`devrev`).
+- All code changes land through feature branches and pull requests.
+- Human review is required before merge to `main`.
+- Authors should run `make pr-final` before pushing a PR branch.
+- Crypto, key-management, and FFI changes require security review
+  (`secrev`) in addition to normal correctness review (`devrev`).
+- Release tags, protected-branch pushes, and direct-to-main operations require
+  explicit maintainer approval.

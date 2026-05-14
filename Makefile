@@ -8,9 +8,9 @@
 #   make fmt        - Format code (cargo fmt + goneat format)
 #   make build      - Build all crates
 
-.PHONY: all help bootstrap bootstrap-force tools check check-all test fmt fmt-check lint build build-release clean
+.PHONY: all help bootstrap bootstrap-prereqs bootstrap-release-tools bootstrap-format-tools bootstrap-rust-tools bootstrap-force tools check check-all test fmt fmt-check lint build build-release clean
 .PHONY: ffi-header build-ffi go-bindings-sync go-bindings-ci go-build go-test go-test-committed ts-build ts-test embed-verify
-.PHONY: precommit prepush repo-status deny deny-all audit miri msrv
+.PHONY: precommit prepush pr-final repo-status deny deny-all audit miri msrv
 .PHONY: check-windows check-windows-msvc check-windows-gnu
 .PHONY: install dogfood-cli
 .PHONY: version version-patch version-minor version-major version-set version-sync version-check
@@ -29,12 +29,15 @@ VERSION := $(shell cargo metadata --format-version 1 --no-deps 2>/dev/null | \
 
 BIN_DIR := $(CURDIR)/bin
 
-SFETCH_VERSION ?= v0.4.5
-SFETCH_INSTALL_URL ?= https://github.com/3leaps/sfetch/releases/download/$(SFETCH_VERSION)/install-sfetch.sh
-GONEAT_VERSION ?= v0.5.1
+SFETCH_VERSION ?= v0.4.7
+GONEAT_VERSION ?= v0.5.10
+PRETTIER_VERSION ?= 3.8.3
+BIOME_VERSION ?= 2.4.15
+YAMLFMT_VERSION ?= v0.21.0
+TOOL_PATH := $(BIN_DIR):$(BIN_DIR)/node/bin:$(PATH)
 
 SFETCH = $(shell [ -x "$(BIN_DIR)/sfetch" ] && echo "$(BIN_DIR)/sfetch" || command -v sfetch 2>/dev/null)
-GONEAT = $(shell command -v goneat 2>/dev/null)
+GONEAT = $(shell [ -x "$(BIN_DIR)/goneat" ] && echo "$(BIN_DIR)/goneat" || command -v goneat 2>/dev/null)
 
 CARGO = cargo
 GO_BINDINGS_DIR := bindings/go/seclusor
@@ -85,6 +88,7 @@ help: ## Show available targets
 	@echo "  lint            Run linting (cargo clippy + goneat lint)"
 	@echo "  precommit       Pre-commit checks (fast: fmt, clippy)"
 	@echo "  prepush         Pre-push checks (thorough: fmt, clippy, test, deny, version-check)"
+	@echo "  pr-final        Final local PR gate before pushing a branch"
 	@echo "  msrv            Verify build+test on MSRV toolchain"
 	@echo "  miri            Run Miri UB detection on FFI crate (nightly)"
 	@echo "  deny            Run cargo-deny license checks (offline-safe)"
@@ -126,6 +130,14 @@ help: ## Show available targets
 bootstrap: ## Install required tools (sfetch -> goneat)
 	@echo "Bootstrapping seclusor development environment..."
 	@echo ""
+	@$(MAKE) bootstrap-prereqs
+	@$(MAKE) bootstrap-release-tools
+	@$(MAKE) bootstrap-format-tools
+	@$(MAKE) bootstrap-rust-tools
+	@echo ""
+	@echo "[ok] Bootstrap complete"
+
+bootstrap-prereqs:
 	@if ! command -v curl >/dev/null 2>&1; then \
 		echo "[!!] curl not found (required for bootstrap)"; \
 		exit 1; \
@@ -139,11 +151,41 @@ bootstrap: ## Install required tools (sfetch -> goneat)
 		exit 1; \
 	fi
 	@echo "[ok] cargo: $$(cargo --version)"
+	@if ! command -v go >/dev/null 2>&1; then \
+		echo "[!!] go not found (required for yamlfmt/gofmt)"; \
+		exit 1; \
+	fi
+	@echo "[ok] go: $$(go version)"
+	@if ! command -v npm >/dev/null 2>&1; then \
+		echo "[!!] npm not found (required for pinned prettier/biome)"; \
+		exit 1; \
+	fi
+	@echo "[ok] npm: $$(npm --version)"
 	@echo ""
+
+bootstrap-release-tools:
 	@mkdir -p "$(BIN_DIR)"
-	@if [ ! -x "$(BIN_DIR)/sfetch" ] && ! command -v sfetch >/dev/null 2>&1; then \
-		echo "[..] Installing sfetch (trust anchor)..."; \
-		curl -fsSL "$(SFETCH_INSTALL_URL)" | bash -s -- --dir "$(BIN_DIR)" --yes; \
+	@if [ "$(FORCE)" = "1" ] || { [ ! -x "$(BIN_DIR)/sfetch" ] && ! command -v sfetch >/dev/null 2>&1; }; then \
+		echo "[..] Installing sfetch $(SFETCH_VERSION) repo-local..."; \
+		tmp_dir="$$(mktemp -d)"; \
+		trap 'rm -rf "$$tmp_dir"' EXIT; \
+		case "$$(uname -s)-$$(uname -m)" in \
+			Darwin-arm64|Darwin-aarch64) asset="sfetch_darwin_arm64.tar.gz" ;; \
+			Linux-x86_64|Linux-amd64) asset="sfetch_linux_amd64.tar.gz" ;; \
+			Linux-aarch64|Linux-arm64) asset="sfetch_linux_arm64.tar.gz" ;; \
+			*) echo "[!!] Unsupported sfetch platform: $$(uname -s)-$$(uname -m)"; exit 1 ;; \
+		esac; \
+		base_url="https://github.com/3leaps/sfetch/releases/download/$(SFETCH_VERSION)"; \
+		curl -fsSL "$$base_url/$$asset" -o "$$tmp_dir/$$asset" || exit 1; \
+		curl -fsSL "$$base_url/SHA256SUMS" -o "$$tmp_dir/SHA256SUMS" || exit 1; \
+		cd "$$tmp_dir" && grep "  $$asset$$" SHA256SUMS > "$$asset.sha256" || exit 1; \
+		if command -v sha256sum >/dev/null 2>&1; then \
+			cd "$$tmp_dir" && sha256sum -c "$$asset.sha256" || exit 1; \
+		else \
+			cd "$$tmp_dir" && shasum -a 256 -c "$$asset.sha256" || exit 1; \
+		fi; \
+		tar -xzf "$$tmp_dir/$$asset" -C "$$tmp_dir" || exit 1; \
+		install -m 0755 "$$tmp_dir/sfetch" "$(BIN_DIR)/sfetch" || exit 1; \
 	else \
 		echo "[ok] sfetch already installed"; \
 	fi
@@ -156,18 +198,53 @@ bootstrap: ## Install required tools (sfetch -> goneat)
 	@SFETCH_BIN=""; \
 	if [ -x "$(BIN_DIR)/sfetch" ]; then SFETCH_BIN="$(BIN_DIR)/sfetch"; \
 	elif command -v sfetch >/dev/null 2>&1; then SFETCH_BIN="$$(command -v sfetch)"; fi; \
-	if [ "$(FORCE)" = "1" ] || ! command -v goneat >/dev/null 2>&1; then \
-		echo "[..] Installing goneat $(GONEAT_VERSION) via sfetch (user-space)..."; \
-		$$SFETCH_BIN --repo fulmenhq/goneat --tag $(GONEAT_VERSION); \
+	if [ "$(FORCE)" = "1" ] || { [ ! -x "$(BIN_DIR)/goneat" ] && ! command -v goneat >/dev/null 2>&1; }; then \
+		echo "[..] Installing goneat $(GONEAT_VERSION) via sfetch (repo-local)..."; \
+		$$SFETCH_BIN --repo fulmenhq/goneat --tag $(GONEAT_VERSION) --dest-dir "$(BIN_DIR)"; \
 	else \
 		echo "[ok] goneat already installed"; \
 	fi
-	@if command -v goneat >/dev/null 2>&1; then \
+	@if [ -x "$(BIN_DIR)/goneat" ]; then \
+		echo "[ok] goneat: $$("$(BIN_DIR)/goneat" version 2>&1 | head -n1)"; \
+	elif command -v goneat >/dev/null 2>&1; then \
 		echo "[ok] goneat: $$(goneat version 2>&1 | head -n1)"; \
 	else \
 		echo "[!!] goneat installation failed"; exit 1; \
 	fi
 	@echo ""
+
+bootstrap-format-tools:
+	@echo "[..] Checking Goneat formatter dependencies..."
+	@if [ "$(FORCE)" = "1" ] || [ ! -x "$(BIN_DIR)/yamlfmt" ]; then \
+		echo "[..] Installing yamlfmt $(YAMLFMT_VERSION) repo-local..."; \
+		GOBIN="$(BIN_DIR)" go install github.com/google/yamlfmt/cmd/yamlfmt@$(YAMLFMT_VERSION); \
+	else \
+		echo "[ok] yamlfmt installed"; \
+	fi
+	@if [ "$(FORCE)" = "1" ] || [ ! -x "$(BIN_DIR)/node/bin/prettier" ]; then \
+		echo "[..] Installing prettier $(PRETTIER_VERSION) repo-local..."; \
+		mkdir -p "$(BIN_DIR)/node"; \
+		npm install --global --prefix "$(BIN_DIR)/node" prettier@$(PRETTIER_VERSION); \
+	else \
+		echo "[ok] prettier installed"; \
+	fi
+	@if [ "$(FORCE)" = "1" ] || [ ! -x "$(BIN_DIR)/node/bin/biome" ]; then \
+		echo "[..] Installing biome $(BIOME_VERSION) repo-local..."; \
+		mkdir -p "$(BIN_DIR)/node"; \
+		npm install --global --prefix "$(BIN_DIR)/node" @biomejs/biome@$(BIOME_VERSION); \
+	else \
+		echo "[ok] biome installed"; \
+	fi
+	@PATH="$(TOOL_PATH)"; \
+	if ! command -v yamlfmt >/dev/null 2>&1; then echo "[!!] yamlfmt installation failed"; exit 1; fi; \
+	if ! command -v prettier >/dev/null 2>&1; then echo "[!!] prettier installation failed"; exit 1; fi; \
+	if ! command -v biome >/dev/null 2>&1; then echo "[!!] biome installation failed"; exit 1; fi; \
+	echo "[ok] yamlfmt: $$(yamlfmt -version 2>&1 | head -n1)"; \
+	echo "[ok] prettier: $$(prettier --version)"; \
+	echo "[ok] biome: $$(biome --version 2>&1 | head -n1)"
+	@echo ""
+
+bootstrap-rust-tools:
 	@echo "[..] Checking Rust dev tools..."
 	@if ! command -v cargo-deny >/dev/null 2>&1; then \
 		echo "[..] Installing cargo-deny..."; \
@@ -193,8 +270,6 @@ bootstrap: ## Install required tools (sfetch -> goneat)
 	else \
 		echo "[ok] cargo-edit installed"; \
 	fi
-	@echo ""
-	@echo "[ok] Bootstrap complete"
 
 bootstrap-force: ## Force reinstall all tools
 	@$(MAKE) bootstrap FORCE=1
@@ -236,6 +311,24 @@ tools: ## Verify external tools are available
 	else \
 		echo "[!!] cargo-edit not found (cargo install cargo-edit)"; \
 	fi
+	@PATH="$(TOOL_PATH)"; \
+	if command -v yamlfmt >/dev/null 2>&1; then \
+		echo "[ok] yamlfmt: $$(yamlfmt -version 2>&1 | head -n1)"; \
+	else \
+		echo "[!!] yamlfmt not found (run 'make bootstrap')"; \
+	fi
+	@PATH="$(TOOL_PATH)"; \
+	if command -v prettier >/dev/null 2>&1; then \
+		echo "[ok] prettier: $$(prettier --version)"; \
+	else \
+		echo "[!!] prettier not found (run 'make bootstrap')"; \
+	fi
+	@PATH="$(TOOL_PATH)"; \
+	if command -v biome >/dev/null 2>&1; then \
+		echo "[ok] biome: $$(biome --version 2>&1 | head -n1)"; \
+	else \
+		echo "[!!] biome not found (run 'make bootstrap')"; \
+	fi
 	@if [ -x "$(BIN_DIR)/sfetch" ]; then \
 		echo "[ok] sfetch: $(BIN_DIR)/sfetch"; \
 	elif command -v sfetch >/dev/null 2>&1; then \
@@ -243,7 +336,9 @@ tools: ## Verify external tools are available
 	else \
 		echo "[!!] sfetch not found (run 'make bootstrap')"; \
 	fi
-	@if command -v goneat >/dev/null 2>&1; then \
+	@if [ -x "$(BIN_DIR)/goneat" ]; then \
+		echo "[ok] goneat: $$("$(BIN_DIR)/goneat" version 2>&1 | head -n1)"; \
+	elif command -v goneat >/dev/null 2>&1; then \
 		echo "[ok] goneat: $$(goneat version 2>&1 | head -n1)"; \
 	else \
 		echo "[!!] goneat not found (run 'make bootstrap')"; \
@@ -267,38 +362,44 @@ test: ## Run test suite
 fmt: ## Format code (cargo fmt + goneat format)
 	@echo "Formatting Rust..."
 	$(CARGO) fmt --all
-	@if command -v goneat >/dev/null 2>&1; then \
+	@GONEAT_BIN="$(GONEAT)"; \
+	if [ -n "$$GONEAT_BIN" ]; then \
 		echo "Formatting markdown, YAML, JSON..."; \
-		goneat format --quiet; \
+		PATH="$(TOOL_PATH)" "$$GONEAT_BIN" format --quiet --fallback-sequential; \
 	else \
-		echo "[!!] goneat not found — skipping non-Rust formatting (run 'make bootstrap')"; \
+		echo "[!!] goneat not found — run 'make bootstrap'"; \
+		exit 1; \
 	fi
 	@echo "[ok] Formatting complete"
 
 fmt-check: ## Check formatting without modifying
 	@echo "Checking Rust formatting..."
 	$(CARGO) fmt --all -- --check
-	@if command -v goneat >/dev/null 2>&1; then \
+	@GONEAT_BIN="$(GONEAT)"; \
+	if [ -n "$$GONEAT_BIN" ]; then \
 		echo "Checking markdown, YAML, JSON formatting..."; \
-		goneat format --check --quiet; \
+		PATH="$(TOOL_PATH)" "$$GONEAT_BIN" format --check --quiet --fallback-sequential; \
 	else \
-		echo "[!!] goneat not found — skipping non-Rust format check (run 'make bootstrap')"; \
+		echo "[!!] goneat not found — run 'make bootstrap'"; \
+		exit 1; \
 	fi
 	@echo "[ok] Formatting check passed"
 
 lint: ## Run linting (cargo clippy + goneat lint)
 	@echo "Linting Rust..."
 	$(CARGO) clippy --workspace --all-targets --all-features -- -D warnings
-	@if command -v goneat >/dev/null 2>&1; then \
+	@GONEAT_BIN="$(GONEAT)"; \
+	if [ -n "$$GONEAT_BIN" ]; then \
 		echo "Linting YAML, shell, workflows..."; \
-		goneat assess --categories lint --fail-on medium --ci-summary --log-level warn --output /dev/null --scope \
+		PATH="$(TOOL_PATH)" "$$GONEAT_BIN" assess --categories lint --fail-on medium --ci-summary --log-level warn --output /dev/null --scope \
 			--include '.github/workflows/**/*.yml' \
 			--include '.github/workflows/**/*.yaml' \
 			--include '.goneat/**/*.yaml' \
 			--include '**/*.sh' \
 			--include '**/Makefile'; \
 	else \
-		echo "[!!] goneat not found — skipping non-Rust linting (run 'make bootstrap')"; \
+		echo "[!!] goneat not found — run 'make bootstrap'"; \
+		exit 1; \
 	fi
 	@echo "[ok] Linting passed"
 
@@ -487,9 +588,13 @@ precommit: fmt-check lint ## Run pre-commit checks (fast)
 prepush: repo-status check version-check go-test ts-test ## Run pre-push checks (thorough)
 	@echo "[ok] Pre-push checks passed"
 
+pr-final: ci go-test ts-test ## Final local PR gate before pushing a branch
+	@echo "[ok] PR final gate passed"
+
 repo-status: ## Fail if working tree has uncommitted changes (goneat assess repo-status)
-	@if command -v goneat >/dev/null 2>&1; then \
-		goneat assess --categories repo-status --fail-on high --ci-summary --log-level warn; \
+	@GONEAT_BIN="$(GONEAT)"; \
+	if [ -n "$$GONEAT_BIN" ]; then \
+		PATH="$(TOOL_PATH)" "$$GONEAT_BIN" assess --categories repo-status --fail-on high --ci-summary --log-level warn; \
 	else \
 		echo "Checking working tree..."; \
 		if [ -n "$$(git status --porcelain 2>/dev/null)" ]; then \

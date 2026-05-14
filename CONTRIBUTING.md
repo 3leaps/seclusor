@@ -24,7 +24,8 @@ This repo aims to be:
 
 Or use the Makefile:
 
-- `make check-all` — runs fmt, clippy, test, deny, version-check
+- `make pr-final` — final local gate before pushing a PR branch
+- `make check-all` — runs fmt, clippy, test, deny
 
 > CI is the source of truth; see `.github/workflows/ci.yml`.
 
@@ -42,15 +43,17 @@ All feature work happens on branches and lands via pull requests.
 ### Workflow
 
 1. Create a branch from `main`
-2. Develop, commit, push to origin
-3. Open a PR against `main` (`gh pr create`)
-4. CI runs automatically on the PR
-5. Address review feedback
-6. Merge (squash for single-concern PRs, merge commit for multi-commit features)
+2. Develop and commit locally
+3. Run `make pr-final`
+4. Push the feature branch to origin
+5. Open a PR against `main` (`gh pr create`)
+6. CI runs automatically on the PR
+7. Address review feedback
+8. Merge after required review and green CI
 
 ### Direct-to-main exceptions
 
-These small, mechanical operations go directly to `main` during releases:
+Direct-to-main work is restricted to maintainer-approved release operations:
 
 - Version bump commit (`chore(release): bump vX.Y.Z`)
 - Go bindings PR merge (automated by workflow)
@@ -63,11 +66,10 @@ PRs should be small, focused, and include tests.
 **PR checklist**
 
 - [ ] Tests added or updated
-- [ ] `cargo fmt` clean
-- [ ] `cargo clippy` clean (with `--all-features`)
-- [ ] `cargo deny check licenses` clean
+- [ ] `make pr-final` passed locally
 - [ ] Docs updated (if behavior changed)
 - [ ] FFI changes reviewed for memory safety and binding parity
+- [ ] Crypto/key-management changes reviewed for plaintext leakage and key handling
 
 ## Commit style
 

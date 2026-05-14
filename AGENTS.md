@@ -13,13 +13,13 @@
 
 ## Operating Model
 
-| Aspect         | Setting                                  |
-| -------------- | ---------------------------------------- |
-| Mode           | Supervised (human reviews before commit) |
-| Classification | code-substantive, security-sensitive     |
-| Role Required  | Yes                                      |
-| Default Role   | devlead                                  |
-| Identity       | Per session (no persistent memory)       |
+| Aspect         | Setting                                 |
+| -------------- | --------------------------------------- |
+| Mode           | Supervised (human reviews before merge) |
+| Classification | code-substantive, security-sensitive    |
+| Role Required  | Yes                                     |
+| Default Role   | devlead                                 |
+| Identity       | Per session (no persistent memory)      |
 
 This repository is classified as **security-sensitive** because:
 
@@ -53,6 +53,7 @@ See [agent-identity standard](https://crucible.3leaps.dev/repository/agent-ident
 | Lint           | `cargo clippy`     |
 | License check  | `cargo deny check` |
 | Security audit | `cargo audit`      |
+| PR final gate  | `make pr-final`    |
 | Full check     | `make check-all`   |
 
 ## Session Protocol
@@ -65,6 +66,8 @@ See [agent-identity standard](https://crucible.3leaps.dev/repository/agent-ident
 - Consider FFI boundary impacts
 - Consider Go and TypeScript binding parity
 - Work on a feature branch (see `CONTRIBUTING.md` for branching model)
+- Coordinate seclusor v0.2.0 release work in Mattermost channel
+  `#release-seclusor-v020`
 
 ### Before Committing
 
@@ -73,6 +76,7 @@ See [agent-identity standard](https://crucible.3leaps.dev/repository/agent-ident
 - Run `cargo deny check licenses`
 - Verify no unintended changes with `git diff`
 - Use proper commit attribution (see below)
+- Run `make pr-final` before pushing a branch for PR review
 - Push branch and open PR for review before merging to `main`
 
 ## Commit Attribution
@@ -193,7 +197,7 @@ See [Role Catalog](config/agentic/roles/README.md) for full definitions.
 
 ### DO NOT
 
-- Push without maintainer approval
+- Push to `main`, release branches, or tags without maintainer approval
 - Skip quality gates or license checks
 - Commit secrets or credentials
 - Add GPL/LGPL/AGPL dependencies
@@ -207,14 +211,19 @@ See [Role Catalog](config/agentic/roles/README.md) for full definitions.
 
 ## Critical Rules
 
-### Never Push Without Approval
+### Push Discipline
 
-Git push operations require explicit, per-incident human maintainer approval:
+Feature branch pushes are allowed after local review and `make pr-final`.
+Protected branches, release branches, and tags require explicit, per-incident
+human maintainer approval.
 
 ```bash
 git add <files>       # OK
 git commit -m "..."   # OK
-git push              # NEVER without explicit approval
+make pr-final         # REQUIRED before pushing a PR branch
+git push -u origin <feature-branch>  # OK after pr-final
+git push origin main  # NEVER without explicit approval
+git push origin vX.Y.Z  # NEVER without explicit approval
 ```
 
 ### License Compliance
@@ -241,6 +250,7 @@ Changes must consider all supported platforms:
 | Path                         | Purpose                                      |
 | ---------------------------- | -------------------------------------------- |
 | `CONTRIBUTING.md`            | Branching model, PR process, commit style    |
+| `REVIEW_CHECKLIST.md`        | Reviewer checklist and PR final gate         |
 | `RELEASE_CHECKLIST.md`       | End-to-end release sequence                  |
 | `docs/guides/development.md` | Development setup, testing, workspace layout |
 | `config/agentic/roles/`      | In-repo role definitions                     |

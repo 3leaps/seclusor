@@ -25,12 +25,13 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - name: Install rust tools
+      - name: Bootstrap development tools
         shell: bash
         run: |
           set -euo pipefail
-          cargo install cargo-deny --locked
-          cargo install cbindgen --locked
+          sudo apt-get update
+          sudo apt-get install -y minisign
+          make bootstrap
       - name: CI checks
         shell: bash
         run: |
