@@ -176,16 +176,16 @@ bootstrap-release-tools:
 			*) echo "[!!] Unsupported sfetch platform: $$(uname -s)-$$(uname -m)"; exit 1 ;; \
 		esac; \
 		base_url="https://github.com/3leaps/sfetch/releases/download/$(SFETCH_VERSION)"; \
-		curl -fsSL "$$base_url/$$asset" -o "$$tmp_dir/$$asset"; \
-		curl -fsSL "$$base_url/SHA256SUMS" -o "$$tmp_dir/SHA256SUMS"; \
-		cd "$$tmp_dir" && grep "  $$asset$$" SHA256SUMS > "$$asset.sha256"; \
+		curl -fsSL "$$base_url/$$asset" -o "$$tmp_dir/$$asset" || exit 1; \
+		curl -fsSL "$$base_url/SHA256SUMS" -o "$$tmp_dir/SHA256SUMS" || exit 1; \
+		cd "$$tmp_dir" && grep "  $$asset$$" SHA256SUMS > "$$asset.sha256" || exit 1; \
 		if command -v sha256sum >/dev/null 2>&1; then \
-			cd "$$tmp_dir" && sha256sum -c "$$asset.sha256"; \
+			cd "$$tmp_dir" && sha256sum -c "$$asset.sha256" || exit 1; \
 		else \
-			cd "$$tmp_dir" && shasum -a 256 -c "$$asset.sha256"; \
+			cd "$$tmp_dir" && shasum -a 256 -c "$$asset.sha256" || exit 1; \
 		fi; \
-		tar -xzf "$$tmp_dir/$$asset" -C "$$tmp_dir"; \
-		install -m 0755 "$$tmp_dir/sfetch" "$(BIN_DIR)/sfetch"; \
+		tar -xzf "$$tmp_dir/$$asset" -C "$$tmp_dir" || exit 1; \
+		install -m 0755 "$$tmp_dir/sfetch" "$(BIN_DIR)/sfetch" || exit 1; \
 	else \
 		echo "[ok] sfetch already installed"; \
 	fi
