@@ -1,5 +1,4 @@
-use std::collections::HashSet;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Read;
 use std::path::Path;
 use std::process::Command;
@@ -7,9 +6,9 @@ use std::process::Command;
 use clap::Parser;
 use seclusor_codec::{
     convert_inline_to_bundle, decrypt_bundle_from_file, decrypt_inline, encrypt_bundle_to_file,
-    encrypt_inline, resolve_runtime_source_from_file, StorageCodec,
+    encrypt_inline, StorageCodec,
 };
-use seclusor_core::constants::{MAX_SECRETS_DOC_BYTES, SCHEMA_VERSION};
+use seclusor_core::constants::MAX_SECRETS_DOC_BYTES;
 use seclusor_core::crud::{
     get_credential, list_credential_keys, resolve_project_index, set_credential, unset_credential,
 };
@@ -18,19 +17,19 @@ use seclusor_core::env::{
 };
 use seclusor_core::validate::{normalize_description, validate_strict};
 use seclusor_core::{Credential, SeclusorError, SecretsFile};
-use seclusor_crypto::{parse_recipients, Identity};
-use seclusor_keyring::{
-    discover_recipients, generate_identity_file, generate_identity_file_with_passphrase,
-    is_passphrase_protected_identity, load_identity_file_auto, KeyringError, Recipient,
-    RecipientDiscoveryOptions, DEFAULT_RECIPIENTS_ENV_VAR,
-};
-use secrecy::{ExposeSecret, SecretString};
+use seclusor_keyring::{generate_identity_file, generate_identity_file_with_passphrase};
 
 mod cli;
 mod error;
+mod io;
+mod lenient;
+mod resolve;
 
 use cli::*;
 use error::{CliError, CliResult};
+use io::*;
+use lenient::*;
+use resolve::*;
 
 const DEFAULT_SECRETS_FILE: &str = "secrets.json";
 const REDACTED_OUTPUT: &str = "<redacted>";
@@ -601,210 +600,6 @@ fn read_import_source(args: &ImportEnvArgs) -> CliResult<Vec<(String, String)>> 
     Ok(std::env::vars().collect())
 }
 
-fn resolve_recipients(args: &RecipientArgs) -> CliResult<Vec<Recipient>> {
-    let mut recipients = Vec::new();
-
-    if !args.recipients.is_empty() {
-        recipients.extend(parse_recipients(
-            args.recipients.iter().map(String::as_str),
-        )?);
-    }
-
-    if args.recipient_file.is_some() || args.recipient_env_var.is_some() {
-        let discovered = discover_recipients(&RecipientDiscoveryOptions {
-            recipient_file: args.recipient_file.clone(),
-            recipient_env_var: args.recipient_env_var.clone(),
-        })?;
-        recipients.extend(discovered);
-    } else if recipients.is_empty() && std::env::var(DEFAULT_RECIPIENTS_ENV_VAR).is_ok() {
-        let discovered = discover_recipients(&RecipientDiscoveryOptions {
-            recipient_file: None,
-            recipient_env_var: Some(DEFAULT_RECIPIENTS_ENV_VAR.to_string()),
-        })?;
-        recipients.extend(discovered);
-    }
-
-    if recipients.is_empty() {
-        return Err(CliError::Message(
-            "no recipients resolved; provide --recipient, --recipient-file, or --recipient-env-var"
-                .to_string(),
-        ));
-    }
-
-    let mut seen = HashSet::new();
-    recipients.retain(|recipient| seen.insert(recipient.to_string()));
-
-    Ok(recipients)
-}
-
-/// Resolve a passphrase from the configured input channel.
-///
-/// Returns `None` if no passphrase flags are set. When `confirm` is true
-/// (identity generation), the interactive prompt asks twice.
-fn resolve_passphrase(args: &PassphraseArgs, confirm: bool) -> CliResult<Option<SecretString>> {
-    if args.passphrase {
-        let prompt = if confirm {
-            "Enter passphrase: "
-        } else {
-            "Passphrase: "
-        };
-        eprint!("{prompt}");
-        let pp = SecretString::from(rpassword::read_password().map_err(|_| {
-            CliError::Message(
-                "no interactive terminal available for passphrase prompt. \
-                 Provide --passphrase-env, --passphrase-file, or --passphrase-stdin."
-                    .to_string(),
-            )
-        })?);
-        if pp.expose_secret().is_empty() {
-            return Err(CliError::Message(
-                "passphrase must not be empty".to_string(),
-            ));
-        }
-        if confirm {
-            eprint!("Confirm passphrase: ");
-            let pp2 = SecretString::from(rpassword::read_password().map_err(|_| {
-                CliError::Message("failed to read passphrase confirmation".to_string())
-            })?);
-            if pp.expose_secret() != pp2.expose_secret() {
-                return Err(CliError::Message("passphrases do not match".to_string()));
-            }
-        }
-        Ok(Some(pp))
-    } else if let Some(var_name) = &args.passphrase_env {
-        let pp = SecretString::from(std::env::var(var_name).map_err(|_| {
-            CliError::Message(format!(
-                "passphrase environment variable {var_name} is not set"
-            ))
-        })?);
-        if pp.expose_secret().is_empty() {
-            return Err(CliError::Message(format!(
-                "passphrase environment variable {var_name} is set but empty"
-            )));
-        }
-        Ok(Some(pp))
-    } else if let Some(path) = &args.passphrase_file {
-        seclusor_crypto::assert_secure_permissions(path)?;
-        assert_file_owned_by_current_user(path)?;
-        // Read file bytes and extract first line directly into SecretString
-        let bytes = fs::read(path)?;
-        let first_newline = bytes
-            .iter()
-            .position(|&b| b == b'\n')
-            .unwrap_or(bytes.len());
-        let line_bytes = &bytes[..first_newline];
-        if line_bytes.is_empty() {
-            return Err(CliError::Message("passphrase file is empty".to_string()));
-        }
-        let line_str = std::str::from_utf8(line_bytes)
-            .map_err(|_| CliError::Message("passphrase file is not valid UTF-8".to_string()))?;
-        Ok(Some(SecretString::from(line_str.to_owned())))
-    } else if args.passphrase_stdin {
-        // Read directly into SecretString via rpassword's stdin helper
-        // to avoid a plain String intermediate
-        let pp = SecretString::from({
-            let mut buf = String::new();
-            std::io::stdin().read_line(&mut buf)?;
-            let trimmed = buf.trim_end_matches('\n').trim_end_matches('\r').to_owned();
-            buf.clear();
-            trimmed
-        });
-        if pp.expose_secret().is_empty() {
-            return Err(CliError::Message(
-                "passphrase from stdin is empty".to_string(),
-            ));
-        }
-        Ok(Some(pp))
-    } else {
-        Ok(None)
-    }
-}
-
-/// Assert that a file is owned by the current user (Unix only).
-fn assert_file_owned_by_current_user(path: &Path) -> CliResult<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let meta = fs::metadata(path)?;
-        let file_uid = meta.uid();
-        let my_uid = unsafe { libc::getuid() };
-        if file_uid != my_uid {
-            return Err(CliError::Message(format!(
-                "passphrase file must be owned by the current user (file uid: {file_uid}, \
-                 current uid: {my_uid})"
-            )));
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-
-    Ok(())
-}
-
-fn resolve_identities(
-    args: &IdentityArgs,
-    passphrase_args: &PassphraseArgs,
-    required: bool,
-) -> CliResult<Vec<Identity>> {
-    // Per SC-008 settled decision 1: scan all identity files first,
-    // error if more than one is passphrase-protected.
-    let mut protected_count = 0usize;
-    for path in &args.identity_files {
-        if is_passphrase_protected_identity(path)? {
-            protected_count += 1;
-        }
-    }
-    if protected_count > 1 {
-        return Err(CliError::Keyring(KeyringError::MultipleProtectedIdentities));
-    }
-
-    // Resolve passphrase only if needed (at least one protected identity)
-    let passphrase = if protected_count > 0 {
-        let mut pp = resolve_passphrase(passphrase_args, false)?;
-        // Auto-prompt if no explicit passphrase channel and terminal available
-        if pp.is_none() {
-            eprint!("Passphrase: ");
-            match rpassword::read_password().map(SecretString::from) {
-                Ok(val) if !val.expose_secret().is_empty() => {
-                    pp = Some(val);
-                }
-                Ok(_) => {
-                    return Err(CliError::Message(
-                        "passphrase must not be empty".to_string(),
-                    ));
-                }
-                Err(_) => {
-                    return Err(CliError::Message(
-                        "identity file is passphrase-protected but no interactive \
-                         terminal is available. Provide --passphrase-env, \
-                         --passphrase-file, or --passphrase-stdin."
-                            .to_string(),
-                    ));
-                }
-            }
-        }
-        pp
-    } else {
-        None
-    };
-
-    let mut identities = Vec::new();
-    for path in &args.identity_files {
-        identities.extend(load_identity_file_auto(path, passphrase.as_ref())?);
-    }
-
-    if required && identities.is_empty() {
-        return Err(CliError::Message(
-            "no identities resolved; provide --identity-file".to_string(),
-        ));
-    }
-
-    Ok(identities)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GetOutputMode {
     Redacted,
@@ -851,230 +646,10 @@ fn credential_from_set_args(
     }
 }
 
-fn read_secrets_file(path: &Path) -> CliResult<SecretsFile> {
-    let bytes = read_file_with_limit(path, MAX_SECRETS_DOC_BYTES)?;
-    let secrets: SecretsFile = serde_json::from_slice(&bytes)?;
-    validate_strict(&secrets)?;
-    Ok(secrets)
-}
-
-fn read_runtime_secrets_file(path: &Path, identities: &[Identity]) -> CliResult<SecretsFile> {
-    Ok(resolve_runtime_source_from_file(path, identities)?)
-}
-
-fn write_secrets_file(path: &Path, secrets: &SecretsFile, create_new: bool) -> CliResult<()> {
-    let data = serde_json::to_vec_pretty(secrets)?;
-    if data.len() > MAX_SECRETS_DOC_BYTES {
-        return Err(CliError::Core(SeclusorError::DocumentTooLarge {
-            actual: data.len(),
-            max: MAX_SECRETS_DOC_BYTES,
-        }));
-    }
-
-    if create_new {
-        let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-        std::io::Write::write_all(&mut file, &data)?;
-        std::io::Write::write_all(&mut file, b"\n")?;
-        return Ok(());
-    }
-
-    fs::write(path, data)?;
-    Ok(())
-}
-
-fn write_json_value_file(path: &Path, value: &serde_json::Value) -> CliResult<()> {
-    let data = serde_json::to_vec_pretty(value)?;
-    if data.len() > MAX_SECRETS_DOC_BYTES {
-        return Err(CliError::Core(SeclusorError::DocumentTooLarge {
-            actual: data.len(),
-            max: MAX_SECRETS_DOC_BYTES,
-        }));
-    }
-
-    fs::write(path, data)?;
-    Ok(())
-}
-
-fn read_file_with_limit(path: &Path, max: usize) -> CliResult<Vec<u8>> {
-    let mut file = fs::File::open(path)?;
-    let mut limited = std::io::Read::by_ref(&mut file).take((max as u64) + 1);
-    let mut buf = Vec::new();
-    limited.read_to_end(&mut buf)?;
-    if buf.len() > max {
-        return Err(CliError::Core(SeclusorError::DocumentTooLarge {
-            actual: buf.len(),
-            max,
-        }));
-    }
-    Ok(buf)
-}
-
-fn handle_unset_lenient(args: UnsetArgs) -> CliResult<()> {
-    eprintln!("warning: file contains malformed credentials; using lenient parse");
-
-    let bytes = read_file_with_limit(&args.file, MAX_SECRETS_DOC_BYTES)?;
-    let mut root: serde_json::Value = serde_json::from_slice(&bytes)?;
-    remove_credential_lenient(&mut root, args.project.as_deref(), &args.key)?;
-    write_json_value_file(&args.file, &root)?;
-
-    if let Err(err) = read_secrets_file(&args.file) {
-        eprintln!(
-            "warning: file was updated, but malformed credentials remain after removing {:?}: {}",
-            args.key, err
-        );
-        return Err(CliError::Message(format!(
-            "file was updated, but malformed credentials remain after removing {:?}",
-            args.key
-        )));
-    }
-
-    println!("ok");
-    Ok(())
-}
-
-fn should_use_lenient_unset(
-    path: &Path,
-    project_slug: Option<&str>,
-    key: &str,
-    err: &CliError,
-) -> bool {
-    match err {
-        CliError::Json(_) => true,
-        CliError::Core(SeclusorError::Validation(_)) => {
-            target_credential_requires_lenient_repair(path, project_slug, key).unwrap_or(false)
-        }
-        _ => false,
-    }
-}
-
-fn target_credential_requires_lenient_repair(
-    path: &Path,
-    project_slug: Option<&str>,
-    key: &str,
-) -> CliResult<bool> {
-    let bytes = read_file_with_limit(path, MAX_SECRETS_DOC_BYTES)?;
-    let root: serde_json::Value = serde_json::from_slice(&bytes)?;
-    let Some(raw_credential) = target_credential_value(&root, project_slug, key)? else {
-        return Ok(false);
-    };
-
-    if !raw_credential.is_object() {
-        return Ok(true);
-    }
-
-    let credential = match serde_json::from_value::<Credential>(raw_credential.clone()) {
-        Ok(credential) => credential,
-        Err(_) => return Ok(true),
-    };
-
-    let mut probe = SecretsFile::new("lenient-unset-probe");
-    probe.schema_version = SCHEMA_VERSION.to_string();
-    probe.projects[0]
-        .credentials
-        .insert(key.to_string(), credential);
-    Ok(validate_strict(&probe).is_err())
-}
-
-fn target_credential_value<'a>(
-    root: &'a serde_json::Value,
-    project_slug: Option<&str>,
-    key: &str,
-) -> CliResult<Option<&'a serde_json::Value>> {
-    let projects = root
-        .get("projects")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| {
-            CliError::Message("lenient unset requires a top-level projects array".to_string())
-        })?;
-
-    let project_index = resolve_lenient_project_index(projects, project_slug)?;
-    let project = &projects[project_index];
-    let credentials = project
-        .get("credentials")
-        .and_then(serde_json::Value::as_object)
-        .ok_or_else(|| {
-            CliError::Message(
-                "lenient unset requires each project to contain a credentials object".to_string(),
-            )
-        })?;
-
-    Ok(credentials.get(key))
-}
-
-fn remove_credential_lenient(
-    root: &mut serde_json::Value,
-    project_slug: Option<&str>,
-    key: &str,
-) -> CliResult<()> {
-    let projects = root
-        .get_mut("projects")
-        .and_then(serde_json::Value::as_array_mut)
-        .ok_or_else(|| {
-            CliError::Message("lenient unset requires a top-level projects array".to_string())
-        })?;
-
-    let project_index = resolve_lenient_project_index(projects, project_slug)?;
-    let project = &mut projects[project_index];
-    let credentials = project
-        .get_mut("credentials")
-        .and_then(serde_json::Value::as_object_mut)
-        .ok_or_else(|| {
-            CliError::Message(
-                "lenient unset requires each project to contain a credentials object".to_string(),
-            )
-        })?;
-
-    if credentials.remove(key).is_some() {
-        return Ok(());
-    }
-
-    let available = available_credential_keys(credentials);
-    if available.is_empty() {
-        return Err(CliError::Message(format!(
-            "credential {key:?} not found; project has no credential keys"
-        )));
-    }
-
-    Err(CliError::Message(format!(
-        "credential {key:?} not found; available keys: {}",
-        available.join(", ")
-    )))
-}
-
-fn resolve_lenient_project_index(
-    projects: &[serde_json::Value],
-    requested_slug: Option<&str>,
-) -> CliResult<usize> {
-    if let Some(slug) = requested_slug {
-        return projects
-            .iter()
-            .position(|project| {
-                project
-                    .get("project_slug")
-                    .and_then(serde_json::Value::as_str)
-                    == Some(slug)
-            })
-            .ok_or_else(|| CliError::Core(SeclusorError::ProjectNotFound(slug.to_string())));
-    }
-
-    if projects.len() == 1 {
-        return Ok(0);
-    }
-
-    Err(CliError::Core(SeclusorError::AmbiguousProject(
-        projects.len(),
-    )))
-}
-
-fn available_credential_keys(
-    credentials: &serde_json::Map<String, serde_json::Value>,
-) -> Vec<String> {
-    credentials.keys().cloned().collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use seclusor_crypto::Identity;
     use std::io::Write;
     use std::path::PathBuf;
 
