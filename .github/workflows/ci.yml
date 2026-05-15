@@ -24,7 +24,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          make bootstrap-release-tools
+          FORCE=1 make bootstrap-release-tools
           make bootstrap-format-tools
       - name: Verify runner tools
         shell: bash
