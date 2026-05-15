@@ -2,12 +2,12 @@ version: "1.0.0"
 hooks:
   pre-commit:
     - command: "assess"
-      args: ["--categories", "format,lint", "--fail-on", "medium"]
+      args: ["--categories", "format,lint", "--fail-on", "medium", "--new-issues-only"]
       priority: 10
       timeout: "90s"
   pre-push:
     - command: "assess"
-      args: ["--categories", "format,lint,security", "--fail-on", "high"]
+      args: ["--categories", "format,lint,security", "--fail-on", "high", "--new-issues-only"]
       priority: 10
       timeout: "2m"
 optimization:

@@ -12,26 +12,35 @@ jobs:
   rust-quality:
     name: Rust Quality (Linux)
     runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/fulmenhq/goneat-tools-runner-glibc:v0.4.1
+      options: --user root
     steps:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@1.94.0
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.22"
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-      - name: Bootstrap development tools
+      - name: Bootstrap pinned non-cargo tools
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y minisign
-          make bootstrap
+          FORCE=1 make bootstrap-release-tools
+          make bootstrap-format-tools
+      - name: Verify runner tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc --version
+          cargo --version
+          go version
+          node --version
+          npm --version
+          bin/goneat version
+          bin/sfetch --version
+          bin/yamlfmt -version
+          bin/node/bin/prettier --version
+          bin/node/bin/biome --version
+          cargo-deny --version
       - name: CI checks
         shell: bash
         run: |

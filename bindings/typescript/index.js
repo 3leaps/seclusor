@@ -1,5 +1,3 @@
-"use strict";
-
 const fs = require("node:fs");
 const path = require("node:path");
 
@@ -18,7 +16,7 @@ function resolveBindingPath() {
 	}
 
 	throw new Error(
-		`No seclusor native binding found for ${platform}-${arch}. Run \"npm run build\" first.`,
+		`No seclusor native binding found for ${platform}-${arch}. Run "npm run build" first.`,
 	);
 }
 
