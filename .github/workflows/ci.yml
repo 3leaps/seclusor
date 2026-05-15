@@ -20,6 +20,12 @@ jobs:
         uses: actions/checkout@v4
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@1.94.0
+      - name: Bootstrap pinned non-cargo tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          make bootstrap-release-tools
+          make bootstrap-format-tools
       - name: Verify runner tools
         shell: bash
         run: |
@@ -29,14 +35,12 @@ jobs:
           go version
           node --version
           npm --version
-          goneat version
-          sfetch --version
-          yamlfmt -version
-          prettier --version
-          biome --version
+          bin/goneat version
+          bin/sfetch --version
+          bin/yamlfmt -version
+          bin/node/bin/prettier --version
+          bin/node/bin/biome --version
           cargo-deny --version
-          cargo-audit --version
-          cbindgen --version
       - name: CI checks
         shell: bash
         run: |
