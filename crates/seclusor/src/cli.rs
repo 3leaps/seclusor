@@ -522,3 +522,28 @@ impl From<StorageCodecArg> for StorageCodec {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    use crate::test_support::TEST_IDENTITY;
+
+    #[test]
+    fn cli_rejects_identity_secret_key_argument_flag() {
+        let parsed = Cli::try_parse_from([
+            "seclusor",
+            "secrets",
+            "bundle",
+            "decrypt",
+            "--input",
+            "in.age",
+            "--output",
+            "out.json",
+            "--identity",
+            TEST_IDENTITY,
+        ]);
+        assert!(parsed.is_err());
+    }
+}
