@@ -21,10 +21,13 @@ This directory holds ADRs/SDRs/DDRs for the Rust rewrite.
 
 - `DDR-0001-go-ts-delivery-strategy.md` (in-repo delivery, Option A)
 - `DDR-0002-ed25519-signing-contract.md`
+- `DDR-0003-release-asset-naming-convention.md`
 
 ## Proposed / Draft
 
 - `ADR-0004-sqlite-driver-and-replication.md` (proposed; Rust TBD)
 - `ADR-0007-rust-crate-decomposition.md` (draft)
+- `DDR-0004-canonical-signing-payload.md` (proposed; v0.2.0 SC-016 prereq)
 - `ADR-0009` (planned): Error model (Rust + FFI code mapping)
 - `ADR-0010` (planned): Secret injection models (exec/eval/env-file/library/daemon)
+- `DDR-0005` (planned): Trusted-time threat model (SC-017 design artifact)
