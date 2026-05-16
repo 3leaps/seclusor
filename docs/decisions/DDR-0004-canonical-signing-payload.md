@@ -6,11 +6,11 @@ Owner: cxotech (drafted) → entarch + secrev (review) → foxtrot-devlead (impl
 
 ## Context
 
-[SC-016](../../../3leaps-productbook-internal/content/projmgmt/seclusor/SC-016-asset-signing-and-verification.md)
-defines the user-facing workflow for asset signing and verification using
-the existing Ed25519 primitives from
-[DDR-0002](DDR-0002-ed25519-signing-contract.md). The detached signature
-envelope `seclusor.signature.v1` is a JSON document with these fields:
+SC-016 (asset signing and verification, v0.2.0) defines the user-facing
+workflow for signing and verifying release assets using the existing
+Ed25519 primitives from [DDR-0002](DDR-0002-ed25519-signing-contract.md).
+The detached signature envelope `seclusor.signature.v1` is a JSON
+document with these fields:
 
 ```json
 {
@@ -19,8 +19,8 @@ envelope `seclusor.signature.v1` is a JSON document with these fields:
   "digest": { "algorithm": "SHA-256", "value": "<base64url>" },
   "signature": "<base64url>",
   "public_key": "<base64url>",
-  "key_fingerprint": "<stable form>",
-  "signer": { "label": "<utf-8>", "claimed_at": "<RFC 3339>" }
+  "key_fingerprint": "<base64url>",
+  "signer": { "label": "<utf-8>", "claimed_at": "<RFC 3339 strict>" }
 }
 ```
 
@@ -35,9 +35,11 @@ that fail verification under correct keys or, worse, succeed under
 attacker-controlled re-serialization.
 
 This DDR defines the exact byte string the signer hashes and Ed25519
-signs, and the exact byte string the verifier reconstructs to validate.
-The byte string is constructed deterministically from the envelope fields
-without going through a JSON serializer.
+signs, the strict JSON parsing rules that produce a normalized envelope
+in memory, and the verification operation that proves an asset was
+signed by an expected key. The signed byte string is constructed
+deterministically from typed in-memory fields without going through a
+JSON serializer.
 
 ## Decision
 
@@ -68,19 +70,19 @@ so that v1 signatures cannot be cross-protocol-confused with v2.
 ### 3. Fields covered, in order
 
 The signed bytes consist of the domain separator followed by these
-fields concatenated in this exact order. No field may be omitted; optional
-fields use the absence marker described in §5.
+fields concatenated in this exact order. No field may be omitted;
+optional fields use the absence marker described in §5.
 
-| #   | Field               | Source envelope path                                         | Encoding (see §4)                       |
-| --- | ------------------- | ------------------------------------------------------------ | --------------------------------------- |
-| 1   | `schema`            | top-level `schema`                                           | length-prefixed UTF-8                   |
-| 2   | `algorithm`         | top-level `algorithm`                                        | length-prefixed UTF-8                   |
-| 3   | `digest.algorithm`  | `digest.algorithm`                                           | length-prefixed UTF-8                   |
-| 4   | `digest.value`      | `digest.value` (raw bytes, NOT the base64url string)         | length-prefixed bytes                   |
-| 5   | `public_key`        | top-level `public_key` (raw 32 bytes, NOT base64url)         | length-prefixed bytes                   |
-| 6   | `key_fingerprint`   | top-level `key_fingerprint` (raw 32 bytes, NOT display form) | length-prefixed bytes                   |
-| 7   | `signer.label`      | `signer.label`, optional                                     | absence marker OR length-prefixed UTF-8 |
-| 8   | `signer.claimed_at` | `signer.claimed_at`, optional                                | absence marker OR length-prefixed UTF-8 |
+| #   | Field               | Source envelope path                                 | Encoding (see §4)                       |
+| --- | ------------------- | ---------------------------------------------------- | --------------------------------------- |
+| 1   | `schema`            | top-level `schema`                                   | length-prefixed UTF-8                   |
+| 2   | `algorithm`         | top-level `algorithm`                                | length-prefixed UTF-8                   |
+| 3   | `digest.algorithm`  | `digest.algorithm`                                   | length-prefixed UTF-8                   |
+| 4   | `digest.value`      | `digest.value` (raw bytes, NOT the base64url string) | length-prefixed bytes (exactly 32)      |
+| 5   | `public_key`        | top-level `public_key` (raw 32 bytes, NOT base64url) | length-prefixed bytes (exactly 32)      |
+| 6   | `key_fingerprint`   | top-level `key_fingerprint` (raw 32 bytes)           | length-prefixed bytes (exactly 32)      |
+| 7   | `signer.label`      | `signer.label`, optional                             | absence marker OR length-prefixed UTF-8 |
+| 8   | `signer.claimed_at` | `signer.claimed_at`, optional                        | absence marker OR length-prefixed UTF-8 |
 
 The `signature` field is excluded from the payload — a signature cannot
 contribute to its own input. This is the "envelope minus signature"
@@ -93,6 +95,10 @@ Every variable-length field is **length-prefixed**:
 - **Length prefix**: 4-byte big-endian unsigned integer (u32) giving
   the length of the value in bytes
 - **Value**: the raw bytes themselves
+- **Guard**: implementations MUST reject any field whose length exceeds
+  `u32::MAX`. Practical maxima are much smaller; field-specific bounds
+  may be tightened in implementation, but the wire format reserves the
+  full u32 range.
 
 For text fields (schema, algorithm, digest.algorithm, signer.label,
 signer.claimed_at):
@@ -106,12 +112,34 @@ signer.claimed_at):
   populating envelope fields.
 - No trailing whitespace, no NUL terminators, no BOM. Length prefix
   describes exactly the bytes covered.
+- `schema`, `algorithm`, `digest.algorithm`: v1 requires the exact
+  literal values `"seclusor.signature.v1"`, `"Ed25519"`, `"SHA-256"`.
+  Implementations MUST reject any other value before payload construction.
+
+For text field `signer.claimed_at` (when present):
+
+- MUST match the strict grammar `YYYY-MM-DDTHH:MM:SSZ` — exactly 20
+  ASCII bytes, always UTC `Z`, no fractional seconds, no timezone
+  offsets other than `Z`
+- Implementations MUST reject any other RFC 3339 variant at sign and
+  verify time
+- Present-but-empty is rejected; if `claimed_at` appears in the
+  envelope it must carry a valid timestamp string
+
+For text field `signer.label` (when present):
+
+- MUST NOT begin or end with whitespace (ASCII space, tab, CR, LF, or
+  any Unicode whitespace category). Rejected at sign and verify time.
+- May contain internal whitespace; the bytes signed are exactly the
+  bytes given.
 
 For binary fields (digest.value, public_key, key_fingerprint):
 
-- The bytes are the raw cryptographic material (e.g., 32 bytes for
-  SHA-256 digest, 32 bytes for Ed25519 public key, 32 bytes for
-  fingerprint)
+- The bytes are the raw cryptographic material
+- Fixed-size assertion (rejected at parse time, not at verify time):
+  `digest.value` is exactly 32 bytes; `public_key` is exactly 32 bytes;
+  `key_fingerprint` is exactly 32 bytes. The envelope's `signature`
+  field (not in the signed payload, see §3) is exactly 64 bytes.
 - The JSON envelope's base64url representation is **decoded** before
   inclusion in the signed payload. Implementations MUST NOT include
   the base64url-encoded string bytes.
@@ -128,25 +156,88 @@ Encoding:
 | Field present, empty value      | One byte `0x01` followed by length prefix `0x00000000`, nothing follows           |
 | Field present, value of N bytes | One byte `0x01` followed by 4-byte big-endian length N, followed by N value bytes |
 
-This guarantees that "label absent" and "label present but empty" produce
-distinct signed bytes, which prevents an attacker from forging a presence
-flip without invalidating the signature.
+This guarantees that "absent" and "present-but-empty" produce distinct
+signed bytes, preventing an attacker from forging a presence flip
+without invalidating the signature.
+
+Note: `signer.claimed_at` MUST NOT use the present-empty form per §4 —
+if claimed_at appears in the envelope it must carry a valid timestamp.
+The encoding table here is general; per-field constraints in §4 are
+stricter.
 
 ### 6. Key fingerprint definition
 
-The `key_fingerprint` is `SHA-256(public_key_bytes)` where `public_key_bytes`
-is the raw 32-byte Ed25519 public key — the same bytes that appear in field 5
-of the signed payload, not the base64url string.
+The `key_fingerprint` is `SHA-256(public_key_bytes)` where
+`public_key_bytes` is the raw 32-byte Ed25519 public key — the same
+bytes that appear in field 5 of the signed payload, not the base64url
+string.
 
-The CLI MAY render the fingerprint in any inspectable display form (e.g.,
-base64url with a `seced25519fp1` prefix), but the **signed payload always
-contains the raw 32 bytes** in field 6.
+The transport encoding inside the JSON envelope is **unpadded
+URL-safe base64** of the raw 32-byte fingerprint (see §7). Prefixed
+or otherwise inspectable display forms (e.g., `seced25519fp1...`) are
+permitted only outside the canonical envelope — e.g., as CLI input for
+an operator-supplied expected fingerprint, or as decorated CLI display
+output — never as the value of the `key_fingerprint` field itself.
 
 Rationale: keeps fingerprint and public_key cryptographically bound
 inside the signed payload, so a verifier cannot be tricked into
 accepting an envelope whose displayed fingerprint mismatches its key.
 
-### 7. Signing operation
+### 7. Base64url profile for envelope binary fields
+
+The JSON envelope encodes all binary fields (`digest.value`,
+`signature`, `public_key`, `key_fingerprint`) as **unpadded URL-safe
+base64** (RFC 4648 §5, padding omitted).
+
+- Signer/canonical emit: implementations MUST emit binary fields in
+  this profile. Padded forms (`=` / `==`) and standard base64 (with
+  `+` / `/`) MUST NOT appear in canonical envelope output.
+- Verifier accept: implementations MUST reject padded base64, MUST
+  reject standard-base64 alphabet, and MUST reject any non-base64url
+  characters. Strictness is a v1 contract; permissive padding
+  acceptance is not a forward-compatibility hedge — it would be a v2
+  decision if ever needed.
+
+This profile is not what's signed (see §3), but envelope parser
+strictness prevents legitimate envelopes from being silently mutated
+in transit and causing downstream fingerprint/digest mismatches.
+
+### 8. Strict JSON envelope parsing
+
+Typed-byte canonicalization (§1) removes JSON serializer risk on the
+sign side but does not by itself remove JSON parser ambiguity on the
+verify side. Implementations MUST parse the envelope under these
+rules; rejection happens before any field extraction or payload
+construction:
+
+1. **Reject duplicate JSON object keys** at any nesting level. Many
+   permissive parsers silently take the last-value-wins; this MUST
+   not happen.
+2. **Reject unknown top-level fields** other than:
+   `schema`, `algorithm`, `digest`, `signature`, `public_key`,
+   `key_fingerprint`, `signer`. v1 envelopes do not carry extensions.
+   v2 will define its own field set under a new domain separator.
+3. **Reject unknown fields inside `digest`** other than `algorithm`
+   and `value`.
+4. **Reject unknown fields inside `signer`** other than `label` and
+   `claimed_at`.
+5. **Reject JSON `null`** for any field. A missing optional is
+   expressed by absence of the key, not by `null`.
+6. **Treat a missing `signer` object** as both `signer.label` and
+   `signer.claimed_at` being absent. A present `signer` with no keys
+   is also valid (both absent). A present `signer` with both keys
+   absent and no other keys is equivalent to a missing `signer`.
+7. **Apply all §4–§7 field-type and length constraints** as parse-time
+   assertions where possible: exact literals for `schema`/`algorithm`/
+   `digest.algorithm`; strict base64url profile for binary fields;
+   fixed sizes after decoding; strict `claimed_at` grammar; label
+   whitespace rules.
+
+A parser that accepts the envelope produces a normalized in-memory
+representation; only at that point is the canonical payload (§1–§5)
+constructed.
+
+### 9. Signing operation
 
 Given the canonical payload bytes `P`, the signature is:
 
@@ -158,23 +249,48 @@ Ed25519 internally hashes its input as part of EdDSA; no separate
 pre-hash step is required or permitted. (No Ed25519ph or Ed25519ctx —
 DDR-0002 explicitly forbids alternative Ed25519 modes.)
 
-### 8. Verification operation
+### 10. Verification operation
 
-Given a received envelope `E`:
+Verification is a function of `(asset_bytes_or_stream, envelope_json,
+expected_key_or_fingerprint, trust_options)`. A correctly verified
+envelope proves three things together: the envelope is well-formed,
+the asset bytes match the envelope's digest, and the signature was
+produced by an expected signer. Implementations MUST perform these
+steps in order; the first failure aborts and reports the failure
+class:
 
-1. Decode all binary fields (digest.value, public_key, key_fingerprint,
-   signature) from their base64url transport forms.
-2. **Re-derive** the fingerprint as `SHA-256(public_key_bytes)` and
-   compare to `E.key_fingerprint`. If they differ, **fail closed** —
-   the envelope is internally inconsistent.
-3. Reconstruct the canonical payload bytes `P` from `E` per §3–§5.
-4. Verify: `Ed25519_verify(public_key, P, signature)`. If this fails,
-   reject.
-5. Apply the [verification trust model from SC-016](../../../3leaps-productbook-internal/content/projmgmt/seclusor/SC-016-asset-signing-and-verification.md):
-   public_key must match the operator-supplied expected key/fingerprint
-   unless `--trust-embedded-key` is passed.
+1. **Parse the envelope** under §8. Reject on any parser failure.
+2. **Decode binary fields** from envelope base64url per §7 and assert
+   fixed sizes per §4 (32 / 32 / 32 / 64). Reject on any mismatch.
+3. **Asset digest check (fail-closed before signature verify)**:
+   require `digest.algorithm == "SHA-256"`; stream-hash the candidate
+   asset bytes with SHA-256; compare the result to the decoded
+   `digest.value` using a **constant-time** byte comparison. Reject
+   on mismatch.
+4. **Re-derive the fingerprint**: compute `SHA-256(public_key_bytes)`
+   and compare to the decoded `key_fingerprint` using a constant-time
+   byte comparison. Reject on mismatch — this catches envelopes that
+   have been edited to claim a fingerprint inconsistent with their
+   embedded public key.
+5. **Reconstruct the canonical payload** `P` from the normalized
+   envelope per §3–§5.
+6. **Cryptographic verify**: `Ed25519_verify(public_key, P, signature)`.
+   Reject on failure.
+7. **Trust model**: apply SC-016's verification trust rules. By
+   default the verifier MUST require an operator-supplied expected
+   public key or fingerprint and reject if it does not match the
+   envelope's embedded value. Only an explicit `--trust-embedded-key`
+   (or equivalent library flag) suppresses this check, in which case
+   the verification result proves only self-consistency, not signer
+   identity.
 
-### 9. Future-binding for SC-017 trusted timestamping
+Verification failure categories (for error reporting):
+parser-rejected, binary-size-rejected, asset-digest-mismatch,
+fingerprint-mismatch, signature-invalid, expected-key-mismatch. None
+of these error strings may include key material, signature bytes, or
+asset bytes (DDR-0002 rule, inherited).
+
+### 11. Future-binding for SC-017 trusted timestamping
 
 SC-017 will add timestamp evidence over signature envelopes. To keep
 DDR-0004 stable across that future work, timestamping MUST cover one
@@ -206,8 +322,8 @@ Envelope (transport form):
     "value": "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU"
   },
   "signature": "<computed>",
-  "public_key": "MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE",
-  "key_fingerprint": "vfo9pgVUaXTNVj0iEFCcfoNQymtFKr-N5DjPGI57e8Y",
+  "public_key": "AtZytOpHFK-qNxEa2Tl54imvnWhELx90w1oihgOobkA",
+  "key_fingerprint": "S52NzNSOdCvV0iqK7ZSiOD8aX60WHCKd2fyVXg8R4Js",
   "signer": {
     "label": "release-signing",
     "claimed_at": "2026-05-11T00:00:00Z"
@@ -215,7 +331,15 @@ Envelope (transport form):
 }
 ```
 
-Canonical payload bytes (pseudo-code, big-endian length prefixes):
+The example values are deterministic so reviewers can reproduce them:
+
+```
+public_key       = SHA-256(b"DDR-0004 example public key v1")   = 32 bytes
+key_fingerprint  = SHA-256(public_key)                           = 32 bytes
+digest.value     = SHA-256(b"")  (empty asset, for illustration) = 32 bytes
+```
+
+Decoded canonical payload bytes (big-endian length prefixes):
 
 ```
 b"seclusor.signature.v1\x00"
@@ -238,40 +362,50 @@ Implementation MUST include test cases that exercise every tamper class.
 Each case below MUST cause verification to fail under the correct
 expected public key:
 
-1. **Asset bytes tampered**: digest in envelope no longer matches the
-   asset → caller-side check fails before signature verification. Test
-   that the caller-side check actually runs before signature verify, not
+1. **Asset bytes tampered**: digest computed from candidate asset no
+   longer matches `digest.value` → §10 step 3 fails. Test that this
+   check actually runs **before** §10 step 6 (signature verify), not
    after.
-2. **Digest value tampered in envelope**: signature verify fails.
-3. **Digest algorithm tampered** (e.g., `SHA-256` → `SHA-512` but bytes
-   unchanged): signature verify fails because the algorithm string is
-   covered.
-4. **Public key tampered**: fingerprint re-derivation mismatch (§8 step 2)
+2. **Digest value tampered in envelope**: §10 step 3 fails (or, if
+   asset bytes were also tampered to match the new digest, §10 step 6
+   fails because the envelope `digest.value` is covered by the
+   payload).
+3. **Digest algorithm tampered** (e.g., `SHA-256` → `SHA-512`):
+   §8 step 7 rejects at parse time (exact literal required).
+4. **Public key tampered**: §10 step 4 (fingerprint re-derivation)
    fails closed before signature verify.
-5. **Fingerprint tampered** (public key unchanged): fingerprint
-   re-derivation mismatch fails closed.
-6. **Signer label changed**: signature verify fails.
+5. **Fingerprint tampered** (public key unchanged): §10 step 4 fails
+   closed.
+6. **Signer label changed**: §10 step 6 fails.
 7. **Signer label absent → empty** (toggle the absence marker without
-   adding bytes): signature verify fails (distinct wire forms per §5).
-8. **Signer label empty → absent**: signature verify fails.
-9. **`claimed_at` altered by one second**: signature verify fails.
-10. **`claimed_at` absent → present, or vice versa**: signature verify
-    fails.
+   adding bytes): §10 step 6 fails (distinct wire forms per §5).
+8. **Signer label empty → absent**: §10 step 6 fails.
+9. **`claimed_at` altered by one second**: §10 step 6 fails.
+10. **`claimed_at` absent → present, or vice versa**: §10 step 6 fails.
 11. **Field reorder in JSON transport** (e.g., `algorithm` before
-    `schema`): signature verify **succeeds** — JSON ordering is not
+    `schema`): verification **succeeds** — JSON ordering is not
     covered; only the typed-byte payload is. This is the intended
     feature, not a bug. Test that this case explicitly passes.
 12. **Whitespace / pretty-print difference in JSON transport**:
-    signature verify **succeeds** for the same reason. Test that this
+    verification **succeeds** for the same reason. Test that this
     case explicitly passes.
-13. **Algorithm string case change** (`Ed25519` → `ed25519`): signature
-    verify fails. UTF-8 bytes differ.
+13. **Algorithm string case change** (`Ed25519` → `ed25519`): §8 step
+    7 rejects at parse time (exact literal).
 14. **Unicode normalization variant in signer label** (`é` as U+00E9
-    vs U+0065 U+0301): signature verify fails. No normalization is
-    applied; the bytes differ.
-15. **Domain separator stripped or altered**: signature verify fails.
+    vs U+0065 U+0301): §10 step 6 fails. No normalization is applied;
+    the bytes differ.
+15. **Domain separator stripped or altered**: §10 step 6 fails.
+16. **Padded base64url in envelope** (`signature` field has trailing
+    `=`): §8 step 7 / §7 rejects at parse time.
+17. **Duplicate JSON key** (envelope has `"label"` twice in `signer`):
+    §8 step 1 rejects at parse time.
+18. **JSON `null` for optional field** (`"signer": null` or
+    `"label": null`): §8 step 5 rejects at parse time.
+19. **Unknown top-level field** (`"extra": "..."`): §8 step 2 rejects.
+20. **`claimed_at` with fractional seconds or non-`Z` offset**: §4 /
+    §8 step 7 rejects at parse time.
 
-Test cases 1–10, 13–15 are negative assertions. Test cases 11–12 are
+Test cases 1–10, 13–20 are negative assertions. Test cases 11–12 are
 positive assertions confirming that JSON transport variance does not
 break signatures — they document the intended robustness property.
 
@@ -286,53 +420,25 @@ break signatures — they document the intended robustness property.
   define a new domain separator and may extend the field list; v1
   signatures and v2 signatures will be mutually unverifiable, by
   design.
-- Implementation cost: one canonical-payload assembly function in
-  `seclusor-crypto` (or wherever the signing layer lands per SC-016's
-  open library/FFI surface question), plus the negative-test-vector
-  suite above. Both are bounded work.
+- Implementation cost: one canonical-payload assembly function in the
+  signing layer (crate placement is SC-016's call), one strict JSON
+  envelope parser, one verification function with the §10 step order,
+  plus the negative-test-vector suite above. Bounded work.
 - This DDR commits the project to **not** depending on a JSON
   canonicalization library (JCS / RFC 8785) for signing, on the
   grounds that typed-byte assembly is simpler and removes the JSON
   trust boundary entirely.
-
-## Open Items for Review
-
-Items where cxotech-the-drafter has made a call but entarch / secrev
-should confirm or push back before this DDR moves to Accepted:
-
-1. **u32 vs varint length prefixes**. u32 is simple and bounded;
-   varints are smaller. Maximum field length we care about is
-   `signer.label` and `claimed_at` — both well under 256 bytes in
-   practice. u32 is the safer call (no parser quirks), but secrev may
-   prefer a smaller prefix to reduce attack surface on
-   length-confusion bugs.
-2. **Fingerprint as raw SHA-256(pk) vs prefixed-hash**. The decision
-   above uses raw 32 bytes. SC-016 left "multihash-style encoding" as
-   an option. Multihash adds a 1- or 2-byte algorithm prefix; here it
-   buys nothing because v1 is Ed25519-only, but it would simplify a
-   future hash-algorithm rotation. Entarch's call.
-3. **`claimed_at` format string**. RFC 3339 admits multiple legal
-   representations of the same instant (offset notation, fractional
-   seconds, `Z` vs `+00:00`). Should DDR-0004 require a strict
-   subgrammar (e.g., always-`Z`, always whole-second, always
-   fixed-width)? My lean: yes, require strict — `YYYY-MM-DDTHH:MM:SSZ`,
-   exactly 20 bytes, no fractional seconds, no offset other than `Z`.
-   Reject anything else at sign time. Secrev's call.
-4. **Empty-value handling for the binary fields**. The decision treats
-   binary fields (digest.value, public_key, key_fingerprint) as
-   always-present and always-non-empty since v1 is Ed25519/SHA-256
-   only. Should the DDR explicitly require length prefixes equal to
-   the expected fixed sizes (32 for all three) and reject any other
-   length? My lean: yes, explicit fixed-size assertion. Reject at
-   parse time, not at verify time.
+- The strict envelope parser (§8) and strict base64url profile (§7)
+  bind v1 tightly. Permissiveness here would be a forward-compatibility
+  trap; if v2 ever needs to relax anything, it will do so under a new
+  domain separator with its own contract.
 
 ## Notes
 
-This DDR captures the canonical signing payload contract only. The
-detached envelope JSON schema, CLI workflow, FFI surface, and signing-key
-material handling live in [SC-016](../../../3leaps-productbook-internal/content/projmgmt/seclusor/SC-016-asset-signing-and-verification.md).
-The Ed25519 primitive contract lives in
+This DDR captures the canonical signing payload contract, the envelope
+parser strictness rules, and the verification operation. The detached
+envelope schema as a deliverable (e.g., a published JSON Schema), the
+CLI workflow, FFI surface, and signing-key material handling all live
+in SC-016. The Ed25519 primitive contract lives in
 [DDR-0002](DDR-0002-ed25519-signing-contract.md). Trusted timestamping
-binding lives in the future
-[SC-017](../../../3leaps-productbook-internal/content/projmgmt/seclusor/SC-017-trusted-timestamping-for-asset-signatures.md) /
-DDR-0005.
+binding lives in future DDR-0005 (SC-017 design artifact).
