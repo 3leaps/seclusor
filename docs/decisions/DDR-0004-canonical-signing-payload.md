@@ -1,8 +1,8 @@
 # DDR-0004: Canonical Signing Payload for `seclusor.signature.v1`
 
-Status: Proposed
+Status: Accepted
 Date: 2026-05-16
-Owner: cxotech (drafted) → entarch + secrev (review) → foxtrot-devlead (implements)
+Owner: cxotech (drafted) → entarch + secrev + foxtrot-devlead + foxtrot-devrev (reviewed) → foxtrot-devlead (implements via SC-016)
 
 ## Context
 
@@ -143,6 +143,11 @@ For binary fields (digest.value, public_key, key_fingerprint):
 - The JSON envelope's base64url representation is **decoded** before
   inclusion in the signed payload. Implementations MUST NOT include
   the base64url-encoded string bytes.
+- **`public_key` requires structural cryptographic validation beyond
+  size**: 32 bytes is necessary but not sufficient — a 32-byte input
+  may still fail Ed25519 verifying-key construction. This second
+  check is normative and happens at parse time per §10 step 3,
+  aligned with `DDR-0002`'s `InvalidPublicKeyBytes` error class.
 
 ### 5. Absence vs empty for optional fields
 
@@ -262,21 +267,31 @@ class:
 1. **Parse the envelope** under §8. Reject on any parser failure.
 2. **Decode binary fields** from envelope base64url per §7 and assert
    fixed sizes per §4 (32 / 32 / 32 / 64). Reject on any mismatch.
-3. **Asset digest check (fail-closed before signature verify)**:
+3. **Public-key structural validation**: pass the 32 decoded
+   `public_key` bytes through Ed25519 verifying-key construction
+   (existing `seclusor_crypto::signing_public_key_from_bytes` or
+   equivalent). Reject if construction fails — 32-byte input that is
+   not a valid Ed25519 public key encoding. This step is distinct
+   from §10 step 2 (size) and from §10 step 5 (fingerprint), because
+   a hostile envelope can supply 32 invalid bytes with a recomputed
+   matching `SHA-256` fingerprint that passes size and fingerprint
+   checks; only verifying-key construction catches the case before
+   any expensive cryptographic operation runs.
+4. **Asset digest check (fail-closed before signature verify)**:
    require `digest.algorithm == "SHA-256"`; stream-hash the candidate
    asset bytes with SHA-256; compare the result to the decoded
    `digest.value` using a **constant-time** byte comparison. Reject
    on mismatch.
-4. **Re-derive the fingerprint**: compute `SHA-256(public_key_bytes)`
+5. **Re-derive the fingerprint**: compute `SHA-256(public_key_bytes)`
    and compare to the decoded `key_fingerprint` using a constant-time
    byte comparison. Reject on mismatch — this catches envelopes that
    have been edited to claim a fingerprint inconsistent with their
    embedded public key.
-5. **Reconstruct the canonical payload** `P` from the normalized
+6. **Reconstruct the canonical payload** `P` from the normalized
    envelope per §3–§5.
-6. **Cryptographic verify**: `Ed25519_verify(public_key, P, signature)`.
+7. **Cryptographic verify**: `Ed25519_verify(public_key, P, signature)`.
    Reject on failure.
-7. **Trust model**: apply SC-016's verification trust rules. By
+8. **Trust model**: apply SC-016's verification trust rules. By
    default the verifier MUST require an operator-supplied expected
    public key or fingerprint and reject if it does not match the
    envelope's embedded value. Only an explicit `--trust-embedded-key`
@@ -285,10 +300,10 @@ class:
    identity.
 
 Verification failure categories (for error reporting):
-parser-rejected, binary-size-rejected, asset-digest-mismatch,
-fingerprint-mismatch, signature-invalid, expected-key-mismatch. None
-of these error strings may include key material, signature bytes, or
-asset bytes (DDR-0002 rule, inherited).
+parser-rejected, binary-size-rejected, **public-key-invalid**,
+asset-digest-mismatch, fingerprint-mismatch, signature-invalid,
+expected-key-mismatch. None of these error strings may include key
+material, signature bytes, or asset bytes (DDR-0002 rule, inherited).
 
 ### 11. Future-binding for SC-017 trusted timestamping
 
@@ -363,25 +378,25 @@ Each case below MUST cause verification to fail under the correct
 expected public key:
 
 1. **Asset bytes tampered**: digest computed from candidate asset no
-   longer matches `digest.value` → §10 step 3 fails. Test that this
-   check actually runs **before** §10 step 6 (signature verify), not
+   longer matches `digest.value` → §10 step 4 fails. Test that this
+   check actually runs **before** §10 step 7 (signature verify), not
    after.
-2. **Digest value tampered in envelope**: §10 step 3 fails (or, if
-   asset bytes were also tampered to match the new digest, §10 step 6
+2. **Digest value tampered in envelope**: §10 step 4 fails (or, if
+   asset bytes were also tampered to match the new digest, §10 step 7
    fails because the envelope `digest.value` is covered by the
    payload).
 3. **Digest algorithm tampered** (e.g., `SHA-256` → `SHA-512`):
    §8 step 7 rejects at parse time (exact literal required).
-4. **Public key tampered**: §10 step 4 (fingerprint re-derivation)
+4. **Public key tampered**: §10 step 5 (fingerprint re-derivation)
    fails closed before signature verify.
-5. **Fingerprint tampered** (public key unchanged): §10 step 4 fails
+5. **Fingerprint tampered** (public key unchanged): §10 step 5 fails
    closed.
-6. **Signer label changed**: §10 step 6 fails.
+6. **Signer label changed**: §10 step 7 fails.
 7. **Signer label absent → empty** (toggle the absence marker without
-   adding bytes): §10 step 6 fails (distinct wire forms per §5).
-8. **Signer label empty → absent**: §10 step 6 fails.
-9. **`claimed_at` altered by one second**: §10 step 6 fails.
-10. **`claimed_at` absent → present, or vice versa**: §10 step 6 fails.
+   adding bytes): §10 step 7 fails (distinct wire forms per §5).
+8. **Signer label empty → absent**: §10 step 7 fails.
+9. **`claimed_at` altered by one second**: §10 step 7 fails.
+10. **`claimed_at` absent → present, or vice versa**: §10 step 7 fails.
 11. **Field reorder in JSON transport** (e.g., `algorithm` before
     `schema`): verification **succeeds** — JSON ordering is not
     covered; only the typed-byte payload is. This is the intended
@@ -392,9 +407,9 @@ expected public key:
 13. **Algorithm string case change** (`Ed25519` → `ed25519`): §8 step
     7 rejects at parse time (exact literal).
 14. **Unicode normalization variant in signer label** (`é` as U+00E9
-    vs U+0065 U+0301): §10 step 6 fails. No normalization is applied;
+    vs U+0065 U+0301): §10 step 7 fails. No normalization is applied;
     the bytes differ.
-15. **Domain separator stripped or altered**: §10 step 6 fails.
+15. **Domain separator stripped or altered**: §10 step 7 fails.
 16. **Padded base64url in envelope** (`signature` field has trailing
     `=`): §8 step 7 / §7 rejects at parse time.
 17. **Duplicate JSON key** (envelope has `"label"` twice in `signer`):
@@ -404,8 +419,17 @@ expected public key:
 19. **Unknown top-level field** (`"extra": "..."`): §8 step 2 rejects.
 20. **`claimed_at` with fractional seconds or non-`Z` offset**: §4 /
     §8 step 7 rejects at parse time.
+21. **32 invalid public_key bytes with recomputed matching
+    fingerprint**: attacker supplies 32 bytes that do not form a
+    valid Ed25519 public key encoding (e.g., a point of order < 8 or
+    an otherwise-rejected encoding) and recomputes
+    `key_fingerprint = SHA-256(those 32 bytes)` so that fingerprint
+    re-derivation in §10 step 5 would pass. Verification MUST reject
+    at §10 step 3 (public-key-invalid) — before asset digest check
+    or any signature operation. This case is what makes §10 step 3
+    distinct from steps 2 and 5.
 
-Test cases 1–10, 13–20 are negative assertions. Test cases 11–12 are
+Test cases 1–10, 13–21 are negative assertions. Test cases 11–12 are
 positive assertions confirming that JSON transport variance does not
 break signatures — they document the intended robustness property.
 
