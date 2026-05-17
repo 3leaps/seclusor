@@ -30,7 +30,7 @@ Seclusor fills the gap for teams that want local-first, library-native, git-comp
 - **Two storage codecs**: Bundle (opaque, safest) and inline (`sec:age:v1:`) for when you need readable structure. Convert between them easily.
 - **Asset signing**: Generate age-protected Ed25519 signing keys, sign arbitrary files, and verify detached `seclusor.signature.v1` envelopes by expected public key or fingerprint.
 - **Ed25519 primitives** (`seclusor-crypto/signing` feature): Generate keypairs, sign messages, and verify signatures. Available in Rust (v0.1.1) and Go (v0.1.2). Secret keys are zeroized on drop.
-- **Library-first design**: Use `seclusor-crypto`, `seclusor-sign`, `seclusor-codec`, and `seclusor-keyring` directly from Rust, Go, or TypeScript. No shelling out.
+- **Library-first design**: Rust consumers can use `seclusor-crypto`, `seclusor-sign`, `seclusor-codec`, and `seclusor-keyring` directly. Go currently exposes the lower-level Ed25519 primitives; asset-signing envelope bindings are deferred to a later binding pass.
 - **Blob encryption**: Encrypt any file (shell scripts, configs, binary tokens) with `secrets blob encrypt`/`decrypt`. No JSON required.
 - **Passphrase-protected identities**: Encrypt identity files at rest with a passphrase, like SSH keys. Four input channels for automation.
 - **Secure CLI**: Full command set including `secrets run` (injects secrets without exposing them in CLI args, history, or process lists).

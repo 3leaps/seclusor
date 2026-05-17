@@ -153,14 +153,14 @@ pub struct GeneratedSigningKey {
     pub key_fingerprint: [u8; 32],
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct SigningKeyFile<'a> {
     schema: &'static str,
     algorithm: &'static str,
     secret_key: &'a str,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct SigningKeyFileOwned {
     schema: String,
     algorithm: String,
@@ -219,8 +219,13 @@ pub fn load_signing_key_file(
         key_file.secret_key.zeroize();
         return Err(SignError::SigningKeyFileInvalid);
     }
-    let mut secret_key = decode_base64url_strict(&key_file.secret_key)
-        .map_err(|_| SignError::SigningKeyFileInvalid)?;
+    let mut secret_key = match decode_base64url_strict(&key_file.secret_key) {
+        Ok(secret_key) => secret_key,
+        Err(_) => {
+            key_file.secret_key.zeroize();
+            return Err(SignError::SigningKeyFileInvalid);
+        }
+    };
     key_file.secret_key.zeroize();
     if secret_key.len() != 32 {
         secret_key.zeroize();
