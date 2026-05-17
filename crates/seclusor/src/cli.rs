@@ -18,6 +18,7 @@ pub(crate) struct Cli {
 pub(crate) enum TopLevelCommand {
     Secrets(SecretsCommand),
     Keys(KeysCommand),
+    Assets(AssetsCommand),
     Docs(DocsCommand),
 }
 
@@ -53,6 +54,19 @@ pub(crate) struct KeysCommand {
 #[derive(Debug, Subcommand)]
 pub(crate) enum KeysSubcommand {
     Age(AgeCommand),
+    Signing(SigningCommand),
+}
+
+#[derive(Debug, Parser)]
+pub(crate) struct AssetsCommand {
+    #[command(subcommand)]
+    pub(crate) command: AssetsSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum AssetsSubcommand {
+    Sign(AssetSignArgs),
+    Verify(AssetVerifyArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -64,6 +78,17 @@ pub(crate) struct AgeCommand {
 #[derive(Debug, Subcommand)]
 pub(crate) enum AgeSubcommand {
     Identity(IdentityCommand),
+}
+
+#[derive(Debug, Parser)]
+pub(crate) struct SigningCommand {
+    #[command(subcommand)]
+    pub(crate) command: SigningSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum SigningSubcommand {
+    Generate(SigningGenerateArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -111,6 +136,64 @@ pub(crate) struct IdentityGenerateArgs {
     pub(crate) output: PathBuf,
     #[command(flatten)]
     pub(crate) passphrase: PassphraseArgs,
+}
+
+#[derive(Debug, Parser)]
+pub(crate) struct SigningGenerateArgs {
+    #[arg(
+        long,
+        help = "Path to write the age-encrypted signing key file (must not exist; 0600 on Unix)"
+    )]
+    pub(crate) output: PathBuf,
+    #[command(flatten)]
+    pub(crate) recipients: RecipientArgs,
+}
+
+#[derive(Debug, Parser)]
+pub(crate) struct AssetSignArgs {
+    #[arg(long, help = "Path to asset file to sign")]
+    pub(crate) input: PathBuf,
+    #[arg(long, help = "Path for detached .secsig signature output")]
+    pub(crate) signature: Option<PathBuf>,
+    #[arg(long, help = "Path to age-encrypted Ed25519 signing key file")]
+    pub(crate) signing_key: PathBuf,
+    #[arg(long, help = "Signed signer label metadata")]
+    pub(crate) signer_label: Option<String>,
+    #[arg(
+        long,
+        help = "Signed claimed time metadata (YYYY-MM-DDTHH:MM:SSZ; not trusted time)"
+    )]
+    pub(crate) claimed_at: Option<String>,
+    #[command(flatten)]
+    pub(crate) identities: IdentityArgs,
+    #[command(flatten)]
+    pub(crate) passphrase: PassphraseArgs,
+}
+
+#[derive(Debug, Parser)]
+pub(crate) struct AssetVerifyArgs {
+    #[arg(long, help = "Path to asset file to verify")]
+    pub(crate) input: PathBuf,
+    #[arg(long, help = "Path to detached .secsig signature file")]
+    pub(crate) signature: Option<PathBuf>,
+    #[arg(
+        long,
+        conflicts_with = "trust_embedded_key",
+        help = "Expected public key as unpadded base64url raw Ed25519 public-key bytes"
+    )]
+    pub(crate) public_key: Option<String>,
+    #[arg(
+        long,
+        conflicts_with = "trust_embedded_key",
+        help = "Expected key fingerprint as unpadded base64url raw SHA-256 fingerprint bytes"
+    )]
+    pub(crate) fingerprint: Option<String>,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Trust the public key embedded in the signature envelope (self-consistency only)"
+    )]
+    pub(crate) trust_embedded_key: bool,
 }
 
 #[derive(Debug, Parser)]

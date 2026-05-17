@@ -11,6 +11,9 @@ Seclusor is a security-sensitive library and tool for managing encrypted secrets
 - Secret key material blocked from CLI arguments (see SDR-0002)
 - Ciphertext prefix validation (`sec:age:v1:`)
 - Identity file permission checks (0600 on Unix)
+- Asset signature verification is fail-closed by default: callers must provide
+  an expected public key or fingerprint unless they explicitly opt into
+  embedded-key self-consistency checks.
 
 ## Key Rotation and Rekeying
 
@@ -51,11 +54,17 @@ Old ciphertexts remain decryptable by the compromised key until rekeyed.
 
 ## File Integrity and Signatures
 
-**Current status**: Seclusor does not currently sign armored files or provide built-in fingerprinting.
-
 - Bundle files are protected by age's authenticated encryption (ChaCha20-Poly1305).
-- For additional integrity guarantees on high-value archives, consider signing the armored file with minisign, age signatures (future), or storing a separate manifest with hashes.
-- Future enhancement: Add optional signature verification on bundle load.
+- Seclusor can sign arbitrary release assets with detached
+  `seclusor.signature.v1` JSON envelopes via `seclusor assets sign`.
+- Verification streams the candidate asset, checks its SHA-256 digest against
+  the envelope, validates the embedded Ed25519 public key and fingerprint, and
+  then verifies the signature over the DDR-0004 canonical payload.
+- Verification requires `--public-key` or `--fingerprint` by default.
+  `--trust-embedded-key` proves only that the asset and envelope are
+  self-consistent under the embedded key.
+- `claimed_at` is signed metadata for operator context. It is not trusted time
+  evidence; trusted timestamping is a separate future feature.
 
 ## Responsible Disclosure
 
@@ -66,7 +75,8 @@ Please report potential vulnerabilities privately to `security@3leaps.net` or @3
 ## Operational Practices
 
 - Keep identity files outside repository roots.
-- Use dedicated, permission-restricted paths for keys (`0600`).
+- Use dedicated, permission-restricted paths for keys (`0600` and current-user
+  ownership on Unix).
 - Regularly run `cargo audit` and monitor upstream `filippo.io/age` releases.
 - Review release artifacts and signatures before distribution.
 

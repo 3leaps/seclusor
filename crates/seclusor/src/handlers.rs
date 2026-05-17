@@ -1,3 +1,4 @@
+pub(crate) mod assets;
 pub(crate) mod blob;
 pub(crate) mod bundle;
 pub(crate) mod convert;
@@ -7,7 +8,7 @@ pub(crate) mod keys;
 pub(crate) mod run;
 pub(crate) mod secrets;
 
-use crate::cli::SecretsSubcommand;
+use crate::cli::{AssetsSubcommand, SecretsSubcommand};
 use crate::error::CliResult;
 
 pub(crate) fn handle_secrets_command(command: SecretsSubcommand) -> CliResult<()> {
@@ -25,5 +26,12 @@ pub(crate) fn handle_secrets_command(command: SecretsSubcommand) -> CliResult<()
         SecretsSubcommand::Inline(args) => inline::handle_inline_command(args.command),
         SecretsSubcommand::Blob(args) => blob::handle_blob_command(args.command),
         SecretsSubcommand::Convert(args) => convert::handle_convert(args),
+    }
+}
+
+pub(crate) fn handle_assets_command(command: AssetsSubcommand) -> CliResult<()> {
+    match command {
+        AssetsSubcommand::Sign(args) => assets::handle_asset_sign(args),
+        AssetsSubcommand::Verify(args) => assets::handle_asset_verify(args),
     }
 }
