@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 seclusor-core = { workspace = true }
 seclusor-crypto = { workspace = true }
+seclusor-sign = { workspace = true }
 seclusor-codec = { workspace = true }
 seclusor-keyring = { workspace = true }
 clap = { version = "4.5", features = ["derive"] }

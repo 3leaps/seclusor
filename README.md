@@ -28,8 +28,9 @@ Seclusor fills the gap for teams that want local-first, library-native, git-comp
 
 - **Modern age encryption**: X25519 for team sharing and scrypt for passphrases. Strong defaults with size limits.
 - **Two storage codecs**: Bundle (opaque, safest) and inline (`sec:age:v1:`) for when you need readable structure. Convert between them easily.
-- **Ed25519 signing** (`seclusor-crypto/signing` feature): Generate keypairs, sign messages, and verify signatures. Available in Rust (v0.1.1) and Go (v0.1.2). Secret keys are zeroized on drop and stored encrypted at rest using the existing age backend.
-- **Library-first design**: Use `seclusor-crypto`, `seclusor-codec`, and `seclusor-keyring` directly from Rust, Go, or TypeScript. No shelling out.
+- **Asset signing**: Generate age-protected Ed25519 signing keys, sign arbitrary files, and verify detached `seclusor.signature.v1` envelopes by expected public key or fingerprint.
+- **Ed25519 primitives** (`seclusor-crypto/signing` feature): Generate keypairs, sign messages, and verify signatures. Available in Rust (v0.1.1) and Go (v0.1.2). Secret keys are zeroized on drop.
+- **Library-first design**: Rust consumers can use `seclusor-crypto`, `seclusor-sign`, `seclusor-codec`, and `seclusor-keyring` directly. Go currently exposes the lower-level Ed25519 primitives; asset-signing envelope bindings are deferred to a later binding pass.
 - **Blob encryption**: Encrypt any file (shell scripts, configs, binary tokens) with `secrets blob encrypt`/`decrypt`. No JSON required.
 - **Passphrase-protected identities**: Encrypt identity files at rest with a passphrase, like SSH keys. Four input channels for automation.
 - **Secure CLI**: Full command set including `secrets run` (injects secrets without exposing them in CLI args, history, or process lists).
@@ -48,8 +49,11 @@ seclusor-crypto = "0.1"   # encrypt/decrypt with age
 seclusor-keyring = "0.1"  # identity generation, recipient management
 seclusor-core = "0.1"     # domain types, validation
 
-# Optional: add Ed25519 sign/verify
+# Optional: add Ed25519 primitive sign/verify
 seclusor-crypto = { version = "0.1", features = ["signing"] }
+
+# Optional: add asset signature envelope support
+seclusor-sign = "0.1"
 ```
 
 ```rust
@@ -63,7 +67,7 @@ let identities = load_identity_file("~/.config/seclusor/identity.txt")?;
 let plaintext = decrypt(&ciphertext, &identities)?;
 ```
 
-Ed25519 signing (requires `features = ["signing"]`):
+Ed25519 primitive signing (requires `features = ["signing"]`):
 
 ```rust
 use seclusor_crypto::{generate_signing_keypair, sign, verify};
@@ -75,6 +79,25 @@ verify(keypair.public_key(), b"payload", &sig)?;
 // Keys stored encrypted at rest — serialize the seed and encrypt with age
 let seed_bytes = seclusor_crypto::signing_secret_key_to_bytes(keypair.secret_key());
 let encrypted_key = encrypt(&seed_bytes, &recipients)?;
+```
+
+Asset signing from the CLI:
+
+```bash
+seclusor keys signing generate \
+  --output ~/.config/seclusor/release-signing.key.age \
+  --recipient age1...
+
+seclusor assets sign \
+  --input dist/seclusor.tar.gz \
+  --signing-key ~/.config/seclusor/release-signing.key.age \
+  --identity-file ~/.config/seclusor/identity.txt \
+  --signer-label release-signing \
+  --claimed-at 2026-05-17T12:00:00Z
+
+seclusor assets verify \
+  --input dist/seclusor.tar.gz \
+  --public-key <base64url-public-key>
 ```
 
 ### Simplest Useful Case: Secure Local Run
@@ -121,13 +144,14 @@ See the [App Notes](docs/appnotes/) for detailed guidance.
 
 ## Architecture
 
-Seclusor is a Rust workspace with six crates. Library crates are the architecture — CLI and FFI are thin consumers.
+Seclusor is a Rust workspace with seven crates. Library crates are the architecture — CLI and FFI are thin consumers.
 
 ```
 seclusor/
 ├── crates/
 │   ├── seclusor-core/         # Domain types, validation, env export/import
 │   ├── seclusor-crypto/       # age encryption (X25519 + scrypt), Ed25519 signing (feature-gated)
+│   ├── seclusor-sign/         # Detached asset signature envelopes
 │   ├── seclusor-codec/        # Bundle + inline codecs, format conversion
 │   ├── seclusor-keyring/      # Key generation, recipient discovery, rekey
 │   ├── seclusor-ffi/          # C-ABI exports (cdylib + staticlib)
@@ -147,6 +171,8 @@ seclusor/
 seclusor-core          ← leaf, no internal deps
     ↑
 seclusor-crypto        ← depends on core
+    ↑
+seclusor-sign          ← depends on crypto
     ↑
 seclusor-codec         ← depends on core, crypto
 seclusor-keyring       ← depends on core, crypto
@@ -217,15 +243,22 @@ Seclusor uses [age](https://age-encryption.org/) (ADR-0002):
 
 ### Signing
 
-The `seclusor-crypto/signing` feature adds Ed25519 digital signatures (added in v0.1.1):
+`seclusor-sign` adds detached asset signatures using the
+`seclusor.signature.v1` envelope from DDR-0004:
+
+- **Asset-bound verification** — stream-hashes the candidate asset before signature verification
+- **Strict envelope parser** — duplicate keys, unknown fields, `null`, padded base64url, and malformed metadata fail closed
+- **Expected-key trust model** — verification requires an expected public key or fingerprint by default
+- **Age-protected signing-key files** — encrypted Ed25519 seeds with `0600` permissions, owner checks on Unix, and repository-root pathguard
+
+The `seclusor-crypto/signing` feature provides the lower-level Ed25519 primitives (added in v0.1.1):
 
 - **Ed25519 plain mode** — 32-byte seed secret key, 32-byte public key, 64-byte signature, opaque message bytes
 - **`SigningSecretKey`** implements `Zeroize`/`ZeroizeOnDrop`; no `Debug`, `Clone`, or serde to prevent accidental key exposure
 - **Four content-free error variants** — no key material, message bytes, or signature bytes ever in error strings
-- **Key at rest** — encrypt the 32-byte seed with the existing age `encrypt()`/`decrypt()` API; no new storage format
 - Rust-native in v0.1.1; Go signing bindings added in v0.1.2. TypeScript signing remains out of scope.
 
-See [ADR-0011](docs/decisions/ADR-0011-ed25519-signing-in-seclusor-crypto.md) and [DDR-0002](docs/decisions/DDR-0002-ed25519-signing-contract.md) for the full signing contract.
+See [ADR-0011](docs/decisions/ADR-0011-ed25519-signing-in-seclusor-crypto.md), [DDR-0002](docs/decisions/DDR-0002-ed25519-signing-contract.md), and [DDR-0004](docs/decisions/DDR-0004-canonical-signing-payload.md) for the full signing contracts.
 
 ### Safety Defaults
 

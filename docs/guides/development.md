@@ -81,6 +81,7 @@ workflow -> merge bindings PR -> tag -> release workflow -> sign -> publish.
 crates/
   seclusor-core/      Domain types, validation, CRUD, env export
   seclusor-crypto/    age encryption + Ed25519 signing (feature-gated)
+  seclusor-sign/      Detached asset signature envelope logic
   seclusor-codec/     Bundle + inline storage codecs
   seclusor-keyring/   Identity/recipient management, rekeying
   seclusor-ffi/       C-ABI FFI exports for Go/TypeScript bindings

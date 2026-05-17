@@ -4,6 +4,7 @@
 
 - `seclusor secrets ...`
 - `seclusor keys ...`
+- `seclusor assets ...`
 - `seclusor docs ...`
 
 ## Secrets
@@ -157,6 +158,52 @@ seclusor secrets run --file secrets.age --identity-file .\\identity.txt --projec
 ## Keys
 
 - `keys age identity generate --output <path>`
+- `keys signing generate --output <path> --recipient <age1...>`
+
+`keys signing generate` creates an age-encrypted Ed25519 signing-key file
+outside the repository root and prints the public verification identity:
+
+```bash
+seclusor keys signing generate \
+  --output ~/.config/seclusor/release-signing.key.age \
+  --recipient age1...
+```
+
+Stdout contains `public_key=<base64url>` and
+`key_fingerprint=<base64url>`. Both values are raw bytes encoded as
+unpadded URL-safe base64. The encrypted signing-key file is created with
+`0600` permissions on Unix and must be owned by the current user when loaded.
+It must be unlocked with an age identity when signing assets.
+
+## Assets
+
+- `assets sign --input <path> --signing-key <key.age> --identity-file <identity>`
+- `assets verify --input <path> --public-key <base64url>`
+- `assets verify --input <path> --fingerprint <base64url>`
+
+If `--signature` is omitted, both `sign` and `verify` use
+`<input>.secsig`.
+
+```bash
+seclusor assets sign \
+  --input dist/seclusor.tar.gz \
+  --signing-key ~/.config/seclusor/release-signing.key.age \
+  --identity-file ~/.config/seclusor/operator-identity.txt \
+  --signer-label release-signing \
+  --claimed-at 2026-05-17T12:00:00Z
+
+seclusor assets verify \
+  --input dist/seclusor.tar.gz \
+  --public-key AtZytOpHFK-qNxEa2Tl54imvnWhELx90w1oihgOobkA
+```
+
+Verification fails closed by default: callers must provide either
+`--public-key` or `--fingerprint`. `--trust-embedded-key` is available
+only for explicit self-consistency checks and does not prove signer
+identity. `claimed_at` is signed metadata supplied by the signer; it is
+not trusted timestamp evidence. Verification stdout is line-oriented; signed
+metadata values such as `signer_label` are escaped when needed so control
+characters cannot create extra output lines.
 
 ## Docs
 

@@ -2,6 +2,7 @@ use seclusor_core::error::sanitize_serde_json_error_message;
 use seclusor_core::SeclusorError;
 use seclusor_crypto::CryptoError;
 use seclusor_keyring::KeyringError;
+use seclusor_sign::SignError;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -16,6 +17,8 @@ pub(crate) enum CliError {
     Codec(#[from] seclusor_codec::CodecError),
     #[error(transparent)]
     Keyring(#[from] KeyringError),
+    #[error(transparent)]
+    Sign(#[from] SignError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]
