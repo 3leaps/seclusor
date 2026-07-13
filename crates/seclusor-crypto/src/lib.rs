@@ -121,10 +121,10 @@ pub fn parse_identity_file_contents(contents: &str) -> Result<Vec<Identity>> {
 
 /// Load and parse age identities from a file.
 ///
-/// On Unix, file permissions must be exactly `0600`.
+/// On Unix, file permissions must be exactly `0600` and owned by the current user.
 pub fn load_identity_file(path: impl AsRef<Path>) -> Result<Vec<Identity>> {
     let path = path.as_ref();
-    assert_secure_permissions(path)?;
+    assert_identity_file_access(path)?;
     let contents = read_identity_file_with_limit(path, MAX_IDENTITY_FILE_BYTES)?;
     parse_identity_file_contents(&contents)
 }
@@ -347,6 +347,44 @@ pub fn assert_secure_permissions(path: &Path) -> Result<()> {
         let _ = path;
     }
 
+    Ok(())
+}
+
+/// Check that an identity file is owned by the current user (Unix).
+///
+/// On non-Unix platforms this is a no-op.
+pub fn assert_owned_by_current_user(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let meta = fs::metadata(path)?;
+        let file_uid = meta.uid();
+        // SAFETY: getuid is always successful and has no memory safety implications.
+        let current_uid = unsafe { libc::getuid() };
+        if file_uid != current_uid {
+            return Err(CryptoError::IdentityFileNotOwnedByCurrentUser {
+                file_uid,
+                current_uid,
+            });
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+
+    Ok(())
+}
+
+/// Preflight for loading an identity file: Unix mode `0600` and owner UID.
+///
+/// On non-Unix platforms this is a no-op. Call before decrypting or parsing
+/// secret material so both explicit paths and keyring discovery share one gate.
+pub fn assert_identity_file_access(path: &Path) -> Result<()> {
+    assert_secure_permissions(path)?;
+    assert_owned_by_current_user(path)?;
     Ok(())
 }
 

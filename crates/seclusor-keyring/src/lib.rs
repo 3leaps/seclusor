@@ -29,6 +29,9 @@ const MAX_REPO_ROOT_SEARCH_DEPTH: usize = 32;
 /// Maximum size of a passphrase-protected identity file (before decryption).
 pub const MAX_PROTECTED_IDENTITY_FILE_BYTES: usize = 8192;
 
+/// Maximum header bytes inspected for public-key metadata (no secret decrypt).
+pub const MAX_IDENTITY_PUBLIC_METADATA_BYTES: usize = 8192;
+
 /// Marker for age-encrypted (passphrase-protected) identity files.
 const AGE_ARMOR_BEGIN: &str = "-----BEGIN AGE ENCRYPTED FILE-----";
 
@@ -155,8 +158,8 @@ pub fn load_identity_file_with_passphrase(
 ) -> Result<Vec<Identity>> {
     let path = path.as_ref();
 
-    // Enforce 0600 permissions — same contract as plaintext identities
-    seclusor_crypto::assert_secure_permissions(path)?;
+    // Enforce 0600 + owner UID — same contract as plaintext identities
+    seclusor_crypto::assert_identity_file_access(path)?;
 
     // Bounded read to enforce size cap at read time (no TOCTOU gap)
     let max = MAX_PROTECTED_IDENTITY_FILE_BYTES as u64;
@@ -207,11 +210,15 @@ pub fn load_identity_file_with_passphrase(
 ///
 /// If the file is passphrase-protected and no passphrase is provided, returns
 /// `ProtectedIdentityNoPassphrase`. If plaintext, the passphrase is ignored.
+///
+/// Access preflight (Unix `0600` + owner) runs **before** any format detection
+/// or secret-body read so insecure files fail closed without probing contents.
 pub fn load_identity_file_auto(
     path: impl AsRef<Path>,
     passphrase: Option<&SecretString>,
 ) -> Result<Vec<Identity>> {
     let path = path.as_ref();
+    seclusor_crypto::assert_identity_file_access(path)?;
     if is_passphrase_protected_identity(path)? {
         match passphrase {
             Some(pp) => load_identity_file_with_passphrase(path, pp),
@@ -219,6 +226,428 @@ pub fn load_identity_file_auto(
         }
     } else {
         Ok(seclusor_crypto::load_identity_file(path)?)
+    }
+}
+
+/// Resolve the primary platform seclusor config directory.
+///
+/// Order:
+/// 1. Absolute `$XDG_CONFIG_HOME/seclusor` when set (relative values ignored)
+/// 2. macOS: `$HOME/Library/Application Support/seclusor`
+/// 3. Other Unix: `$HOME/.config/seclusor`
+/// 4. Windows: `%APPDATA%\seclusor` (then `%USERPROFILE%\.config\seclusor`)
+///
+/// When absolute `XDG_CONFIG_HOME` is set on macOS, it **replaces** Application
+/// Support as the primary root (not additive). For discovery, also see
+/// [`legacy_seclusor_config_dirs`] which adds the documented `~/.config/seclusor`
+/// compatibility root on macOS when XDG is unset.
+pub fn seclusor_config_dir() -> Option<PathBuf> {
+    if let Some(xdg) = absolute_xdg_config_home() {
+        return Some(xdg.join("seclusor"));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var_os("HOME")?;
+        if home.is_empty() {
+            return None;
+        }
+        Some(
+            PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
+                .join("seclusor"),
+        )
+    }
+
+    #[cfg(windows)]
+    {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            let appdata = appdata.trim();
+            if !appdata.is_empty() {
+                return Some(PathBuf::from(appdata).join("seclusor"));
+            }
+        }
+        if let Ok(home) = std::env::var("USERPROFILE") {
+            let home = home.trim();
+            if !home.is_empty() {
+                return Some(PathBuf::from(home).join(".config").join("seclusor"));
+            }
+        }
+        return None;
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let home = std::env::var_os("HOME")?;
+        if home.is_empty() {
+            return None;
+        }
+        Some(PathBuf::from(home).join(".config").join("seclusor"))
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
+}
+
+/// Additional bounded config roots kept for operator-doc compatibility.
+///
+/// On macOS, docs historically used `~/.config/seclusor/` while the platform
+/// primary is Application Support. That path is an explicit secondary root
+/// only (still non-recursive, still no home walk).
+pub fn legacy_seclusor_config_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    #[cfg(target_os = "macos")]
+    {
+        if absolute_xdg_config_home().is_none() {
+            if let Some(home) = std::env::var_os("HOME") {
+                if !home.is_empty() {
+                    dirs.push(PathBuf::from(home).join(".config").join("seclusor"));
+                }
+            }
+        }
+    }
+    let _ = &dirs;
+    dirs
+}
+
+/// Bounded identity-file search roots for public-key lookup.
+///
+/// For each config root (primary + legacy compatibility):
+/// - `<config>/identities/` (dedicated directory; non-recursive; any non-hidden
+///   regular file — **symlinks are skipped** via `DirEntry::file_type`)
+/// - `<config>/` itself (direct files only; non-recursive; filtered by
+///   [`is_config_root_identity_candidate`])
+///
+/// Does not walk `$HOME`, `$PATH`, or arbitrary environment overrides.
+///
+/// On macOS, an absolute `XDG_CONFIG_HOME` **replaces** the Application Support
+/// primary (it is not additive). Relative `XDG_CONFIG_HOME` is ignored.
+pub fn default_identity_search_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut seen = HashSet::new();
+    for cfg in seclusor_config_dir()
+        .into_iter()
+        .chain(legacy_seclusor_config_dirs())
+    {
+        for root in [cfg.join("identities"), cfg] {
+            if seen.insert(root.clone()) {
+                roots.push(root);
+            }
+        }
+    }
+    roots
+}
+
+/// Parse a public key from identity-file header comments (public metadata only).
+///
+/// Recognizes comment lines of the form `# public key: age1...` with
+/// case-insensitive label matching (`# Public key:` included). Stops at the
+/// first non-comment body/armor line when used via incremental readers.
+/// Does not decrypt passphrase-protected bodies.
+pub fn parse_public_key_from_identity_header(header: &str) -> Option<String> {
+    for line in header.lines() {
+        match classify_identity_header_line(line) {
+            HeaderLine::PublicKey(pk) => return Some(pk),
+            HeaderLine::Comment => continue,
+            HeaderLine::Body => break,
+        }
+    }
+    None
+}
+
+/// Read public-key metadata from an identity file with a bounded header read.
+///
+/// Reads **comment lines only** (through newline). At the first non-comment
+/// body/armor line, stops after the first non-whitespace body byte without
+/// buffering the remainder of that line (so secret material is not pulled into
+/// memory during discovery). Total header bytes are capped by
+/// [`MAX_IDENTITY_PUBLIC_METADATA_BYTES`].
+///
+/// Returns `Ok(None)` when the header has no recognizable public-key comment.
+/// Does not enforce 0600/ownership — those gates run only when loading secrets.
+pub fn read_identity_file_public_key(path: impl AsRef<Path>) -> Result<Option<String>> {
+    let path = path.as_ref();
+    let mut file = File::open(path)?;
+    let mut limited =
+        std::io::Read::by_ref(&mut file).take(MAX_IDENTITY_PUBLIC_METADATA_BYTES as u64);
+    read_identity_public_key_from_reader(&mut limited)
+}
+
+/// Public-key metadata scan over an arbitrary reader.
+///
+/// `pub(crate)` test seam for the no-read-ahead regression (poison readers).
+/// Not a consumer API — callers should use [`read_identity_file_public_key`].
+///
+/// Stops without read-ahead into body lines: once a non-whitespace byte that
+/// is not `#` is observed, returns `Ok(None)` (or the key if found earlier)
+/// without consuming further bytes from that line.
+pub(crate) fn read_identity_public_key_from_reader<R: Read>(
+    reader: &mut R,
+) -> Result<Option<String>> {
+    let mut total = 0usize;
+    loop {
+        match read_next_header_line(reader, &mut total)? {
+            HeaderScan::PublicKey(pk) => return Ok(Some(pk)),
+            HeaderScan::Continue => continue,
+            HeaderScan::Stop => return Ok(None),
+            HeaderScan::Eof => return Ok(None),
+        }
+    }
+}
+
+/// Locate the unique identity file whose header advertises `public_key`.
+///
+/// `public_key` must parse as an age recipient (`age1...`). Discovery is limited
+/// to [`default_identity_search_roots`]. Matching uses public metadata only.
+///
+/// Errors:
+/// - [`KeyringError::InvalidIdentityPublicKey`] — bad encoding
+/// - [`KeyringError::IdentityPublicKeyNotFound`] — no match
+/// - [`KeyringError::AmbiguousIdentityPublicKey`] — two or more matches
+pub fn find_identity_path_by_public_key(public_key: &str) -> Result<PathBuf> {
+    let want = normalize_public_key(public_key)?;
+    let mut matches = Vec::new();
+
+    for root in default_identity_search_roots() {
+        if !root.is_dir() {
+            continue;
+        }
+        let is_identities_dir = root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n == "identities");
+
+        let entries = match fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if !ft.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name.starts_with('.') {
+                continue;
+            }
+            // Dedicated identities/ dir: any non-hidden regular file.
+            // Config root: only compatibility identity filename patterns.
+            if !is_identities_dir && !is_config_root_identity_candidate(name) {
+                continue;
+            }
+
+            match read_identity_file_public_key(&path) {
+                Ok(Some(found)) => {
+                    if found == want {
+                        matches.push(path);
+                    }
+                }
+                Ok(None) => {}
+                // Skip unreadable candidates during discovery.
+                Err(_) => continue,
+            }
+        }
+    }
+
+    matches.sort();
+    match matches.len() {
+        0 => Err(KeyringError::IdentityPublicKeyNotFound),
+        1 => Ok(matches.remove(0)),
+        _ => Err(KeyringError::AmbiguousIdentityPublicKey { paths: matches }),
+    }
+}
+
+/// Resolve and load the identity file matching `public_key` (narrow load).
+///
+/// Performs discovery via public metadata, then loads only the matched path
+/// through [`load_identity_file_auto`] (access preflight + optional passphrase).
+///
+/// After load, verifies that at least one loaded identity's derived public key
+/// equals the requested key (header comments are untrusted). Mismatch yields
+/// [`KeyringError::IdentityPublicKeyMismatch`].
+pub fn load_identity_by_public_key(
+    public_key: &str,
+    passphrase: Option<&SecretString>,
+) -> Result<Vec<Identity>> {
+    let want = normalize_public_key(public_key)?;
+    let path = find_identity_path_by_public_key(&want)?;
+    let identities = load_identity_file_auto(&path, passphrase)?;
+    let matches = identities
+        .iter()
+        .any(|identity| identity.to_public().to_string() == want);
+    if !matches {
+        return Err(KeyringError::IdentityPublicKeyMismatch { path });
+    }
+    Ok(identities)
+}
+
+fn normalize_public_key(public_key: &str) -> Result<String> {
+    let trimmed = public_key.trim();
+    if trimmed.is_empty() {
+        return Err(KeyringError::InvalidIdentityPublicKey);
+    }
+    let recipient = trimmed
+        .parse::<Recipient>()
+        .map_err(|_| KeyringError::InvalidIdentityPublicKey)?;
+    Ok(recipient.to_string())
+}
+
+fn absolute_xdg_config_home() -> Option<PathBuf> {
+    let xdg = std::env::var("XDG_CONFIG_HOME").ok()?;
+    let xdg = xdg.trim();
+    if xdg.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(xdg);
+    // XDG Base Directory Spec: XDG_CONFIG_HOME must be absolute.
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+/// Compatibility filename filter for files living directly under a config root.
+///
+/// The dedicated `identities/` directory accepts any non-hidden regular file.
+/// Config-root scans are narrower to avoid treating every operator file as an
+/// identity candidate (ambiguity / exposure / DoS).
+///
+/// Accepted names (case-insensitive):
+/// - `identity`
+/// - `identity.txt`
+/// - `identity*.txt`
+/// - `*.identity`
+pub fn is_config_root_identity_candidate(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if lower == "identity" || lower == "identity.txt" {
+        return true;
+    }
+    if lower.starts_with("identity") && lower.ends_with(".txt") {
+        return true;
+    }
+    lower.ends_with(".identity")
+}
+
+enum HeaderLine {
+    PublicKey(String),
+    Comment,
+    Body,
+}
+
+fn classify_identity_header_line(line: &str) -> HeaderLine {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return HeaderLine::Comment;
+    }
+    if let Some(pk) = public_key_from_comment_line(line) {
+        return HeaderLine::PublicKey(pk);
+    }
+    if trimmed.starts_with('#') {
+        return HeaderLine::Comment;
+    }
+    HeaderLine::Body
+}
+
+fn public_key_from_comment_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('#') {
+        return None;
+    }
+    let rest = trimmed[1..].trim_start();
+    let lower = rest.to_ascii_lowercase();
+    const LABEL: &str = "public key:";
+    if !lower.starts_with(LABEL) {
+        return None;
+    }
+    // Slice using the original `rest` length of the label (ASCII-only).
+    let value = rest[LABEL.len()..].trim();
+    if value.is_empty() || !value.starts_with("age1") {
+        return None;
+    }
+    // Reject if extra tokens / trailing junk after the key (first whitespace).
+    let token = value.split_whitespace().next().unwrap_or(value);
+    token.parse::<Recipient>().ok().map(|r| r.to_string())
+}
+
+enum HeaderScan {
+    PublicKey(String),
+    Continue,
+    /// Hit a body/armor line (or byte budget); do not read further body bytes.
+    Stop,
+    Eof,
+}
+
+/// Read the next header unit from `reader`.
+///
+/// Blank and comment lines are fully consumed through `\n` (within the remaining
+/// byte budget). Body lines are detected from the first non-whitespace byte; if
+/// that byte is not `#`, scanning stops **without** reading the rest of the line.
+fn read_next_header_line<R: Read>(reader: &mut R, total: &mut usize) -> Result<HeaderScan> {
+    if *total >= MAX_IDENTITY_PUBLIC_METADATA_BYTES {
+        return Ok(HeaderScan::Stop);
+    }
+
+    let mut byte = [0u8; 1];
+    // Skip leading ASCII whitespace except newlines (those end a blank line).
+    let first = loop {
+        if *total >= MAX_IDENTITY_PUBLIC_METADATA_BYTES {
+            return Ok(HeaderScan::Stop);
+        }
+        match reader.read(&mut byte)? {
+            0 => return Ok(HeaderScan::Eof),
+            _ => {
+                *total += 1;
+                match byte[0] {
+                    b'\n' => return Ok(HeaderScan::Continue), // blank line
+                    b'\r' | b' ' | b'\t' => continue,
+                    other => break other,
+                }
+            }
+        }
+    };
+
+    // Body / armor / secret line: stop without reading any further bytes.
+    if first != b'#' {
+        return Ok(HeaderScan::Stop);
+    }
+
+    // Comment line: accumulate through newline (or budget), then classify.
+    let mut line = vec![b'#'];
+    loop {
+        if *total >= MAX_IDENTITY_PUBLIC_METADATA_BYTES {
+            break;
+        }
+        match reader.read(&mut byte)? {
+            0 => break,
+            _ => {
+                *total += 1;
+                line.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
+        }
+    }
+
+    let text = String::from_utf8_lossy(&line);
+    match classify_identity_header_line(text.trim_end_matches(['\n', '\r'])) {
+        HeaderLine::PublicKey(pk) => Ok(HeaderScan::PublicKey(pk)),
+        HeaderLine::Comment => Ok(HeaderScan::Continue),
+        // A '#' line that classify treats as body shouldn't happen; treat as stop.
+        HeaderLine::Body => Ok(HeaderScan::Stop),
     }
 }
 
@@ -1042,5 +1471,453 @@ mod tests {
                 .as_deref(),
             Some("vault://path")
         );
+    }
+
+    #[test]
+    fn parse_public_key_comment_is_case_insensitive() {
+        let pk = Identity::generate().to_public().to_string();
+        assert_eq!(
+            parse_public_key_from_identity_header(&format!("# public key: {pk}\n")),
+            Some(pk.clone())
+        );
+        assert_eq!(
+            parse_public_key_from_identity_header(&format!("# Public key: {pk}\n")),
+            Some(pk.clone())
+        );
+        assert_eq!(
+            parse_public_key_from_identity_header(&format!("# PUBLIC KEY: {pk}\n")),
+            Some(pk)
+        );
+        assert_eq!(
+            parse_public_key_from_identity_header("# comment only\nAGE-SECRET-KEY-x\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn read_identity_file_public_key_plain_and_protected() {
+        let _guard = cwd_lock().lock().expect("lock cwd");
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        let plain = dir.path().join("plain.txt");
+        let gen = generate_identity_file(&plain).expect("generate plain");
+        assert_eq!(
+            read_identity_file_public_key(&plain).expect("read plain"),
+            Some(gen.recipient.clone())
+        );
+
+        let protected = dir.path().join("protected.txt");
+        let pp = SecretString::from("test-passphrase-for-lookup".to_owned());
+        let gen2 = generate_identity_file_with_passphrase(&protected, &pp).expect("generate pp");
+        assert_eq!(
+            read_identity_file_public_key(&protected).expect("read protected"),
+            Some(gen2.recipient)
+        );
+        // Metadata path must not require passphrase and must not open secret body.
+        assert!(is_passphrase_protected_identity(&protected).expect("detect protected"));
+    }
+
+    #[test]
+    fn find_identity_path_by_public_key_discovers_config_and_identities_subdir() {
+        let _guard = env_lock().lock().expect("lock env");
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+
+        let cfg = dir.path().join("seclusor");
+        let identities = cfg.join("identities");
+        fs::create_dir_all(&identities).expect("mkdir identities");
+
+        let direct = cfg.join("identity.txt");
+        let gen_direct = generate_identity_file(&direct).expect("direct identity");
+
+        let nested = identities.join("ops.txt");
+        let gen_nested = generate_identity_file(&nested).expect("nested identity");
+
+        assert_eq!(
+            find_identity_path_by_public_key(&gen_direct.recipient).expect("find direct"),
+            direct
+        );
+        assert_eq!(
+            find_identity_path_by_public_key(&gen_nested.recipient).expect("find nested"),
+            nested
+        );
+
+        let loaded =
+            load_identity_by_public_key(&gen_direct.recipient, None).expect("load by public key");
+        assert_eq!(loaded.len(), 1);
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn find_identity_path_by_public_key_ambiguous_and_missing() {
+        let _guard = env_lock().lock().expect("lock env");
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+
+        let cfg = dir.path().join("seclusor");
+        let identities = cfg.join("identities");
+        fs::create_dir_all(&identities).expect("mkdir");
+
+        let a = cfg.join("identity.txt");
+        let gen = generate_identity_file(&a).expect("a");
+        // Second file with the same public key comment (duplicate metadata).
+        let b = identities.join("copy.txt");
+        fs::write(
+            &b,
+            format!(
+                "# public key: {}\n# duplicate metadata only\n",
+                gen.recipient
+            ),
+        )
+        .expect("write b");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&b, fs::Permissions::from_mode(0o600)).expect("chmod b");
+        }
+
+        let err = find_identity_path_by_public_key(&gen.recipient).expect_err("ambiguous");
+        match &err {
+            KeyringError::AmbiguousIdentityPublicKey { paths } => {
+                assert_eq!(paths.len(), 2);
+                let rendered = err.to_string();
+                assert!(rendered.contains("ambiguous"));
+                assert!(
+                    rendered.contains(a.file_name().unwrap().to_str().unwrap())
+                        || rendered.contains("identity.txt")
+                );
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        let other = Identity::generate().to_public().to_string();
+        let missing = find_identity_path_by_public_key(&other).expect_err("missing");
+        assert!(matches!(missing, KeyringError::IdentityPublicKeyNotFound));
+
+        let bad = find_identity_path_by_public_key("not-an-age-key").expect_err("bad key");
+        assert!(matches!(bad, KeyringError::InvalidIdentityPublicKey));
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn discovery_does_not_recurse_home_or_nested_dirs() {
+        let _guard = env_lock().lock().expect("lock env");
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+
+        let cfg = dir.path().join("seclusor");
+        let deep = cfg.join("identities").join("nested");
+        fs::create_dir_all(&deep).expect("mkdir deep");
+        let buried = deep.join("hidden.txt");
+        let gen = generate_identity_file(&buried).expect("buried");
+
+        // File is under identities/nested/ — non-recursive scan must not find it.
+        let err = find_identity_path_by_public_key(&gen.recipient).expect_err("must not recurse");
+        assert!(matches!(err, KeyringError::IdentityPublicKeyNotFound));
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn load_identity_file_auto_rejects_insecure_permissions() {
+        let _guard = cwd_lock().lock().expect("lock cwd");
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("identity.txt");
+        generate_identity_file(&path).expect("generate");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        let err = match load_identity_file_auto(&path, None) {
+            Ok(_) => panic!("must fail perms"),
+            Err(e) => e,
+        };
+        assert!(matches!(
+            err,
+            KeyringError::Crypto(
+                seclusor_crypto::CryptoError::InsecureIdentityFilePermissions { .. }
+            )
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn load_identity_file_auto_insecure_protected_fails_before_passphrase_probe() {
+        let _guard = cwd_lock().lock().expect("lock cwd");
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("protected.txt");
+        let pp = SecretString::from("test-passphrase-for-preflight".to_owned());
+        generate_identity_file_with_passphrase(&path, &pp).expect("generate protected");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        // No passphrase supplied: without preflight-first this would return
+        // ProtectedIdentityNoPassphrase after reading the file header.
+        let err = match load_identity_file_auto(&path, None) {
+            Ok(_) => panic!("must fail perms before passphrase path"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(
+                err,
+                KeyringError::Crypto(
+                    seclusor_crypto::CryptoError::InsecureIdentityFilePermissions { .. }
+                )
+            ),
+            "expected permissions error, got {err}"
+        );
+        assert!(!matches!(err, KeyringError::ProtectedIdentityNoPassphrase));
+    }
+
+    #[test]
+    fn public_key_metadata_stops_before_secret_body() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("identity.txt");
+        let real = Identity::generate().to_public().to_string();
+        let decoy = Identity::generate().to_public().to_string();
+        // Body appears before a decoy public-key comment; metadata reader must
+        // stop at the body and must not treat the trailing decoy as metadata.
+        let contents = format!(
+            "# comment\nAGE-SECRET-KEY-1NOTAREALKEY000000000000000000000000000000000000000000000000\n# public key: {decoy}\n# public key: {real}\n"
+        );
+        fs::write(&path, contents).expect("write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod");
+        }
+
+        assert_eq!(
+            read_identity_file_public_key(&path).expect("read metadata"),
+            None
+        );
+        // Header-only parse of a full blob is for unit convenience; production
+        // path stops at body, so decoy must not win.
+        assert_eq!(
+            parse_public_key_from_identity_header(
+                "# public key: AGE-WRONG\nAGE-SECRET-KEY-1x\n# public key: decoy\n"
+            ),
+            None
+        );
+        let _ = real;
+    }
+
+    /// Reader that panics if any byte past `max_allowed` is requested.
+    struct BoundedProbeRead {
+        data: &'static [u8],
+        pos: usize,
+        /// Exclusive upper bound on readable positions (first body byte + 1).
+        max_allowed: usize,
+    }
+
+    impl Read for BoundedProbeRead {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            if self.pos >= self.max_allowed {
+                panic!(
+                    "metadata reader requested body bytes after first body byte (pos={}, max_allowed={})",
+                    self.pos, self.max_allowed
+                );
+            }
+            if self.pos >= self.data.len() {
+                return Ok(0);
+            }
+            buf[0] = self.data[self.pos];
+            self.pos += 1;
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn load_identity_by_public_key_rejects_mislabeled_header() {
+        let _guard = env_lock().lock().expect("lock env");
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+
+        let cfg = dir.path().join("seclusor");
+        fs::create_dir_all(cfg.join("identities")).expect("mkdir");
+        let path = cfg.join("identity.txt");
+
+        // Real identity A, but header advertises unrelated public key B.
+        let real = generate_identity();
+        let decoy = Identity::generate().to_public().to_string();
+        fs::write(&path, format!("# public key: {decoy}\n{}\n", real.identity))
+            .expect("write mislabeled");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod");
+        }
+
+        // Discovery matches on the untrusted header...
+        assert_eq!(
+            find_identity_path_by_public_key(&decoy).expect("find by decoy comment"),
+            path
+        );
+        // ...but load must fail closed when the body is a different key.
+        let err = match load_identity_by_public_key(&decoy, None) {
+            Ok(_) => panic!("mislabeled identity must not load"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, KeyringError::IdentityPublicKeyMismatch { .. }),
+            "unexpected: {err}"
+        );
+        // Correct key for the body is not advertised, so no-match on discovery.
+        let missing = find_identity_path_by_public_key(&real.recipient).expect_err("no comment");
+        assert!(matches!(missing, KeyringError::IdentityPublicKeyNotFound));
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn metadata_reader_does_not_read_ahead_into_body_line() {
+        // Comment then body: only the first body byte ('A') may be read.
+        let input: &'static [u8] =
+            b"# comment\nAGE-SECRET-KEY-1SHOULD_NOT_BE_FULLY_READ\n# public key: age1decoy\n";
+        let body_start = input.iter().position(|&b| b == b'A').expect("body start");
+        let mut reader = BoundedProbeRead {
+            data: input,
+            pos: 0,
+            max_allowed: body_start + 1,
+        };
+        let found = read_identity_public_key_from_reader(&mut reader).expect("scan");
+        assert_eq!(found, None);
+        assert_eq!(
+            reader.pos,
+            body_start + 1,
+            "must stop immediately after first body byte"
+        );
+    }
+
+    #[test]
+    fn public_key_metadata_finds_key_in_leading_comments_only() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("identity.txt");
+        let pk = Identity::generate().to_public().to_string();
+        fs::write(
+            &path,
+            format!("# Public key: {pk}\nAGE-SECRET-KEY-1NOTAREALKEY000000000000000000000000000000000000000000000000\n"),
+        )
+        .expect("write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod");
+        }
+        assert_eq!(
+            read_identity_file_public_key(&path).expect("read"),
+            Some(pk)
+        );
+    }
+
+    #[test]
+    fn config_root_filename_filter_and_relative_xdg_ignored() {
+        let _guard = env_lock().lock().expect("lock env");
+        let dir = tempfile::tempdir().expect("temp dir");
+        // Relative XDG must be ignored (XDG requires absolute paths).
+        std::env::set_var("XDG_CONFIG_HOME", "relative-config-home");
+        assert!(
+            absolute_xdg_config_home().is_none(),
+            "relative XDG_CONFIG_HOME must be ignored"
+        );
+        // Force absolute XDG for the positive filter test next.
+        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+        assert_eq!(
+            absolute_xdg_config_home().as_deref(),
+            Some(dir.path()),
+            "absolute XDG_CONFIG_HOME must be accepted"
+        );
+
+        let cfg = dir.path().join("seclusor");
+        fs::create_dir_all(&cfg).expect("mkdir");
+        let identities = cfg.join("identities");
+        fs::create_dir_all(&identities).expect("mkdir identities");
+
+        let pk = Identity::generate().to_public().to_string();
+        // Non-candidate name at config root must be ignored.
+        let notes = cfg.join("notes.txt");
+        fs::write(&notes, format!("# public key: {pk}\n")).expect("write notes");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&notes, fs::Permissions::from_mode(0o600)).expect("chmod");
+        }
+        let missing = find_identity_path_by_public_key(&pk).expect_err("notes ignored");
+        assert!(matches!(missing, KeyringError::IdentityPublicKeyNotFound));
+
+        // Candidate name at config root is accepted.
+        let identity = cfg.join("identity.txt");
+        fs::write(&identity, format!("# public key: {pk}\n")).expect("write identity");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&identity, fs::Permissions::from_mode(0o600)).expect("chmod");
+        }
+        assert_eq!(
+            find_identity_path_by_public_key(&pk).expect("find identity.txt"),
+            identity
+        );
+
+        // identities/ still accepts arbitrary non-hidden names.
+        let other_pk = Identity::generate().to_public().to_string();
+        let nested = identities.join("ops-key");
+        fs::write(&nested, format!("# public key: {other_pk}\n")).expect("write nested");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&nested, fs::Permissions::from_mode(0o600)).expect("chmod");
+        }
+        assert_eq!(
+            find_identity_path_by_public_key(&other_pk).expect("find nested"),
+            nested
+        );
+
+        assert!(is_config_root_identity_candidate("identity.txt"));
+        assert!(is_config_root_identity_candidate("identity-ops.txt"));
+        assert!(is_config_root_identity_candidate("team.identity"));
+        assert!(!is_config_root_identity_candidate("notes.txt"));
+        assert!(!is_config_root_identity_candidate("recipients.txt"));
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn ambiguous_paths_are_sorted() {
+        let _guard = env_lock().lock().expect("lock env");
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+
+        let cfg = dir.path().join("seclusor");
+        let identities = cfg.join("identities");
+        fs::create_dir_all(&identities).expect("mkdir");
+        let pk = Identity::generate().to_public().to_string();
+
+        let z = identities.join("z.txt");
+        let a = identities.join("a.txt");
+        for path in [&z, &a] {
+            fs::write(path, format!("# public key: {pk}\n")).expect("write");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("chmod");
+            }
+        }
+
+        let err = find_identity_path_by_public_key(&pk).expect_err("ambiguous");
+        match err {
+            KeyringError::AmbiguousIdentityPublicKey { paths } => {
+                assert_eq!(paths, vec![a, z]);
+            }
+            other => panic!("unexpected: {other}"),
+        }
+
+        std::env::remove_var("XDG_CONFIG_HOME");
     }
 }
