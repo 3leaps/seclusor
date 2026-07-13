@@ -38,6 +38,12 @@ pub enum CryptoError {
     #[error("identity file permissions must be 0600 on unix (actual: {actual:o})")]
     InsecureIdentityFilePermissions { actual: u32 },
 
+    /// Identity file is not owned by the current user (Unix).
+    #[error(
+        "identity file must be owned by the current user (file uid: {file_uid}, current uid: {current_uid})"
+    )]
+    IdentityFileNotOwnedByCurrentUser { file_uid: u32, current_uid: u32 },
+
     /// Inline ciphertext value must have the required prefix.
     #[error("inline ciphertext must start with sec:age:v1:")]
     InvalidInlineCiphertextPrefix,

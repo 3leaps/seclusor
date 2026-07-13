@@ -1170,6 +1170,7 @@ dependencies = [
  "age",
  "base64 0.22.1",
  "ed25519-dalek",
+ "libc",
  "rand_core",
  "seclusor-core",
  "tempfile",

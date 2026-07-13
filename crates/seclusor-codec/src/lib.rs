@@ -394,6 +394,10 @@ pub fn decrypt_bundle_from_file(
 /// Bundle markers take precedence (fail-closed). Valid JSON is then classified
 /// as [`DocumentSource::Inline`] if any credential value carries the inline
 /// ciphertext prefix, otherwise [`DocumentSource::Plaintext`].
+///
+/// Classification is not validation: a document may classify as
+/// [`DocumentSource::Inline`] even when inline encodings are malformed. Use
+/// [`resolve_runtime_document`] for shape checks and load-mode reporting.
 pub fn classify_document_bytes(input: &[u8]) -> Result<DocumentSource> {
     if is_bundle_ciphertext(input) {
         return Ok(DocumentSource::Bundle);

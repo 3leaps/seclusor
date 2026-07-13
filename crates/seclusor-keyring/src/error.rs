@@ -79,6 +79,29 @@ pub enum KeyringError {
     )]
     MultipleProtectedIdentities,
 
+    /// Public-key string was not a valid age recipient (`age1...`).
+    #[error("invalid identity public key (expected age1 recipient encoding)")]
+    InvalidIdentityPublicKey,
+
+    /// No identity file in bounded discovery locations matched the public key.
+    #[error("no identity file found for the given public key in configured keyring locations")]
+    IdentityPublicKeyNotFound,
+
+    /// More than one identity file advertised the same public key.
+    #[error(
+        "ambiguous identity public key: multiple identity files match ({paths})",
+        paths = format_paths(paths)
+    )]
+    AmbiguousIdentityPublicKey { paths: Vec<PathBuf> },
+
+    /// Header comment advertised a public key that does not match the loaded identity.
+    ///
+    /// Discovery uses untrusted `# public key:` metadata; loaders verify the
+    /// derived public key after load so `--identity-public-key` cannot silently
+    /// use a mislabeled file.
+    #[error("identity file public-key metadata does not match the loaded identity (path: {path})")]
+    IdentityPublicKeyMismatch { path: PathBuf },
+
     /// Passphrase-protected identity file content was not valid UTF-8 after decryption.
     #[error("passphrase-protected identity file decrypted to non-UTF-8 data")]
     ProtectedIdentityNotUtf8,
@@ -94,4 +117,12 @@ pub enum KeyringError {
     /// I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+fn format_paths(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
