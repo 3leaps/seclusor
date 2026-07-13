@@ -1,0 +1,15 @@
+{
+  "schema_version": "v1.0.0",
+  "env_prefix": "APP_",
+  "projects": [
+    {
+      "project_slug": "demo",
+      "credentials": {
+        "API_KEY": {
+          "type": "secret",
+          "value": "sec:age:v1:YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSBEQU8zc3FaMTUwYzREWjY1ckF3c1JxU0d1N2luRGxnMVo2UDdYY2ZnZXdnCnV5dGxhd08zeWd3dXdWNC9xajI4NUFpMlRtNUpIZlh3a0ZnclJLc0F4T0kKLT4gaUxpLlx2W0AtZ3JlYXNlCnBmWFZhSG1NeGRINERxbGlZbkhXOW01Q0srQWpyNk14N2FXZ2dhaWc4U3MKLS0tIDFXb21peHpBU3Z6ZXlQang4cWViY0RuRmp0aWQrWVhMR242TjlUT3htYWsKri2CSSqdeYQ8r/4TpJlhflzjBMMK+/t1FoUoKRaF+pUJ1IfyX/0="
+        }
+      }
+    }
+  ]
+}

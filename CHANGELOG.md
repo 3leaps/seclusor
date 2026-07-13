@@ -6,6 +6,32 @@ All notable changes to seclusor will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.2.0] - Unreleased
+
+### Added
+
+- Read-side commands accept bundle, inline-encrypted, or plaintext secrets via
+  automatic codec detection (`secrets get`, `list`, `validate`, `export-env`,
+  `run`)
+- `--identity-public-key age1…` identity selector with bounded keyring discovery
+  (public metadata only; conflicts with `--identity-file`)
+- `secrets validate` distinguishes full vs structural-only success on stdout
+  (`valid` vs `structural-only valid`)
+- Shell-safe `export-env --format export`: required `--allow`, TTY refuse without
+  `--force`, verbose-only completion summary
+- Go and C-ABI loaders for encrypted documents: `LoadSecretsBundle` /
+  `LoadSecretsInline` and matching FFI constructors (pointer + length; full
+  decrypt only)
+- Classified runtime document load API in `seclusor-codec` (`ResolvedDocument`,
+  source/mode tokens)
+
+### Changed
+
+- Identity file loads enforce Unix owner UID in addition to mode `0600`
+- Nested inline ciphertext inside a decrypted bundle is rejected (fail closed)
+- Documentation for encrypted-read flows, identity discovery, and passphrase-env
+  automation tradeoffs (App Note 02 and CLI guides)
+
 ## [0.1.6] - 2026-04-03
 
 ### Fixed
