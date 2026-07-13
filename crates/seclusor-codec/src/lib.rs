@@ -15,13 +15,62 @@ use seclusor_core::{SeclusorError, SecretsFile};
 use seclusor_crypto::{CryptoError, Identity, Recipient};
 use thiserror::Error;
 
-/// Supported storage codecs.
+/// Supported storage codecs (conversion surface: bundle ↔ JSON form).
+///
+/// Note: both plaintext secrets JSON and inline-encrypted JSON map to
+/// [`StorageCodec::Inline`] for convert. For read-side classification that
+/// distinguishes plaintext vs inline ciphertext, use [`DocumentSource`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageCodec {
     /// Whole-document age ciphertext.
     Bundle,
-    /// Structured JSON with per-value inline ciphertext.
+    /// Structured JSON (plaintext values and/or per-value inline ciphertext).
     Inline,
+}
+
+/// How secrets document bytes were classified before optional decryption.
+///
+/// Used by read-side operations (SC-018) so callers can distinguish full
+/// validation from structural-only inspection of encrypted inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocumentSource {
+    /// Whole-file age ciphertext (binary or armored header).
+    Bundle,
+    /// Valid secrets JSON with no `sec:age:v1:` credential values.
+    Plaintext,
+    /// Valid secrets JSON containing at least one inline-encrypted value.
+    Inline,
+}
+
+/// Whether encrypted material was opened for this load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadMode {
+    /// All applicable ciphertext opened (or none present).
+    Full,
+    /// Structure only; encrypted values left opaque (not decrypted).
+    StructuralOnly,
+}
+
+/// Classified load of a secrets document for read-side operations.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedDocument {
+    /// Document contents (may still contain inline ciphertext when mode is
+    /// [`LoadMode::StructuralOnly`]).
+    pub secrets: SecretsFile,
+    /// Input classification.
+    pub source: DocumentSource,
+    /// Whether ciphertext was opened.
+    pub mode: LoadMode,
+}
+
+impl ResolvedDocument {
+    /// Machine-readable token for validate/list tooling (`full` or `structural-only`).
+    pub fn mode_token(&self) -> &'static str {
+        match self.mode {
+            LoadMode::Full => "full",
+            LoadMode::StructuralOnly => "structural-only",
+        }
+    }
 }
 
 /// Error type for codec operations.
@@ -52,6 +101,23 @@ pub enum CodecError {
     /// Runtime bundle source requires identity files for decryption.
     #[error("bundle input requires at least one identity file (--identity-file)")]
     BundleIdentityRequired,
+
+    /// Prefixed inline value failed marker/base64/size structural checks.
+    ///
+    /// Error text intentionally omits the credential value / ciphertext body.
+    #[error(
+        "credential {key:?} in project {project:?} has invalid inline ciphertext encoding (marker, base64, or size)"
+    )]
+    InvalidInlineCiphertextShape { project: String, key: String },
+
+    /// Bundle decrypt produced a document that still contains inline ciphertext.
+    ///
+    /// Nested codecs are not supported: a bundle payload must decrypt to
+    /// plaintext secrets JSON so [`LoadMode::Full`] remains truthful.
+    #[error(
+        "bundle plaintext must not contain nested inline ciphertext (found credential {key:?} in project {project:?}); nested codecs are not supported"
+    )]
+    NestedInlineInBundle { project: String, key: String },
 
     /// Core-domain validation or model error.
     #[error(transparent)]
@@ -323,40 +389,157 @@ pub fn decrypt_bundle_from_file(
     decrypt_bundle(&ciphertext, identities)
 }
 
+/// Classify secrets document bytes without decrypting.
+///
+/// Bundle markers take precedence (fail-closed). Valid JSON is then classified
+/// as [`DocumentSource::Inline`] if any credential value carries the inline
+/// ciphertext prefix, otherwise [`DocumentSource::Plaintext`].
+pub fn classify_document_bytes(input: &[u8]) -> Result<DocumentSource> {
+    if is_bundle_ciphertext(input) {
+        return Ok(DocumentSource::Bundle);
+    }
+
+    let secrets = deserialize_json(input)?;
+    if secrets.has_inline_ciphertext() {
+        Ok(DocumentSource::Inline)
+    } else {
+        Ok(DocumentSource::Plaintext)
+    }
+}
+
 /// Resolve runtime source bytes as plaintext JSON, bundle ciphertext, or
-/// inline-encrypted JSON.
+/// inline-encrypted JSON, retaining classification metadata for SC-018.
 ///
 /// Classification is fail-closed: bundle marker detection takes precedence and
-/// never falls back to plaintext JSON if bundle decryption fails. When
-/// identities are provided and the document contains inline-encrypted values,
-/// they are decrypted before returning.
-pub fn resolve_runtime_source(input: &[u8], identities: &[Identity]) -> Result<SecretsFile> {
+/// never falls back to plaintext JSON if bundle decryption fails.
+///
+/// Mode rules:
+/// - Bundle with identities → decrypt outer bundle; reject nested inline
+///   ciphertext ([`CodecError::NestedInlineInBundle`]); else [`LoadMode::Full`]
+/// - Bundle without identities → [`CodecError::BundleIdentityRequired`]
+/// - Plaintext JSON → [`LoadMode::Full`] (nothing to decrypt)
+/// - Inline JSON with identities → decrypt inline values, [`LoadMode::Full`]
+/// - Inline JSON without identities → validate marker/base64/size for every
+///   prefixed value (no decrypt), preserve ciphertext, [`LoadMode::StructuralOnly`]
+/// - Mixed plaintext + inline values: accepted; only prefixed values are shape-checked
+///   or decrypted (existing runtime leniency)
+pub fn resolve_runtime_document(input: &[u8], identities: &[Identity]) -> Result<ResolvedDocument> {
     if is_bundle_ciphertext(input) {
         if identities.is_empty() {
             return Err(CodecError::BundleIdentityRequired);
         }
-        return decrypt_bundle(input, identities);
+        let secrets = decrypt_bundle(input, identities)?;
+        reject_nested_inline_in_bundle(&secrets)?;
+        return Ok(ResolvedDocument {
+            secrets,
+            source: DocumentSource::Bundle,
+            mode: LoadMode::Full,
+        });
     }
 
     let secrets = deserialize_json(input)?;
 
-    if !identities.is_empty() && secrets.has_inline_ciphertext() {
-        return decrypt_inline(&secrets, identities);
+    if secrets.has_inline_ciphertext() {
+        if identities.is_empty() {
+            validate_structural_inline_shapes(&secrets)?;
+            return Ok(ResolvedDocument {
+                secrets,
+                source: DocumentSource::Inline,
+                mode: LoadMode::StructuralOnly,
+            });
+        }
+        let secrets = decrypt_inline(&secrets, identities)?;
+        return Ok(ResolvedDocument {
+            secrets,
+            source: DocumentSource::Inline,
+            mode: LoadMode::Full,
+        });
     }
 
-    Ok(secrets)
+    Ok(ResolvedDocument {
+        secrets,
+        source: DocumentSource::Plaintext,
+        mode: LoadMode::Full,
+    })
 }
 
-/// Resolve runtime source from file as either plaintext JSON or bundle ciphertext.
+/// Validate every `sec:age:v1:` value for marker/base64/size without decrypting.
+///
+/// Used for structural-only loads so `validate` cannot report success over
+/// malformed ciphertext. Error messages never include credential values.
+fn validate_structural_inline_shapes(secrets: &SecretsFile) -> Result<()> {
+    for project in &secrets.projects {
+        for (key, credential) in &project.credentials {
+            let Some(value) = credential.value.as_ref() else {
+                continue;
+            };
+            if !value.starts_with(INLINE_CIPHERTEXT_PREFIX) {
+                continue;
+            }
+            seclusor_crypto::validate_inline_ciphertext_encoding(value).map_err(|err| {
+                // Map crypto encoding failures to a codec-level shape error that
+                // names project/key but never echoes the ciphertext body.
+                let _ = err;
+                CodecError::InvalidInlineCiphertextShape {
+                    project: project.project_slug.clone(),
+                    key: key.clone(),
+                }
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Fail closed if a decrypted bundle still contains inline ciphertext markers.
+///
+/// Nested bundle→inline is unsupported so [`LoadMode::Full`] remains truthful.
+fn reject_nested_inline_in_bundle(secrets: &SecretsFile) -> Result<()> {
+    for project in &secrets.projects {
+        for (key, credential) in &project.credentials {
+            if credential.is_inline_encrypted() {
+                return Err(CodecError::NestedInlineInBundle {
+                    project: project.project_slug.clone(),
+                    key: key.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve runtime source bytes as plaintext JSON, bundle ciphertext, or
+/// inline-encrypted JSON.
+///
+/// Thin wrapper over [`resolve_runtime_document`] for callers that only need
+/// the document. Prefer the classified API for validate/list mode reporting.
+pub fn resolve_runtime_source(input: &[u8], identities: &[Identity]) -> Result<SecretsFile> {
+    Ok(resolve_runtime_document(input, identities)?.secrets)
+}
+
+/// Resolve and classify a runtime source from file.
 ///
 /// Uses bounded reads with codec-specific limits before allocation:
 /// - bundle marker input: `MAX_BUNDLE_CIPHERTEXT_BYTES`
 /// - non-bundle input: `MAX_SECRETS_DOC_BYTES`
+pub fn resolve_runtime_document_from_file(
+    input_path: impl AsRef<Path>,
+    identities: &[Identity],
+) -> Result<ResolvedDocument> {
+    let input = read_runtime_input_bytes(input_path.as_ref())?;
+    resolve_runtime_document(&input, identities)
+}
+
+/// Resolve runtime source from file as either plaintext JSON or bundle ciphertext.
+///
+/// Thin wrapper over [`resolve_runtime_document_from_file`].
 pub fn resolve_runtime_source_from_file(
     input_path: impl AsRef<Path>,
     identities: &[Identity],
 ) -> Result<SecretsFile> {
-    let input_path = input_path.as_ref();
+    Ok(resolve_runtime_document_from_file(input_path, identities)?.secrets)
+}
+
+fn read_runtime_input_bytes(input_path: &Path) -> Result<Vec<u8>> {
     let is_bundle = detect_bundle_marker_from_file(input_path)?;
     let max = if is_bundle {
         MAX_BUNDLE_CIPHERTEXT_BYTES as u64
@@ -383,8 +566,7 @@ pub fn resolve_runtime_source_from_file(
         };
     }
 
-    let input = read_file_with_limit(input_path, max, kind)?;
-    resolve_runtime_source(&input, identities)
+    read_file_with_limit(input_path, max, kind)
 }
 
 fn is_bundle_ciphertext(input: &[u8]) -> bool {
@@ -634,6 +816,50 @@ mod tests {
     }
 
     #[test]
+    fn classify_document_bytes_plaintext_vs_inline_vs_bundle() {
+        let secrets = fixture_secrets();
+        let plain_json = serde_json::to_vec(&secrets).expect("serialize");
+        assert_eq!(
+            classify_document_bytes(&plain_json).expect("classify plain"),
+            DocumentSource::Plaintext
+        );
+
+        let encrypted = encrypt_inline(&secrets, &[fixture_recipient()]).expect("inline encrypt");
+        let inline_json = serde_json::to_vec(&encrypted).expect("serialize");
+        assert_eq!(
+            classify_document_bytes(&inline_json).expect("classify inline"),
+            DocumentSource::Inline
+        );
+
+        let bundle = encrypt_bundle(&secrets, &[fixture_recipient()]).expect("bundle encrypt");
+        assert_eq!(
+            classify_document_bytes(&bundle).expect("classify bundle"),
+            DocumentSource::Bundle
+        );
+
+        // detect_format still maps both plain and inline JSON to StorageCodec::Inline
+        assert_eq!(detect_format(&plain_json).unwrap(), StorageCodec::Inline);
+        assert_eq!(detect_format(&inline_json).unwrap(), StorageCodec::Inline);
+    }
+
+    #[test]
+    fn classify_document_bytes_rejects_garbage() {
+        let err = classify_document_bytes(b"not-a-document").expect_err("must fail");
+        assert!(matches!(err, CodecError::Json(_) | CodecError::Core(_)));
+    }
+
+    #[test]
+    fn resolve_runtime_document_plaintext_is_full() {
+        let secrets = fixture_secrets();
+        let json = serde_json::to_vec(&secrets).expect("serialize");
+        let resolved = resolve_runtime_document(&json, &[]).expect("resolve");
+        assert_eq!(resolved.source, DocumentSource::Plaintext);
+        assert_eq!(resolved.mode, LoadMode::Full);
+        assert_eq!(resolved.mode_token(), "full");
+        assert_eq!(resolved.secrets, secrets);
+    }
+
+    #[test]
     fn resolve_runtime_source_inline_encrypted_with_identities_decrypts() {
         let secrets = fixture_secrets();
         let recipient = fixture_recipient();
@@ -641,9 +867,13 @@ mod tests {
         let encrypted = encrypt_inline(&secrets, &[recipient]).expect("inline encrypt");
         let json = serde_json::to_vec(&encrypted).expect("serialize");
 
-        let resolved =
-            resolve_runtime_source(&json, std::slice::from_ref(&identity)).expect("should decrypt");
+        let classified = resolve_runtime_document(&json, std::slice::from_ref(&identity))
+            .expect("should decrypt");
+        assert_eq!(classified.source, DocumentSource::Inline);
+        assert_eq!(classified.mode, LoadMode::Full);
+        assert_eq!(classified.mode_token(), "full");
 
+        let resolved = &classified.secrets;
         // Values should be decrypted
         let project = &resolved.projects[0];
         assert_eq!(
@@ -668,8 +898,12 @@ mod tests {
         let encrypted = encrypt_inline(&secrets, &[recipient]).expect("inline encrypt");
         let json = serde_json::to_vec(&encrypted).expect("serialize");
 
-        let resolved = resolve_runtime_source(&json, &[]).expect("should succeed");
+        let classified = resolve_runtime_document(&json, &[]).expect("should succeed");
+        assert_eq!(classified.source, DocumentSource::Inline);
+        assert_eq!(classified.mode, LoadMode::StructuralOnly);
+        assert_eq!(classified.mode_token(), "structural-only");
 
+        let resolved = &classified.secrets;
         // Values should still be inline-encrypted (no identities to decrypt with)
         let project = &resolved.projects[0];
         assert!(project.credentials["A_KEY"]
@@ -696,10 +930,12 @@ mod tests {
             .value = Some(b_encrypted);
 
         let json = serde_json::to_vec(&secrets).expect("serialize");
-        let resolved =
-            resolve_runtime_source(&json, std::slice::from_ref(&identity)).expect("should decrypt");
+        let classified = resolve_runtime_document(&json, std::slice::from_ref(&identity))
+            .expect("should decrypt");
+        assert_eq!(classified.source, DocumentSource::Inline);
+        assert_eq!(classified.mode, LoadMode::Full);
 
-        let project = &resolved.projects[0];
+        let project = &classified.secrets.projects[0];
         assert_eq!(
             project.credentials["A_KEY"].value.as_deref(),
             Some("a-value")
@@ -711,12 +947,56 @@ mod tests {
     }
 
     #[test]
+    fn resolve_runtime_document_mixed_without_identities_is_structural_only() {
+        let mut secrets = fixture_secrets();
+        let recipient = fixture_recipient();
+        let b_encrypted =
+            seclusor_crypto::encrypt_inline_value(b"b-value", std::slice::from_ref(&recipient))
+                .expect("inline encrypt value");
+        secrets.projects[0]
+            .credentials
+            .get_mut("B_KEY")
+            .unwrap()
+            .value = Some(b_encrypted);
+
+        let json = serde_json::to_vec(&secrets).expect("serialize");
+        let classified = resolve_runtime_document(&json, &[]).expect("mixed structural");
+        assert_eq!(classified.source, DocumentSource::Inline);
+        assert_eq!(classified.mode, LoadMode::StructuralOnly);
+        assert_eq!(
+            classified.secrets.projects[0].credentials["A_KEY"]
+                .value
+                .as_deref(),
+            Some("a-value")
+        );
+        assert!(classified.secrets.projects[0].credentials["B_KEY"]
+            .value
+            .as_ref()
+            .unwrap()
+            .starts_with(INLINE_CIPHERTEXT_PREFIX));
+    }
+
+    #[test]
     fn resolve_runtime_source_bundle_requires_identity() {
         let secrets = fixture_secrets();
         let ciphertext =
             encrypt_bundle(&secrets, &[fixture_recipient()]).expect("encrypt should succeed");
         let err = resolve_runtime_source(&ciphertext, &[]).expect_err("must fail");
         assert!(matches!(err, CodecError::BundleIdentityRequired));
+        let err = resolve_runtime_document(&ciphertext, &[]).expect_err("must fail");
+        assert!(matches!(err, CodecError::BundleIdentityRequired));
+    }
+
+    #[test]
+    fn resolve_runtime_document_bundle_full_with_identity() {
+        let secrets = fixture_secrets();
+        let ciphertext =
+            encrypt_bundle(&secrets, &[fixture_recipient()]).expect("encrypt should succeed");
+        let classified =
+            resolve_runtime_document(&ciphertext, &[fixture_identity()]).expect("bundle decrypt");
+        assert_eq!(classified.source, DocumentSource::Bundle);
+        assert_eq!(classified.mode, LoadMode::Full);
+        assert_eq!(classified.secrets, secrets);
     }
 
     #[test]
@@ -727,6 +1007,151 @@ mod tests {
         )
         .expect_err("must fail");
         assert!(matches!(err, CodecError::Crypto(_)));
+
+        // Bundle marker must not fall through to JSON parse.
+        let err = resolve_runtime_document(
+            b"age-encryption.org/v1\nthis is not valid age payload",
+            &[fixture_identity()],
+        )
+        .expect_err("must fail closed");
+        assert!(matches!(err, CodecError::Crypto(_)));
+        assert!(!matches!(err, CodecError::Json(_)));
+    }
+
+    #[test]
+    fn resolve_runtime_document_armored_bundle_marker_fail_closed() {
+        let err = resolve_runtime_document(
+            b"-----BEGIN AGE ENCRYPTED FILE-----\nnot-real\n-----END AGE ENCRYPTED FILE-----\n",
+            &[fixture_identity()],
+        )
+        .expect_err("must fail");
+        assert!(matches!(err, CodecError::Crypto(_)));
+    }
+
+    #[test]
+    fn resolve_runtime_document_from_file_classifies_plaintext() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("secrets.json");
+        let secrets = fixture_secrets();
+        std::fs::write(&path, serde_json::to_vec(&secrets).expect("ser")).expect("write");
+
+        let classified =
+            resolve_runtime_document_from_file(&path, &[]).expect("from file plaintext");
+        assert_eq!(classified.source, DocumentSource::Plaintext);
+        assert_eq!(classified.mode, LoadMode::Full);
+        assert_eq!(classified.secrets, secrets);
+    }
+
+    #[test]
+    fn resolve_runtime_document_from_file_bundle_requires_identity() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("secrets.age");
+        let secrets = fixture_secrets();
+        encrypt_bundle_to_file(&secrets, &[fixture_recipient()], &path).expect("write bundle");
+
+        let err = resolve_runtime_document_from_file(&path, &[]).expect_err("no identity");
+        assert!(matches!(err, CodecError::BundleIdentityRequired));
+
+        let classified = resolve_runtime_document_from_file(&path, &[fixture_identity()])
+            .expect("with identity");
+        assert_eq!(classified.source, DocumentSource::Bundle);
+        assert_eq!(classified.mode, LoadMode::Full);
+    }
+
+    #[test]
+    fn structural_only_rejects_malformed_inline_base64() {
+        let mut secrets = fixture_secrets();
+        secrets.projects[0].credentials.insert(
+            "A_KEY".to_string(),
+            seclusor_core::Credential::with_value("secret", "sec:age:v1:not base64!"),
+        );
+        let json = serde_json::to_vec(&secrets).expect("serialize");
+
+        let err = resolve_runtime_document(&json, &[]).expect_err("malformed base64");
+        assert!(matches!(
+            err,
+            CodecError::InvalidInlineCiphertextShape { ref key, .. } if key == "A_KEY"
+        ));
+        let rendered = err.to_string();
+        assert!(!rendered.contains("not base64"));
+        assert!(!rendered.contains("sec:age:v1:"));
+    }
+
+    #[test]
+    fn structural_only_rejects_oversized_credential_value_without_leaking() {
+        // Domain validate_strict enforces a per-value size cap at or below the
+        // inline ciphertext bound, so encoded-length overflow is unreachable
+        // through deserialize_json. Oversized values still fail closed before
+        // any Full/structural-only success, without echoing the payload.
+        let mut secrets = fixture_secrets();
+        let oversized = "A".repeat(seclusor_core::constants::MAX_INLINE_CIPHERTEXT_BYTES + 1);
+        let value = format!("{INLINE_CIPHERTEXT_PREFIX}{oversized}");
+        secrets.projects[0].credentials.insert(
+            "A_KEY".to_string(),
+            seclusor_core::Credential::with_value("secret", &value),
+        );
+        let json = serde_json::to_vec(&secrets).expect("serialize");
+
+        let err = resolve_runtime_document(&json, &[]).expect_err("oversized value");
+        assert!(
+            matches!(err, CodecError::Core(SeclusorError::Validation(_))),
+            "unexpected error: {err:?} / {err}"
+        );
+        let rendered = err.to_string();
+        assert!(!rendered.contains(&oversized[..32]));
+        assert!(!rendered.contains(INLINE_CIPHERTEXT_PREFIX));
+    }
+
+    #[test]
+    fn structural_only_malformed_inline_from_file_path() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("bad-inline.json");
+        let mut secrets = fixture_secrets();
+        secrets.projects[0].credentials.insert(
+            "B_KEY".to_string(),
+            seclusor_core::Credential::with_value("secret", "sec:age:v1:%%%"),
+        );
+        std::fs::write(&path, serde_json::to_vec(&secrets).expect("ser")).expect("write");
+
+        let err = resolve_runtime_document_from_file(&path, &[]).expect_err("from file");
+        assert!(matches!(
+            err,
+            CodecError::InvalidInlineCiphertextShape { ref key, .. } if key == "B_KEY"
+        ));
+        assert!(!err.to_string().contains("%%%"));
+    }
+
+    #[test]
+    fn bundle_with_nested_inline_ciphertext_rejected() {
+        // Build plaintext doc → encrypt_inline → encrypt that as bundle payload.
+        let secrets = fixture_secrets();
+        let inline =
+            encrypt_inline(&secrets, &[fixture_recipient()]).expect("inline encrypt nested");
+        assert!(inline.has_inline_ciphertext());
+        let nested_bundle =
+            encrypt_bundle(&inline, &[fixture_recipient()]).expect("bundle encrypt nested");
+
+        let err = resolve_runtime_document(&nested_bundle, &[fixture_identity()])
+            .expect_err("nested inline in bundle");
+        assert!(matches!(err, CodecError::NestedInlineInBundle { .. }));
+        let rendered = err.to_string();
+        assert!(!rendered.contains(INLINE_CIPHERTEXT_PREFIX));
+        // Source classification path must not report Full over unopened values.
+        assert!(resolve_runtime_source(&nested_bundle, &[fixture_identity()]).is_err());
+    }
+
+    #[test]
+    fn bundle_nested_inline_from_file_rejected() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("nested.age");
+        let secrets = fixture_secrets();
+        let inline =
+            encrypt_inline(&secrets, &[fixture_recipient()]).expect("inline encrypt nested");
+        encrypt_bundle_to_file(&inline, &[fixture_recipient()], &path).expect("write nested");
+
+        let err = resolve_runtime_document_from_file(&path, &[fixture_identity()])
+            .expect_err("nested from file");
+        assert!(matches!(err, CodecError::NestedInlineInBundle { .. }));
     }
 
     #[test]
