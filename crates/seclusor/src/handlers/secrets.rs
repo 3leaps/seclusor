@@ -12,7 +12,8 @@ use crate::cli::{
 use crate::env_support::resolve_export_env_vars;
 use crate::error::{CliError, CliResult};
 use crate::io::{
-    read_file_with_limit, read_runtime_secrets_file, read_secrets_file, write_secrets_file,
+    read_file_with_limit, read_runtime_document_file, read_runtime_secrets_file, read_secrets_file,
+    write_secrets_file,
 };
 use crate::lenient::{handle_unset_lenient, should_use_lenient_unset};
 use crate::resolve::resolve_identities;
@@ -91,16 +92,18 @@ pub(crate) fn handle_get(args: GetArgs) -> CliResult<()> {
 }
 
 pub(crate) fn handle_list(args: ListArgs) -> CliResult<()> {
-    let secrets = read_secrets_file(&args.file)?;
+    let identities = resolve_identities(&args.identities, &args.passphrase, false)?;
+    let resolved = read_runtime_document_file(&args.file, &identities)?;
+    let secrets = &resolved.secrets;
     if !args.verbose {
-        let keys = list_credential_keys(&secrets, args.project.as_deref())?;
+        let keys = list_credential_keys(secrets, args.project.as_deref())?;
         for key in keys {
             println!("{key}");
         }
         return Ok(());
     }
 
-    let project_index = resolve_project_index(&secrets, args.project.as_deref())?;
+    let project_index = resolve_project_index(secrets, args.project.as_deref())?;
     let project = &secrets.projects[project_index];
     for (key, credential) in &project.credentials {
         if let Some(description) = credential.description.as_deref() {
@@ -136,9 +139,29 @@ pub(crate) fn handle_unset(args: UnsetArgs) -> CliResult<()> {
 }
 
 pub(crate) fn handle_validate(args: ValidateArgs) -> CliResult<()> {
-    let secrets = read_secrets_file(&args.file)?;
-    validate_strict(&secrets)?;
-    println!("valid");
+    let identities = resolve_identities(&args.identities, &args.passphrase, false)?;
+    let resolved = read_runtime_document_file(&args.file, &identities)?;
+    // resolve_runtime_document already runs validate_strict (via deserialize /
+    // decrypt paths) and structural-only shape checks when applicable.
+    validate_strict(&resolved.secrets)?;
+
+    // Machine-readable mode distinguishability: structural-only must never
+    // look like full cryptographic validation. Both exit 0 on success.
+    match resolved.mode {
+        seclusor_codec::LoadMode::StructuralOnly => {
+            // Encoding/shape only — not authenticity or decryptability.
+            println!("structural-only valid");
+            eprintln!(
+                "validate: structural-only (source: {}); inline ciphertext encodings \
+                 checked without decryption. Pass --identity-file or \
+                 --identity-public-key for full validation.",
+                resolved.source_token()
+            );
+        }
+        seclusor_codec::LoadMode::Full => {
+            println!("valid");
+        }
+    }
     Ok(())
 }
 
@@ -433,6 +456,7 @@ mod tests {
             show_description: false,
             identities: IdentityArgs {
                 identity_files: vec![identity_file.clone()],
+                identity_public_key: None,
             },
             passphrase: PassphraseArgs::default(),
         })
@@ -446,6 +470,7 @@ mod tests {
             show_description: false,
             identities: IdentityArgs {
                 identity_files: vec![identity_file],
+                identity_public_key: None,
             },
             passphrase: PassphraseArgs::default(),
         })
@@ -518,6 +543,7 @@ mod tests {
             show_description: false,
             identities: IdentityArgs {
                 identity_files: vec![wrong_identity_file],
+                identity_public_key: None,
             },
             passphrase: PassphraseArgs::default(),
         })
@@ -540,9 +566,16 @@ mod tests {
             file: path,
             project: Some("demo".to_string()),
             verbose: false,
+            identities: IdentityArgs::default(),
+            passphrase: PassphraseArgs::default(),
         })
         .expect_err("must reject invalid document");
-        assert!(matches!(err, CliError::Core(SeclusorError::Validation(_))));
+        assert!(matches!(
+            err,
+            CliError::Codec(seclusor_codec::CodecError::Core(SeclusorError::Validation(
+                _
+            )))
+        ));
     }
 
     #[test]
@@ -872,6 +905,7 @@ mod tests {
             deny: vec![],
             identities: IdentityArgs {
                 identity_files: vec![identity_file],
+                identity_public_key: None,
             },
             passphrase: PassphraseArgs::default(),
         })
@@ -948,6 +982,7 @@ mod tests {
             deny: vec![],
             identities: IdentityArgs {
                 identity_files: vec![wrong_identity_file],
+                identity_public_key: None,
             },
             passphrase: PassphraseArgs::default(),
         })
@@ -1002,6 +1037,7 @@ mod tests {
             show_description: false,
             identities: IdentityArgs {
                 identity_files: vec![identity_file.clone()],
+                identity_public_key: None,
             },
             passphrase: PassphraseArgs::default(),
         })
@@ -1016,6 +1052,7 @@ mod tests {
             show_description: false,
             identities: IdentityArgs {
                 identity_files: vec![identity_file],
+                identity_public_key: None,
             },
             passphrase: PassphraseArgs::default(),
         })
@@ -1057,9 +1094,184 @@ mod tests {
             deny: vec![],
             identities: IdentityArgs {
                 identity_files: vec![identity_file],
+                identity_public_key: None,
             },
             passphrase: PassphraseArgs::default(),
         });
         assert!(result.is_ok(), "export-env failed: {}", result.unwrap_err());
+    }
+
+    #[test]
+    fn handle_list_and_validate_accept_bundle_with_identity() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("input.json");
+        let bundle = dir.path().join("secrets.age");
+        let identity_file = dir.path().join("identity.txt");
+        let secrets = fixture_secrets();
+        write_secrets_file(&input, &secrets, true).expect("write input");
+        write_identity_file(&identity_file, TEST_IDENTITY);
+
+        handle_bundle_encrypt(BundleEncryptArgs {
+            input,
+            output: bundle.clone(),
+            recipients: RecipientArgs {
+                recipients: vec![fixture_recipient_string()],
+                recipient_file: None,
+                recipient_env_var: None,
+            },
+        })
+        .expect("bundle encrypt");
+
+        handle_list(ListArgs {
+            file: bundle.clone(),
+            project: Some("demo".to_string()),
+            verbose: false,
+            identities: IdentityArgs {
+                identity_files: vec![identity_file.clone()],
+                identity_public_key: None,
+            },
+            passphrase: PassphraseArgs::default(),
+        })
+        .expect("list bundle");
+
+        handle_validate(ValidateArgs {
+            file: bundle,
+            identities: IdentityArgs {
+                identity_files: vec![identity_file],
+                identity_public_key: None,
+            },
+            passphrase: PassphraseArgs::default(),
+        })
+        .expect("validate bundle full");
+    }
+
+    #[test]
+    fn handle_list_and_validate_bundle_require_identity() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("input.json");
+        let bundle = dir.path().join("secrets.age");
+        write_secrets_file(&input, &fixture_secrets(), true).expect("write input");
+        handle_bundle_encrypt(BundleEncryptArgs {
+            input,
+            output: bundle.clone(),
+            recipients: RecipientArgs {
+                recipients: vec![fixture_recipient_string()],
+                recipient_file: None,
+                recipient_env_var: None,
+            },
+        })
+        .expect("bundle encrypt");
+
+        let list_err = handle_list(ListArgs {
+            file: bundle.clone(),
+            project: Some("demo".to_string()),
+            verbose: false,
+            identities: IdentityArgs::default(),
+            passphrase: PassphraseArgs::default(),
+        })
+        .expect_err("list bundle without identity");
+        assert!(matches!(
+            list_err,
+            CliError::Codec(seclusor_codec::CodecError::BundleIdentityRequired)
+        ));
+
+        let validate_err = handle_validate(ValidateArgs {
+            file: bundle,
+            identities: IdentityArgs::default(),
+            passphrase: PassphraseArgs::default(),
+        })
+        .expect_err("validate bundle without identity");
+        assert!(matches!(
+            validate_err,
+            CliError::Codec(seclusor_codec::CodecError::BundleIdentityRequired)
+        ));
+    }
+
+    #[test]
+    fn handle_list_inline_without_identity_lists_keys() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (inline, _identity_file) = write_inline_encrypted_file(dir.path());
+
+        handle_list(ListArgs {
+            file: inline,
+            project: Some("demo".to_string()),
+            verbose: false,
+            identities: IdentityArgs::default(),
+            passphrase: PassphraseArgs::default(),
+        })
+        .expect("list inline structural keys");
+    }
+
+    #[test]
+    fn handle_validate_inline_structural_only_without_identity() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (inline, _identity_file) = write_inline_encrypted_file(dir.path());
+
+        handle_validate(ValidateArgs {
+            file: inline,
+            identities: IdentityArgs::default(),
+            passphrase: PassphraseArgs::default(),
+        })
+        .expect("structural-only validate");
+    }
+
+    #[test]
+    fn handle_validate_inline_full_with_identity() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (inline, identity_file) = write_inline_encrypted_file(dir.path());
+
+        handle_validate(ValidateArgs {
+            file: inline,
+            identities: IdentityArgs {
+                identity_files: vec![identity_file],
+                identity_public_key: None,
+            },
+            passphrase: PassphraseArgs::default(),
+        })
+        .expect("full validate with identity");
+    }
+
+    #[test]
+    fn handle_list_via_identity_public_key() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let xdg = dir.path().join("xdg-config");
+        let seclusor_cfg = xdg.join("seclusor");
+        fs::create_dir_all(&seclusor_cfg).expect("mkdir config");
+        let identity_path = seclusor_cfg.join("identity.txt");
+        write_identity_file(&identity_path, TEST_IDENTITY);
+
+        let input = dir.path().join("input.json");
+        let bundle = dir.path().join("secrets.age");
+        write_secrets_file(&input, &fixture_secrets(), true).expect("write");
+        handle_bundle_encrypt(BundleEncryptArgs {
+            input,
+            output: bundle.clone(),
+            recipients: RecipientArgs {
+                recipients: vec![fixture_recipient_string()],
+                recipient_file: None,
+                recipient_env_var: None,
+            },
+        })
+        .expect("encrypt");
+
+        // SAFETY: serial test env; restored on drop via scope-guard pattern below.
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        // Absolute XDG_CONFIG_HOME replaces platform defaults for discovery.
+        std::env::set_var("XDG_CONFIG_HOME", &xdg);
+        let result = handle_list(ListArgs {
+            file: bundle,
+            project: Some("demo".to_string()),
+            verbose: false,
+            identities: IdentityArgs {
+                identity_files: vec![],
+                identity_public_key: Some(fixture_recipient_string()),
+            },
+            passphrase: PassphraseArgs::default(),
+        });
+        match prev {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        result.expect("list via identity public key");
     }
 }

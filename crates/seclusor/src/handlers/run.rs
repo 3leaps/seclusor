@@ -121,6 +121,7 @@ mod tests {
             deny: vec![],
             identities: IdentityArgs {
                 identity_files: vec![identity_file],
+                identity_public_key: None,
             },
             passphrase: PassphraseArgs::default(),
             command,
@@ -164,6 +165,7 @@ mod tests {
             deny: vec![],
             identities: IdentityArgs {
                 identity_files: vec![wrong_identity_file],
+                identity_public_key: None,
             },
             passphrase: PassphraseArgs::default(),
             command,
@@ -193,6 +195,7 @@ mod tests {
             deny: vec![],
             identities: IdentityArgs {
                 identity_files: vec![identity_file],
+                identity_public_key: None,
             },
             passphrase: PassphraseArgs::default(),
             command,

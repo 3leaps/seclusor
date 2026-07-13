@@ -145,6 +145,7 @@ mod tests {
             claimed_at: Some("2026-05-17T12:00:00Z".to_string()),
             identities: IdentityArgs {
                 identity_files: vec![identity_path],
+                identity_public_key: None,
             },
             passphrase: PassphraseArgs::default(),
         })

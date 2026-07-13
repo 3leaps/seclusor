@@ -93,6 +93,7 @@ mod tests {
             output: output.clone(),
             identities: IdentityArgs {
                 identity_files: vec![identity_file],
+                identity_public_key: None,
             },
             passphrase: PassphraseArgs::default(),
         })
@@ -127,12 +128,16 @@ mod tests {
             output: dir.path().join("output.json"),
             identities: IdentityArgs {
                 identity_files: vec![],
+                identity_public_key: None,
             },
             passphrase: PassphraseArgs::default(),
         })
         .expect_err("missing identity-file should fail");
 
         assert!(matches!(err, CliError::Message(_)));
-        assert!(format!("{err}").contains("--identity-file"));
+        assert!(
+            format!("{err}").contains("--identity-file")
+                || format!("{err}").contains("--identity-public-key")
+        );
     }
 }

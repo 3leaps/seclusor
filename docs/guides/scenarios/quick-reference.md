@@ -13,18 +13,21 @@ for full context.
 
 ## Creating and editing secrets
 
-| I want to...                | Command                                                                                                        |
-| --------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| Initialize a secrets file   | `seclusor secrets init --file secrets.json --project myapp --env-prefix MYAPP_`                                |
-| Add a secret value          | `seclusor secrets set --file secrets.json --project myapp --key DB_PASSWORD --value "..." --description "..."` |
-| Add a reference pointer     | `seclusor secrets set --file secrets.json --project myapp --key DB_PASSWORD --ref "vault://prod/db/password"`  |
-| Remove a credential         | `seclusor secrets unset --file secrets.json --project myapp --key DB_PASSWORD`                                 |
-| List keys (no values shown) | `seclusor secrets list --file secrets.json --project myapp`                                                    |
-| List keys with descriptions | `seclusor secrets list --file secrets.json --project myapp --verbose`                                          |
-| Read a value (redacted)     | `seclusor secrets get --file secrets.json --project myapp --key DB_PASSWORD`                                   |
-| Read a value (plaintext)    | `seclusor secrets get --file secrets.json --project myapp --key DB_PASSWORD --reveal`                          |
-| Read a description only     | `seclusor secrets get --file secrets.json --project myapp --key DB_PASSWORD --show-description`                |
-| Validate a secrets file     | `seclusor secrets validate --file secrets.json`                                                                |
+| I want to...                    | Command                                                                                                        |
+| ------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| Initialize a secrets file       | `seclusor secrets init --file secrets.json --project myapp --env-prefix MYAPP_`                                |
+| Add a secret value              | `seclusor secrets set --file secrets.json --project myapp --key DB_PASSWORD --value "..." --description "..."` |
+| Add a reference pointer         | `seclusor secrets set --file secrets.json --project myapp --key DB_PASSWORD --ref "vault://prod/db/password"`  |
+| Remove a credential             | `seclusor secrets unset --file secrets.json --project myapp --key DB_PASSWORD`                                 |
+| List keys (no values shown)     | `seclusor secrets list --file secrets.json --project myapp`                                                    |
+| List keys from a bundle         | `seclusor secrets list --file secrets.age --identity-file ./identity.txt --project myapp`                      |
+| List keys with descriptions     | `seclusor secrets list --file secrets.json --project myapp --verbose`                                          |
+| Read a value (redacted)         | `seclusor secrets get --file secrets.json --project myapp --key DB_PASSWORD`                                   |
+| Read a value (plaintext)        | `seclusor secrets get --file secrets.json --project myapp --key DB_PASSWORD --reveal`                          |
+| Read a description only         | `seclusor secrets get --file secrets.json --project myapp --key DB_PASSWORD --show-description`                |
+| Validate a secrets file         | `seclusor secrets validate --file secrets.json`                                                                |
+| Validate structural-only inline | `seclusor secrets validate --file secrets-inline.json` (stdout: `structural-only valid`)                       |
+| Validate with public-key lookup | `seclusor secrets validate --file secrets.age --identity-public-key age1...`                                   |
 
 ## Bundle encryption
 

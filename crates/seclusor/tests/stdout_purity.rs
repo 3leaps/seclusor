@@ -242,6 +242,136 @@ fn invalid_document_failure_writes_diagnostics_to_stderr_only() {
 }
 
 #[test]
+fn validate_plaintext_full_is_valid_token_only_on_stdout() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let secrets = dir.path().join("secrets.json");
+    write_fixture(&secrets);
+
+    let output = run_seclusor(&[
+        "secrets",
+        "validate",
+        "--file",
+        secrets.to_str().expect("utf8 path"),
+    ]);
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("utf8 stdout"),
+        "valid\n"
+    );
+    assert_eq!(String::from_utf8(output.stderr).expect("utf8 stderr"), "");
+}
+
+/// Process-boundary guardrail: structural-only success is machine-distinguishable.
+#[test]
+fn validate_inline_without_identity_is_structural_only_on_stdout() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (inline, _identity) = prepare_inline_encrypted(dir.path());
+
+    let output = run_seclusor(&[
+        "secrets",
+        "validate",
+        "--file",
+        inline.to_str().expect("utf8 path"),
+    ]);
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("utf8 stdout"),
+        "structural-only valid\n"
+    );
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(
+        stderr.contains("structural-only"),
+        "stderr must reinforce structural-only mode, got: {stderr}"
+    );
+    assert!(
+        !stderr.to_ascii_lowercase().contains("authentic"),
+        "must not claim authenticity"
+    );
+    assert!(
+        !stderr.to_ascii_lowercase().contains("decryptab"),
+        "must not claim decryptability of values"
+    );
+}
+
+/// Full mode with identity: `valid` token only, empty stderr (stdout purity).
+#[test]
+fn validate_inline_with_identity_is_full_valid_empty_stderr() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (inline, identity) = prepare_inline_encrypted(dir.path());
+
+    let output = run_seclusor(&[
+        "secrets",
+        "validate",
+        "--file",
+        inline.to_str().expect("utf8 path"),
+        "--identity-file",
+        identity.to_str().expect("utf8 identity"),
+    ]);
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("utf8 stdout"),
+        "valid\n"
+    );
+    assert_eq!(String::from_utf8(output.stderr).expect("utf8 stderr"), "");
+}
+
+/// Build an inline-encrypted secrets file via the CLI for process-boundary tests.
+fn prepare_inline_encrypted(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let input = dir.join("input.json");
+    let inline = dir.join("inline.json");
+    let identity = dir.join("identity.txt");
+    write_fixture(&input);
+
+    let generated = Command::new(env!("CARGO_BIN_EXE_seclusor"))
+        .args([
+            "keys",
+            "age",
+            "identity",
+            "generate",
+            "--output",
+            identity.to_str().expect("utf8 identity"),
+        ])
+        .output()
+        .expect("generate identity");
+    assert!(
+        generated.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let recipient = String::from_utf8(generated.stdout).expect("utf8 recipient");
+
+    let encrypted = Command::new(env!("CARGO_BIN_EXE_seclusor"))
+        .args([
+            "secrets",
+            "inline",
+            "encrypt",
+            "--input",
+            input.to_str().expect("utf8 input"),
+            "--output",
+            inline.to_str().expect("utf8 inline"),
+            "--recipient",
+            recipient.trim(),
+        ])
+        .output()
+        .expect("inline encrypt");
+    assert!(
+        encrypted.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&encrypted.stderr)
+    );
+
+    (inline, identity)
+}
+
+#[test]
 fn unset_lenient_recovery_keeps_plaintext_off_output() {
     let dir = tempfile::tempdir().expect("tempdir");
     let invalid = dir.path().join("invalid.json");

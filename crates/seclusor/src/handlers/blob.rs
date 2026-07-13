@@ -127,6 +127,7 @@ mod tests {
             allow_large: false,
             identities: IdentityArgs {
                 identity_files: vec![identity_path],
+                identity_public_key: None,
             },
             passphrase: PassphraseArgs::default(),
         })
@@ -177,6 +178,7 @@ mod tests {
             allow_large: false,
             identities: IdentityArgs {
                 identity_files: vec![identity_path],
+                identity_public_key: None,
             },
             passphrase: PassphraseArgs::default(),
         })
@@ -213,6 +215,7 @@ mod tests {
             allow_large: false,
             identities: IdentityArgs {
                 identity_files: vec![identity_path],
+                identity_public_key: None,
             },
             passphrase: PassphraseArgs::default(),
         })
@@ -297,6 +300,7 @@ mod tests {
             allow_large: false,
             identities: IdentityArgs {
                 identity_files: vec![identity_path],
+                identity_public_key: None,
             },
             passphrase: PassphraseArgs::default(),
         })
@@ -336,6 +340,7 @@ mod tests {
             allow_large: false,
             identities: IdentityArgs {
                 identity_files: vec![id1_path],
+                identity_public_key: None,
             },
             passphrase: PassphraseArgs::default(),
         })
@@ -350,6 +355,7 @@ mod tests {
             allow_large: false,
             identities: IdentityArgs {
                 identity_files: vec![id2_path],
+                identity_public_key: None,
             },
             passphrase: PassphraseArgs::default(),
         })
@@ -387,6 +393,7 @@ mod tests {
             allow_large: false,
             identities: IdentityArgs {
                 identity_files: vec![wrong_id_path],
+                identity_public_key: None,
             },
             passphrase: PassphraseArgs::default(),
         })
