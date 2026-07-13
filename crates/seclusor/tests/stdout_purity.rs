@@ -195,6 +195,105 @@ fn export_json_stdout_is_valid_json_and_stderr_empty() {
 }
 
 #[test]
+fn export_shell_format_requires_allow() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let secrets = dir.path().join("secrets.json");
+    write_fixture(&secrets);
+
+    let output = run_seclusor(&[
+        "secrets",
+        "export-env",
+        "--file",
+        secrets.to_str().expect("utf8 path"),
+        "--project",
+        "demo",
+        "--format",
+        "export",
+        "--prefix",
+        "APP_",
+    ]);
+    assert!(!output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).expect("utf8 stdout"), "");
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(
+        stderr.contains("--allow"),
+        "stderr should require allow pattern: {stderr}"
+    );
+}
+
+#[test]
+fn export_shell_format_with_allow_writes_export_lines_empty_stderr() {
+    // Process capture means stdout is not a TTY, so --force is not required.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let secrets = dir.path().join("secrets.json");
+    write_fixture(&secrets);
+
+    let output = run_seclusor(&[
+        "secrets",
+        "export-env",
+        "--file",
+        secrets.to_str().expect("utf8 path"),
+        "--project",
+        "demo",
+        "--format",
+        "export",
+        "--prefix",
+        "APP_",
+        "--allow",
+        "APP_API_KEY",
+    ]);
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8(output.stderr).expect("utf8 stderr"), "");
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(
+        stdout.contains("export APP_API_KEY="),
+        "expected shell export line, got {stdout:?}"
+    );
+    assert!(!stdout.contains("EMPTY_DESC"), "allow filter should apply");
+}
+
+#[test]
+fn export_shell_format_verbose_summary_on_stderr_only() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let secrets = dir.path().join("secrets.json");
+    write_fixture(&secrets);
+
+    let output = run_seclusor(&[
+        "secrets",
+        "export-env",
+        "--file",
+        secrets.to_str().expect("utf8 path"),
+        "--project",
+        "demo",
+        "--format",
+        "export",
+        "--prefix",
+        "APP_",
+        "--allow",
+        "APP_API_KEY",
+        "--verbose",
+    ]);
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("export APP_API_KEY="));
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(
+        stderr.contains("Exported 1 variables from demo"),
+        "expected completion summary, got {stderr:?}"
+    );
+    // Allow patterns may appear under --verbose only; stdout must stay pure.
+    assert!(!stdout.contains("Exported"));
+}
+
+#[test]
 fn missing_file_failure_writes_diagnostics_to_stderr_only() {
     let dir = tempfile::tempdir().expect("tempdir");
     let missing = dir.path().join("missing.json");

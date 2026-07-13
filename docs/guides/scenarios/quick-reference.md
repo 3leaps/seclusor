@@ -63,13 +63,14 @@ See [Blob Encryption](blob-encryption.md) for the full workflow.
 
 ## Runtime use
 
-| I want to...                          | Command                                                                                                                         |
-| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| Run a command with injected secrets   | `seclusor secrets run --file secrets.age --identity-file ./identity.txt --project myapp -- ./my-command`                        |
-| Run with glob-filtered keys           | `seclusor secrets run --file secrets.age --identity-file ./identity.txt --project myapp --allow MYAPP_* -- ./my-command`        |
-| Run with shell features (pipes, etc.) | `seclusor secrets run --file secrets.age --identity-file ./identity.txt --project myapp -- sh -c 'echo "$MYAPP_KEY" \| base64'` |
-| Export as shell variables             | `seclusor secrets export-env --file secrets.age --identity-file ./identity.txt --project myapp --format export`                 |
-| Import from environment               | `seclusor secrets import-env --file secrets.json --project myapp --prefix MYAPP_`                                               |
+| I want to...                          | Command                                                                                                                                     |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| Run a command with injected secrets   | `seclusor secrets run --file secrets.age --identity-file ./identity.txt --project myapp -- ./my-command`                                    |
+| Run with glob-filtered keys           | `seclusor secrets run --file secrets.age --identity-file ./identity.txt --project myapp --allow 'MYAPP_*' -- ./my-command`                  |
+| Run with shell features (pipes, etc.) | `seclusor secrets run --file secrets.age --identity-file ./identity.txt --project myapp -- sh -c 'echo "$MYAPP_KEY" \| base64'`             |
+| Export as shell variables             | `seclusor secrets export-env --file secrets.age --identity-file ./identity.txt --project myapp --format export --allow 'MYAPP_*'`           |
+| Eval into current shell               | `eval "$(seclusor secrets export-env --file secrets.age --identity-file ./identity.txt --project myapp --format export --allow 'MYAPP_*')"` |
+| Import from environment               | `seclusor secrets import-env --file secrets.json --project myapp --prefix MYAPP_`                                                           |
 
 ## Passphrase channels (protected identities)
 

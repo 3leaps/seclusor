@@ -7,7 +7,8 @@ use seclusor_core::validate::{normalize_description, validate_strict};
 use seclusor_core::{Credential, SeclusorError, SecretsFile};
 
 use crate::cli::{
-    ExportEnvArgs, GetArgs, ImportEnvArgs, InitArgs, ListArgs, SetArgs, UnsetArgs, ValidateArgs,
+    EnvFormatArg, ExportEnvArgs, GetArgs, ImportEnvArgs, InitArgs, ListArgs, SetArgs, UnsetArgs,
+    ValidateArgs,
 };
 use crate::env_support::resolve_export_env_vars;
 use crate::error::{CliError, CliResult};
@@ -166,11 +167,92 @@ pub(crate) fn handle_validate(args: ValidateArgs) -> CliResult<()> {
 }
 
 pub(crate) fn handle_export_env(args: ExportEnvArgs) -> CliResult<()> {
+    // Pure shell-safety gates first: never resolve identities, prompt for
+    // passphrases, or decrypt secrets when --allow / TTY policy would refuse.
+    let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    enforce_export_shell_safety_preflight(&args, stdout_is_tty)?;
+
     let identities = resolve_identities(&args.identities, &args.passphrase, false)?;
     let secrets = read_runtime_secrets_file(&args.file, &identities)?;
-    let output = render_export_env_output(&secrets, args.project.as_deref(), &args)?;
+    let (output, exported_count) =
+        render_export_env_output(&secrets, args.project.as_deref(), &args)?;
+
+    // Forced-TTY warning immediately before emission (after load succeeds so
+    // we do not warn about output that never happens).
+    warn_export_shell_tty_force(&args, stdout_is_tty);
+
     println!("{output}");
+
+    // ADR-0006: default success leaves stderr empty. Shell completion summary
+    // is opt-in via --verbose only (settled for shell-export safety).
+    if matches!(args.format, EnvFormatArg::Export) && args.verbose {
+        let project_label = args
+            .project
+            .as_deref()
+            .or_else(|| secrets.projects.first().map(|p| p.project_slug.as_str()))
+            .unwrap_or("unknown");
+        eprint!("Exported {exported_count} variables from {project_label}");
+        if !args.allow.is_empty() {
+            // Patterns are user-supplied and potentially sensitive; only under
+            // explicit --verbose, and never on the default path.
+            eprint!(" (allow: {})", args.allow.join(", "));
+        }
+        eprintln!();
+    }
+
     Ok(())
+}
+
+/// Pure refusal gates for shell `--format export` (before any secret I/O).
+///
+/// Dotenv and JSON keep the historical default (empty `--allow` means all keys).
+/// `stdout_is_tty` is injected so unit tests can cover the TTY branch without a
+/// real terminal. Does **not** emit the forced-TTY warning — that runs only
+/// immediately before successful emission (see [`warn_export_shell_tty_force`]).
+pub(crate) fn enforce_export_shell_safety_preflight(
+    args: &ExportEnvArgs,
+    stdout_is_tty: bool,
+) -> CliResult<()> {
+    if !matches!(args.format, EnvFormatArg::Export) {
+        return Ok(());
+    }
+
+    if args.allow.is_empty() {
+        return Err(CliError::Message(
+            "export format requires at least one --allow pattern \
+             (refusing to export all secrets to the shell by default)"
+                .to_string(),
+        ));
+    }
+
+    if stdout_is_tty && !args.force {
+        return Err(CliError::Message(
+            "refusing to write shell exports to a TTY (values would be visible); \
+             re-run with --force, or pipe/redirect for eval \
+             (e.g. eval \"$(seclusor secrets export-env ... --format export --allow '...')\")"
+                .to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Risk acknowledgment when deliberately writing shell exports to a TTY.
+fn warn_export_shell_tty_force(args: &ExportEnvArgs, stdout_is_tty: bool) {
+    if matches!(args.format, EnvFormatArg::Export) && stdout_is_tty && args.force {
+        eprintln!(
+            "warning: writing shell exports to a TTY; secret values may be visible on screen"
+        );
+    }
+}
+
+/// Combined preflight used by unit tests that only need the refusal contract.
+#[cfg(test)]
+pub(crate) fn enforce_export_shell_safety(
+    args: &ExportEnvArgs,
+    stdout_is_tty: bool,
+) -> CliResult<()> {
+    enforce_export_shell_safety_preflight(args, stdout_is_tty)
 }
 
 pub(crate) fn handle_import_env(args: ImportEnvArgs) -> CliResult<()> {
@@ -235,7 +317,7 @@ fn render_export_env_output(
     secrets: &SecretsFile,
     project_slug: Option<&str>,
     args: &ExportEnvArgs,
-) -> CliResult<String> {
+) -> CliResult<(String, usize)> {
     let vars = resolve_export_env_vars(
         secrets,
         project_slug,
@@ -244,7 +326,8 @@ fn render_export_env_output(
         &args.allow,
         &args.deny,
     )?;
-    Ok(format_env_vars(&vars, args.format.into()))
+    let count = vars.len();
+    Ok((format_env_vars(&vars, args.format.into()), count))
 }
 
 fn read_import_source(args: &ImportEnvArgs) -> CliResult<Vec<(String, String)>> {
@@ -866,12 +949,134 @@ mod tests {
             emit_ref: false,
             allow: vec!["APP_API_*".to_string()],
             deny: vec![],
+            force: false,
+            verbose: false,
             identities: IdentityArgs::default(),
             passphrase: PassphraseArgs::default(),
         };
 
-        let output = render_export_env_output(&secrets, Some("demo"), &args).expect("export");
+        let (output, count) =
+            render_export_env_output(&secrets, Some("demo"), &args).expect("export");
         assert_eq!(output, "APP_API_KEY=sk-123");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn export_shell_format_requires_allow_pattern() {
+        let args = ExportEnvArgs {
+            file: PathBuf::from("ignored.json"),
+            project: Some("demo".to_string()),
+            format: EnvFormatArg::Export,
+            prefix: None,
+            emit_ref: false,
+            allow: vec![],
+            deny: vec![],
+            force: false,
+            verbose: false,
+            identities: IdentityArgs::default(),
+            passphrase: PassphraseArgs::default(),
+        };
+        let err = enforce_export_shell_safety(&args, false).expect_err("require allow");
+        assert!(format!("{err}").contains("--allow"));
+    }
+
+    #[test]
+    fn export_shell_format_refuses_tty_without_force() {
+        let args = ExportEnvArgs {
+            file: PathBuf::from("ignored.json"),
+            project: Some("demo".to_string()),
+            format: EnvFormatArg::Export,
+            prefix: None,
+            emit_ref: false,
+            allow: vec!["APP_*".to_string()],
+            deny: vec![],
+            force: false,
+            verbose: false,
+            identities: IdentityArgs::default(),
+            passphrase: PassphraseArgs::default(),
+        };
+        let err = enforce_export_shell_safety(&args, true).expect_err("refuse tty");
+        assert!(format!("{err}").contains("TTY"));
+        // With force, TTY is allowed (warning is side-effect only).
+        let forced = ExportEnvArgs {
+            force: true,
+            ..args
+        };
+        enforce_export_shell_safety(&forced, true).expect("force permits tty");
+    }
+
+    #[test]
+    fn export_dotenv_and_json_skip_shell_safety_gates() {
+        for format in [EnvFormatArg::Dotenv, EnvFormatArg::Json] {
+            let args = ExportEnvArgs {
+                file: PathBuf::from("ignored.json"),
+                project: Some("demo".to_string()),
+                format,
+                prefix: None,
+                emit_ref: false,
+                allow: vec![], // empty still OK for non-export
+                deny: vec![],
+                force: false,
+                verbose: false,
+                identities: IdentityArgs::default(),
+                passphrase: PassphraseArgs::default(),
+            };
+            enforce_export_shell_safety(&args, true).expect("non-export ignores tty/allow gates");
+        }
+    }
+
+    #[test]
+    fn export_shell_missing_allow_wins_before_missing_file_io() {
+        // Missing allow must fail before any attempt to open the secrets file.
+        let missing = PathBuf::from("/nonexistent/seclusor-export-env-no-such-file.json");
+        let err = handle_export_env(ExportEnvArgs {
+            file: missing,
+            project: Some("demo".to_string()),
+            format: EnvFormatArg::Export,
+            prefix: None,
+            emit_ref: false,
+            allow: vec![],
+            deny: vec![],
+            force: false,
+            verbose: false,
+            identities: IdentityArgs::default(),
+            passphrase: PassphraseArgs::default(),
+        })
+        .expect_err("must refuse on allow before I/O");
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("--allow"),
+            "expected allowlist error, got {rendered}"
+        );
+        assert!(
+            !rendered.to_ascii_lowercase().contains("no such file")
+                && !rendered.to_ascii_lowercase().contains("not found")
+                && !rendered.to_ascii_lowercase().contains("os error"),
+            "must not surface file I/O: {rendered}"
+        );
+    }
+
+    #[test]
+    fn export_shell_tty_refuse_wins_before_missing_file_io() {
+        // TTY refuse is pure preflight; inject via unit gate (handler uses real
+        // stdout isatty). Prove missing-allow already covers file-before-load.
+        // TTY+allow without force still must not need a real secrets path when
+        // exercised through enforce_export_shell_safety_preflight alone.
+        let args = ExportEnvArgs {
+            file: PathBuf::from("/nonexistent/seclusor-export-env-tty.json"),
+            project: Some("demo".to_string()),
+            format: EnvFormatArg::Export,
+            prefix: None,
+            emit_ref: false,
+            allow: vec!["APP_*".to_string()],
+            deny: vec![],
+            force: false,
+            verbose: false,
+            identities: IdentityArgs::default(),
+            passphrase: PassphraseArgs::default(),
+        };
+        let err = enforce_export_shell_safety_preflight(&args, true).expect_err("tty refuse");
+        assert!(format!("{err}").contains("TTY"));
     }
 
     #[test]
@@ -903,6 +1108,8 @@ mod tests {
             emit_ref: false,
             allow: vec!["APP_API_*".to_string()],
             deny: vec![],
+            force: false,
+            verbose: false,
             identities: IdentityArgs {
                 identity_files: vec![identity_file],
                 identity_public_key: None,
@@ -939,6 +1146,8 @@ mod tests {
             emit_ref: false,
             allow: vec!["*".to_string()],
             deny: vec![],
+            force: false,
+            verbose: false,
             identities: IdentityArgs::default(),
             passphrase: PassphraseArgs::default(),
         })
@@ -980,6 +1189,8 @@ mod tests {
             emit_ref: false,
             allow: vec!["APP_API_KEY".to_string()],
             deny: vec![],
+            force: false,
+            verbose: false,
             identities: IdentityArgs {
                 identity_files: vec![wrong_identity_file],
                 identity_public_key: None,
@@ -1092,6 +1303,8 @@ mod tests {
             emit_ref: true,
             allow: vec![],
             deny: vec![],
+            force: false,
+            verbose: false,
             identities: IdentityArgs {
                 identity_files: vec![identity_file],
                 identity_public_key: None,

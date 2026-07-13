@@ -60,7 +60,7 @@ jobs:
             --identity-file ~/.config/seclusor/identity.txt \
             --passphrase-env SECLUSOR_PASSPHRASE \
             --project myapp \
-            --allow MYAPP_* \
+            --allow 'MYAPP_*' \
             -- ./deploy.sh
 ```
 
@@ -81,7 +81,7 @@ deploy:
       --identity-file ~/.config/seclusor/identity.txt
       --passphrase-env SECLUSOR_PASSPHRASE
       --project myapp
-      --allow MYAPP_*
+      --allow 'MYAPP_*'
       -- ./deploy.sh
 ```
 

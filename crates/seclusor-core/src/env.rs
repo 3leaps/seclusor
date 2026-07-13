@@ -591,6 +591,175 @@ mod tests {
         assert_eq!(out, "export KEY=\"val\"");
     }
 
+    /// Metacharacter coverage for shell `--format export` (double-quote escape).
+    ///
+    /// Single-line values round-trip via `parse_dotenv` (same unescape rules).
+    /// Newlines are asserted via `shell_quote` shape only — dotenv line parsing
+    /// is not a multi-line container format.
+    #[test]
+    fn format_export_shell_metacharacters_are_safely_quoted() {
+        let single_line_cases = [
+            "plain",
+            "single'quote",
+            "double\"quote",
+            "has$dollar",
+            "has`backtick`",
+            "back\\slash",
+            "mix $ ` \" ' \\ end",
+        ];
+        for raw in single_line_cases {
+            let vars = vec![EnvVar {
+                key: "KEY".to_string(),
+                value: raw.to_string(),
+            }];
+            let out = format_env_vars(&vars, EnvFormat::Export);
+            assert!(
+                out.starts_with("export KEY="),
+                "expected export prefix, got {out:?}"
+            );
+            let quoted = out.strip_prefix("export KEY=").unwrap();
+            assert!(
+                quoted.starts_with('"') && quoted.ends_with('"'),
+                "export values must be double-quoted, got {quoted:?}"
+            );
+            // Active chars must be escaped inside the quotes.
+            if raw.contains('$') {
+                assert!(quoted.contains("\\$"), "dollar must be escaped: {quoted}");
+            }
+            if raw.contains('`') {
+                assert!(quoted.contains("\\`"), "backtick must be escaped: {quoted}");
+            }
+            if raw.contains('"') {
+                assert!(
+                    quoted.contains("\\\""),
+                    "double-quote must be escaped: {quoted}"
+                );
+            }
+            // Round-trip through dotenv parser for single-line values.
+            let parsed = parse_dotenv(&out);
+            assert_eq!(
+                parsed,
+                vec![("KEY".to_string(), raw.to_string())],
+                "round-trip failed for raw={raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_quote_escapes_active_double_quote_metacharacters() {
+        assert_eq!(shell_quote(r#"a$b"c`d\e"#), r#""a\$b\"c\`d\\e""#);
+        // Single quotes are safe inside double quotes (no escape needed).
+        assert_eq!(shell_quote("it's"), r#""it's""#);
+        // Newlines are preserved literally inside double quotes (bash-compatible).
+        assert_eq!(shell_quote("a\nb"), "\"a\nb\"");
+        // format_export emits a multi-line assignment for newline values.
+        let out = format_env_vars(
+            &[EnvVar {
+                key: "KEY".to_string(),
+                value: "line1\nline2".to_string(),
+            }],
+            EnvFormat::Export,
+        );
+        assert_eq!(out, "export KEY=\"line1\nline2\"");
+    }
+
+    /// Process-level round-trip through `/bin/sh` for export quoting.
+    ///
+    /// Shape assertions and `parse_dotenv` can agree with a buggy producer while
+    /// a real shell disagrees. This cfg-gated check evals the export line in
+    /// POSIX sh and asserts the variable value is restored literally — including
+    /// no command-substitution side effects for `$` / backticks.
+    #[test]
+    #[cfg(unix)]
+    fn format_export_roundtrips_through_bin_sh() {
+        use std::process::Command;
+
+        let cases = [
+            "plain",
+            "single'quote",
+            "double\"quote",
+            "has$dollar",
+            "has`backtick`",
+            "back\\slash",
+            "line1\nline2",
+            // Would execute if $ or ` were not escaped:
+            "$(echo SHOULD_NOT_RUN)",
+            "`echo SHOULD_NOT_RUN`",
+            "mix $ ` \" ' \\ and end",
+        ];
+
+        for raw in cases {
+            let out = format_env_vars(
+                &[EnvVar {
+                    key: "KEY".to_string(),
+                    value: raw.to_string(),
+                }],
+                EnvFormat::Export,
+            );
+            // Eval the export line, then emit the value with a trailing marker
+            // so embedded newlines do not confuse capture boundaries.
+            let script = format!("{out}\nprintf '%s' \"$KEY\"; printf '\\n__END__\\n'");
+            let output = Command::new("/bin/sh")
+                .arg("-c")
+                .arg(&script)
+                .output()
+                .expect("/bin/sh available");
+            assert!(
+                output.status.success(),
+                "sh failed for raw={raw:?}: stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+            let restored = stdout
+                .strip_suffix("\n__END__\n")
+                .or_else(|| stdout.strip_suffix("\n__END__"))
+                .unwrap_or(&stdout);
+            assert_eq!(
+                restored, raw,
+                "sh round-trip mismatch for raw={raw:?}; export was {out:?}"
+            );
+        }
+    }
+
+    /// Ensure unescaped command substitution cannot create side effects.
+    #[test]
+    #[cfg(unix)]
+    fn format_export_does_not_execute_command_substitution_in_sh() {
+        use std::process::Command;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let marker = std::env::temp_dir().join(format!("seclusor-shell-quote-pwned-{nanos}"));
+        let marker_str = marker.to_str().expect("utf8 path");
+        // If $ is not escaped, sh would create the marker file.
+        let raw = format!("$(touch {marker_str})");
+        let out = format_env_vars(
+            &[EnvVar {
+                key: "KEY".to_string(),
+                value: raw.clone(),
+            }],
+            EnvFormat::Export,
+        );
+        let script = format!("{out}\nprintf '%s' \"$KEY\"");
+        let output = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("/bin/sh");
+        assert!(output.status.success());
+        let leaked = marker.exists();
+        let _ = std::fs::remove_file(&marker);
+        assert!(
+            !leaked,
+            "command substitution side effect executed; quoting is broken"
+        );
+        let restored = String::from_utf8(output.stdout).expect("utf8");
+        assert_eq!(restored, raw);
+    }
+
     #[test]
     fn format_json() {
         let vars = vec![EnvVar {
