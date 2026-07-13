@@ -283,6 +283,10 @@ pub(crate) struct ListArgs {
         help = "Show KEY<TAB>description (no values)"
     )]
     pub(crate) verbose: bool,
+    #[command(flatten)]
+    pub(crate) identities: IdentityArgs,
+    #[command(flatten)]
+    pub(crate) passphrase: PassphraseArgs,
 }
 
 #[derive(Debug, Parser)]
@@ -299,6 +303,10 @@ pub(crate) struct UnsetArgs {
 pub(crate) struct ValidateArgs {
     #[arg(long, default_value = DEFAULT_SECRETS_FILE, help = "Path to secrets file")]
     pub(crate) file: PathBuf,
+    #[command(flatten)]
+    pub(crate) identities: IdentityArgs,
+    #[command(flatten)]
+    pub(crate) passphrase: PassphraseArgs,
 }
 
 #[derive(Debug, Parser)]
@@ -529,10 +537,35 @@ pub(crate) struct RecipientArgs {
 pub(crate) struct IdentityArgs {
     #[arg(
         long = "identity-file",
+        conflicts_with = "identity_public_key",
         help = "Path to an age identity file (private key) for decryption; \
-                repeatable. File must be 0600 on Unix"
+                repeatable. File must be 0600 and owned by the current user on Unix. \
+                Conflicts with --identity-public-key"
     )]
     pub(crate) identity_files: Vec<PathBuf>,
+    #[arg(
+        long = "identity-public-key",
+        value_name = "AGE1",
+        conflicts_with = "identity_files",
+        value_parser = parse_identity_public_key_arg,
+        help = "Age recipient (age1...) for identity lookup in the bounded keyring \
+                locations (config dir + identities/ subdir). Public metadata only \
+                during discovery; loads only the matched file. Conflicts with \
+                --identity-file"
+    )]
+    pub(crate) identity_public_key: Option<String>,
+}
+
+/// Clap value parser: require a well-formed age recipient (`age1...`).
+fn parse_identity_public_key_arg(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("identity public key must not be empty".to_string());
+    }
+    trimmed
+        .parse::<seclusor_crypto::Recipient>()
+        .map(|r| r.to_string())
+        .map_err(|_| "identity public key must be a valid age recipient (age1...)".to_string())
 }
 
 #[derive(Debug, Clone, Args, Default)]
@@ -628,5 +661,63 @@ mod tests {
             TEST_IDENTITY,
         ]);
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn identity_public_key_conflicts_with_identity_file() {
+        let parsed = Cli::try_parse_from([
+            "seclusor",
+            "secrets",
+            "list",
+            "--file",
+            "secrets.json",
+            "--identity-file",
+            "id.txt",
+            "--identity-public-key",
+            "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p",
+        ]);
+        assert!(parsed.is_err(), "must reject simultaneous selectors");
+    }
+
+    #[test]
+    fn identity_public_key_rejects_non_age1_at_parse_time() {
+        let parsed = Cli::try_parse_from([
+            "seclusor",
+            "secrets",
+            "validate",
+            "--file",
+            "secrets.json",
+            "--identity-public-key",
+            "not-a-recipient",
+        ]);
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn identity_public_key_accepts_valid_age1() {
+        let pk = crate::test_support::fixture_recipient_string();
+        let parsed = Cli::try_parse_from([
+            "seclusor",
+            "secrets",
+            "list",
+            "--file",
+            "secrets.json",
+            "--identity-public-key",
+            &pk,
+        ]);
+        assert!(parsed.is_ok());
+        match parsed.unwrap().command {
+            TopLevelCommand::Secrets(cmd) => match cmd.command {
+                SecretsSubcommand::List(args) => {
+                    assert_eq!(
+                        args.identities.identity_public_key.as_deref(),
+                        Some(pk.as_str())
+                    );
+                    assert!(args.identities.identity_files.is_empty());
+                }
+                _ => panic!("expected list"),
+            },
+            _ => panic!("expected secrets"),
+        }
     }
 }

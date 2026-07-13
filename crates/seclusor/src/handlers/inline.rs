@@ -72,6 +72,7 @@ mod tests {
             output: output.clone(),
             identities: IdentityArgs {
                 identity_files: vec![identity_file],
+                identity_public_key: None,
             },
             passphrase: PassphraseArgs::default(),
         })

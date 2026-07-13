@@ -124,16 +124,45 @@ credentials.
 - `secrets get --show-description` and `--reveal` are mutually exclusive.
 - `secrets list --verbose` prints `KEY<TAB>description`; keys without descriptions print as just `KEY`.
 
-### Runtime source behavior (`get`, `export-env`, `run`)
+### Runtime source behavior (`get`, `list`, `validate`, `export-env`, `run`)
 
-- Plaintext JSON input (`--file secrets.json`) works without identities.
-- Bundle ciphertext input (`--file secrets.age`) requires one or more `--identity-file <path>`.
-- Source classification is fail-closed: bundle-classified input does not fall back to plaintext parsing after decrypt/identity failure.
+All five read-side commands accept plaintext JSON, bundle ciphertext, or
+inline-encrypted JSON via the same auto-detect path (`--file`).
+
+- Plaintext JSON works without identities.
+- Bundle ciphertext requires `--identity-file <path>` **or**
+  `--identity-public-key <age1...>` (mutually exclusive; see
+  [Identity files and recipients](identity-and-recipients.md)).
+- Inline JSON without an identity: `list` still prints keys (values never
+  shown); `validate` runs **structural-only** checks (schema + inline
+  marker/base64/size — **not** authenticity/decryptability); `get` can
+  redact or show descriptions; `export-env` / `run` need identities when
+  ciphertext values must be opened.
+- Source classification is fail-closed: bundle-classified input does not fall
+  back to plaintext parsing after decrypt/identity failure.
+
+#### `secrets validate` modes
+
+| Input     | Identity? | Exit 0 stdout           | Notes                                         |
+| --------- | --------- | ----------------------- | --------------------------------------------- |
+| Plaintext | n/a       | `valid`                 | Full structural validation                    |
+| Bundle    | no        | (fails)                 | Fail-closed; supply an identity selector      |
+| Bundle    | yes       | `valid`                 | Decrypt in memory, then validate              |
+| Inline    | no        | `structural-only valid` | Encoding/shape only; stderr explains the mode |
+| Inline    | yes       | `valid`                 | Decrypt values, then full validation          |
+
+Both structural-only and full success exit `0`. Scripts must inspect **stdout**
+for the `structural-only` token — do not treat exit code alone as proof of
+cryptographic validation. Structural-only never claims authenticity or that
+values are decryptable with any particular identity.
 
 Examples:
 
 ```bash
 seclusor secrets get --file secrets.age --identity-file ./identity.txt --project demo --key API_KEY
+seclusor secrets list --file secrets.age --identity-file ./identity.txt --project demo
+seclusor secrets validate --file secrets-inline.json
+seclusor secrets validate --file secrets.age --identity-public-key age1...
 seclusor secrets export-env --file secrets.age --identity-file ./identity.txt --project demo --format export
 seclusor secrets run --file secrets.age --identity-file ./identity.txt --project demo --allow APP_API_KEY -- env | grep APP_API_KEY
 ```

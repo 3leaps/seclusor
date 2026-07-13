@@ -2,10 +2,11 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
-use seclusor_crypto::{parse_recipients, Identity};
+use seclusor_crypto::{assert_identity_file_access, parse_recipients, Identity};
 use seclusor_keyring::{
-    discover_recipients, is_passphrase_protected_identity, load_identity_file_auto, KeyringError,
-    Recipient, RecipientDiscoveryOptions, DEFAULT_RECIPIENTS_ENV_VAR,
+    discover_recipients, find_identity_path_by_public_key, is_passphrase_protected_identity,
+    load_identity_by_public_key, load_identity_file_auto, KeyringError, Recipient,
+    RecipientDiscoveryOptions, DEFAULT_RECIPIENTS_ENV_VAR,
 };
 use secrecy::{ExposeSecret, SecretString};
 
@@ -163,10 +164,34 @@ pub(crate) fn resolve_identities(
     passphrase_args: &PassphraseArgs,
     required: bool,
 ) -> CliResult<Vec<Identity>> {
+    // --identity-public-key and --identity-file conflict at clap parse time.
+    if let Some(public_key) = &args.identity_public_key {
+        let path = find_identity_path_by_public_key(public_key)?;
+        // Access preflight before format detection / passphrase probing so
+        // insecure files fail closed without reading secret-body material.
+        assert_identity_file_access(&path)?;
+        let protected = is_passphrase_protected_identity(&path)?;
+        let passphrase = if protected {
+            resolve_passphrase_for_protected(passphrase_args)?
+        } else {
+            None
+        };
+        let identities = load_identity_by_public_key(public_key, passphrase.as_ref())?;
+        if required && identities.is_empty() {
+            return Err(CliError::Message(
+                "no identities resolved; provide --identity-file or --identity-public-key"
+                    .to_string(),
+            ));
+        }
+        return Ok(identities);
+    }
+
     // Per SC-008 settled decision 1: scan all identity files first,
     // error if more than one is passphrase-protected.
+    // Access preflight runs before any format probe on each path.
     let mut protected_count = 0usize;
     for path in &args.identity_files {
+        assert_identity_file_access(path)?;
         if is_passphrase_protected_identity(path)? {
             protected_count += 1;
         }
@@ -177,30 +202,7 @@ pub(crate) fn resolve_identities(
 
     // Resolve passphrase only if needed (at least one protected identity)
     let passphrase = if protected_count > 0 {
-        let mut pp = resolve_passphrase(passphrase_args, false)?;
-        // Auto-prompt if no explicit passphrase channel and terminal available
-        if pp.is_none() {
-            eprint!("Passphrase: ");
-            match rpassword::read_password().map(SecretString::from) {
-                Ok(val) if !val.expose_secret().is_empty() => {
-                    pp = Some(val);
-                }
-                Ok(_) => {
-                    return Err(CliError::Message(
-                        "passphrase must not be empty".to_string(),
-                    ));
-                }
-                Err(_) => {
-                    return Err(CliError::Message(
-                        "identity file is passphrase-protected but no interactive \
-                         terminal is available. Provide --passphrase-env, \
-                         --passphrase-file, or --passphrase-stdin."
-                            .to_string(),
-                    ));
-                }
-            }
-        }
-        pp
+        resolve_passphrase_for_protected(passphrase_args)?
     } else {
         None
     };
@@ -212,9 +214,137 @@ pub(crate) fn resolve_identities(
 
     if required && identities.is_empty() {
         return Err(CliError::Message(
-            "no identities resolved; provide --identity-file".to_string(),
+            "no identities resolved; provide --identity-file or --identity-public-key".to_string(),
         ));
     }
 
     Ok(identities)
+}
+
+/// Resolve passphrase for a protected identity, with TTY auto-prompt fallback.
+fn resolve_passphrase_for_protected(
+    passphrase_args: &PassphraseArgs,
+) -> CliResult<Option<SecretString>> {
+    let mut pp = resolve_passphrase(passphrase_args, false)?;
+    // Auto-prompt if no explicit passphrase channel and terminal available
+    if pp.is_none() {
+        eprint!("Passphrase: ");
+        match rpassword::read_password().map(SecretString::from) {
+            Ok(val) if !val.expose_secret().is_empty() => {
+                pp = Some(val);
+            }
+            Ok(_) => {
+                return Err(CliError::Message(
+                    "passphrase must not be empty".to_string(),
+                ));
+            }
+            Err(_) => {
+                return Err(CliError::Message(
+                    "identity file is passphrase-protected but no interactive \
+                     terminal is available. Provide --passphrase-env, \
+                     --passphrase-file, or --passphrase-stdin."
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    Ok(pp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    use seclusor_crypto::CryptoError;
+    use seclusor_keyring::generate_identity_file_with_passphrase;
+    use secrecy::SecretString;
+
+    use crate::cli::{IdentityArgs, PassphraseArgs};
+    use crate::error::CliError;
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_identities_insecure_protected_file_fails_before_passphrase_probe() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("protected.txt");
+        let pp = SecretString::from("test-passphrase-for-cli-preflight".to_owned());
+        generate_identity_file_with_passphrase(&path, &pp).expect("generate protected");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        // No passphrase channel: without preflight-first this would prompt or
+        // return ProtectedIdentityNoPassphrase after reading the armor header.
+        let err = match resolve_identities(
+            &IdentityArgs {
+                identity_files: vec![path],
+                identity_public_key: None,
+            },
+            &PassphraseArgs::default(),
+            false,
+        ) {
+            Ok(_) => panic!("must fail access before passphrase path"),
+            Err(e) => e,
+        };
+
+        assert!(
+            matches!(
+                err,
+                CliError::Crypto(CryptoError::InsecureIdentityFilePermissions { .. })
+            ),
+            "expected insecure permissions, got {err}"
+        );
+        assert!(!matches!(
+            err,
+            CliError::Keyring(KeyringError::ProtectedIdentityNoPassphrase)
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_identities_public_key_insecure_protected_fails_before_passphrase_probe() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let xdg = dir.path().join("xdg-config");
+        let seclusor_cfg = xdg.join("seclusor");
+        fs::create_dir_all(&seclusor_cfg).expect("mkdir config");
+        let path = seclusor_cfg.join("identity.txt");
+        let pp = SecretString::from("test-passphrase-for-cli-pk-preflight".to_owned());
+        let generated =
+            generate_identity_file_with_passphrase(&path, &pp).expect("generate protected");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", &xdg);
+        let result = resolve_identities(
+            &IdentityArgs {
+                identity_files: vec![],
+                identity_public_key: Some(generated.recipient.clone()),
+            },
+            &PassphraseArgs::default(),
+            false,
+        );
+        match prev {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+
+        let err = match result {
+            Ok(_) => panic!("must fail access before passphrase path"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(
+                err,
+                CliError::Crypto(CryptoError::InsecureIdentityFilePermissions { .. })
+            ),
+            "expected insecure permissions, got {err}"
+        );
+        assert!(!matches!(
+            err,
+            CliError::Keyring(KeyringError::ProtectedIdentityNoPassphrase)
+        ));
+    }
 }

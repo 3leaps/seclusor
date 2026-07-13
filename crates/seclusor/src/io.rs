@@ -2,7 +2,9 @@ use std::fs::{self, OpenOptions};
 use std::io::Read;
 use std::path::Path;
 
-use seclusor_codec::resolve_runtime_source_from_file;
+use seclusor_codec::{
+    resolve_runtime_document_from_file, resolve_runtime_source_from_file, ResolvedDocument,
+};
 use seclusor_core::constants::MAX_SECRETS_DOC_BYTES;
 use seclusor_core::validate::validate_strict;
 use seclusor_core::{SeclusorError, SecretsFile};
@@ -22,6 +24,14 @@ pub(crate) fn read_runtime_secrets_file(
     identities: &[Identity],
 ) -> CliResult<SecretsFile> {
     Ok(resolve_runtime_source_from_file(path, identities)?)
+}
+
+/// Classified runtime load for list/validate (mode + source tokens).
+pub(crate) fn read_runtime_document_file(
+    path: &Path,
+    identities: &[Identity],
+) -> CliResult<ResolvedDocument> {
+    Ok(resolve_runtime_document_from_file(path, identities)?)
 }
 
 pub(crate) fn write_secrets_file(

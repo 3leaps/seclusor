@@ -82,6 +82,7 @@ mod tests {
             },
             identities: IdentityArgs {
                 identity_files: vec![identity_file.clone()],
+                identity_public_key: None,
             },
             passphrase: PassphraseArgs::default(),
         })
@@ -99,6 +100,7 @@ mod tests {
             },
             identities: IdentityArgs {
                 identity_files: vec![identity_file],
+                identity_public_key: None,
             },
             passphrase: PassphraseArgs::default(),
         })

@@ -32,12 +32,13 @@ Share the recipient freely; keep the identity file private.
 ### File permissions
 
 On **Unix** (Linux, macOS), identity files must have mode `0600` (read/write
-for owner only). Seclusor enforces this — loading an identity file with
-other permissions fails with a clear error. Generated identity files are
-created with `0600` atomically.
+for owner only) **and** be owned by the current user. Seclusor enforces both
+checks before loading — wrong mode or ownership fails with a clear error
+that never includes key material. Generated identity files are created with
+`0600` atomically.
 
-On **Windows**, there is no equivalent permission check. Protect identity
-files using NTFS ACLs or by storing them in a user-only directory.
+On **Windows**, there is no equivalent mode/ownership preflight. Protect
+identity files using NTFS ACLs or by storing them in a user-only directory.
 
 ### File size limit
 
@@ -94,6 +95,70 @@ is available.
 add the new recipient to your recipient set, and rekey existing bundles.
 The old plaintext identity can then be securely deleted.
 
+### Selecting an identity
+
+Decryption commands accept **exactly one** of these selectors (Clap conflict;
+not silent precedence):
+
+| Flag                              | Meaning                                                          |
+| --------------------------------- | ---------------------------------------------------------------- |
+| `--identity-file <path>`          | Explicit path to an identity file (repeatable)                   |
+| `--identity-public-key <age1...>` | Look up the identity file whose header advertises this recipient |
+
+`--identity-public-key` is validated as a well-formed age recipient (`age1...`)
+at argument parse time. Secret identity material (`AGE-SECRET-KEY-...`) is
+never accepted on the CLI.
+
+#### Public-key discovery (bounded)
+
+Lookup uses **public header metadata only** (`# public key: age1...` /
+`# Public key: age1...`, case-insensitive). It does **not** decrypt candidate
+identity files while searching. After a unique path match, only that file is
+loaded (with the usual permission/ownership preflight and optional passphrase
+channels). After load, seclusor verifies that a loaded identity actually
+derives the requested public key (header comments are untrusted).
+
+Search roots are **bounded** and non-recursive. Seclusor never walks `$HOME`,
+`$PATH`, or arbitrary environment-driven trees.
+
+For each config root:
+
+1. `<config>/identities/` — any non-hidden **regular file** (not a symlink)
+2. `<config>/` itself — only compatibility filenames:
+   `identity`, `identity.txt`, `identity*.txt`, `*.identity` (case-insensitive)
+
+**Config root resolution** (primary first):
+
+1. Absolute `$XDG_CONFIG_HOME/seclusor` when set (relative values are ignored)
+2. Platform primary:
+   - **macOS**: `~/Library/Application Support/seclusor`
+   - **Linux / other Unix**: `~/.config/seclusor`
+   - **Windows**: `%APPDATA%\seclusor` (fallback: `%USERPROFILE%\.config\seclusor`)
+3. **macOS compatibility root** (only when absolute `XDG_CONFIG_HOME` is
+   **unset**): `~/.config/seclusor`
+
+On macOS, setting an absolute `XDG_CONFIG_HOME` **replaces** Application
+Support as the discovery root — it is not additive, and the
+`~/.config/seclusor` compatibility root is also suppressed in that case.
+
+**Symlinks**: discovery **skips** symlinks (`DirEntry` file-type check does
+not follow links). Explicit `--identity-file` still opens the path you pass
+(and thus may follow a symlink). If you symlink an identity into a discovery
+root, `--identity-public-key` will not find it; use `--identity-file` or place
+a regular file in a documented root.
+
+**Ambiguity / no match**: two files advertising the same public key is a hard
+error listing both paths; zero matches is a hard error. There is no
+decrypt-everything fallback.
+
+```bash
+# Explicit path
+seclusor secrets list --file secrets.age --identity-file ~/.config/seclusor/identity.txt
+
+# Public-key lookup (file must live under a discovery root with a public-key comment)
+seclusor secrets list --file secrets.age --identity-public-key age1...your-recipient...
+```
+
 ## Recipients
 
 A recipient is an age public key, formatted as `age1...`. It is the public
@@ -147,9 +212,10 @@ grep -i '^# public key:' ~/.config/seclusor/identity.txt
 
 - **Encrypting** (`bundle encrypt`, `inline encrypt`): requires one or more
   `--recipient` flags. No identity needed.
-- **Decrypting** (`get`, `export-env`, `run`, `bundle decrypt`,
-  `inline decrypt`): requires `--identity-file` pointing to the
-  corresponding private key.
+- **Decrypting / encrypted reads** (`get`, `list`, `validate`, `export-env`,
+  `run`, `bundle decrypt`, `inline decrypt`): require `--identity-file` or
+  `--identity-public-key` when the input is a bundle (and for full inline
+  decryption). See [CLI reference](cli-reference.md) for validate modes.
 - **Converting** (`convert`): requires both — identity to decrypt the
   source, recipient to re-encrypt in the target format.
 

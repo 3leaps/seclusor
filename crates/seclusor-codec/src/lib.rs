@@ -71,6 +71,15 @@ impl ResolvedDocument {
             LoadMode::StructuralOnly => "structural-only",
         }
     }
+
+    /// Machine-readable source classification (`bundle`, `plaintext`, or `inline`).
+    pub fn source_token(&self) -> &'static str {
+        match self.source {
+            DocumentSource::Bundle => "bundle",
+            DocumentSource::Plaintext => "plaintext",
+            DocumentSource::Inline => "inline",
+        }
+    }
 }
 
 /// Error type for codec operations.
@@ -98,8 +107,8 @@ pub enum CodecError {
     #[error("bundle ciphertext exceeds maximum size of {max} bytes (actual: {actual})")]
     BundleCiphertextTooLarge { actual: u64, max: u64 },
 
-    /// Runtime bundle source requires identity files for decryption.
-    #[error("bundle input requires at least one identity file (--identity-file)")]
+    /// Runtime bundle source requires an identity for decryption.
+    #[error("bundle input requires an identity (--identity-file or --identity-public-key)")]
     BundleIdentityRequired,
 
     /// Prefixed inline value failed marker/base64/size structural checks.
@@ -860,6 +869,7 @@ mod tests {
         assert_eq!(resolved.source, DocumentSource::Plaintext);
         assert_eq!(resolved.mode, LoadMode::Full);
         assert_eq!(resolved.mode_token(), "full");
+        assert_eq!(resolved.source_token(), "plaintext");
         assert_eq!(resolved.secrets, secrets);
     }
 
