@@ -222,6 +222,17 @@ pub fn encrypt_inline_value(plaintext: &[u8], recipients: &[Recipient]) -> Resul
     Ok(format!("{INLINE_CIPHERTEXT_PREFIX}{encoded}"))
 }
 
+/// Validate `sec:age:v1:<base64>` encoding without decrypting.
+///
+/// Checks the prefix, base64 alphabet, encoded-length bound, and decoded
+/// ciphertext size bound. Does not attempt age decryption and does not return
+/// decoded bytes (callers should not need ciphertext material for structural
+/// validation).
+pub fn validate_inline_ciphertext_encoding(ciphertext: &str) -> Result<()> {
+    let _ = decode_inline_ciphertext(ciphertext)?;
+    Ok(())
+}
+
 /// Decrypt a `sec:age:v1:<base64>` inline value.
 pub fn decrypt_inline_value(ciphertext: &str, identities: &[Identity]) -> Result<Vec<u8>> {
     let raw = decode_inline_ciphertext(ciphertext)?;
@@ -476,6 +487,36 @@ mod tests {
         let err = decrypt_inline_value("sec:age:v1:%%%not-base64%%%", &[identity])
             .expect_err("must fail");
         assert!(matches!(err, CryptoError::InvalidInlineCiphertextEncoding));
+    }
+
+    #[test]
+    fn validate_inline_ciphertext_encoding_rejects_bad_base64_without_identity() {
+        let err = validate_inline_ciphertext_encoding("sec:age:v1:%%%not-base64%%%")
+            .expect_err("must fail");
+        assert!(matches!(err, CryptoError::InvalidInlineCiphertextEncoding));
+        assert!(!err.to_string().contains("%%%not-base64%%%"));
+    }
+
+    #[test]
+    fn validate_inline_ciphertext_encoding_accepts_well_formed() {
+        let recipient = parsed_identity().to_public();
+        let inline = encrypt_inline_value(b"ok", &[recipient]).expect("encrypt");
+        validate_inline_ciphertext_encoding(&inline).expect("shape ok");
+    }
+
+    #[test]
+    fn validate_inline_ciphertext_encoding_rejects_oversized_base64() {
+        let oversized = "A".repeat(max_base64_encoded_len(MAX_INLINE_CIPHERTEXT_BYTES) + 1);
+        let inline = format!("{INLINE_CIPHERTEXT_PREFIX}{oversized}");
+        let err = validate_inline_ciphertext_encoding(&inline).expect_err("must fail");
+        assert!(matches!(
+            err,
+            CryptoError::SizeLimitExceeded {
+                kind: "inline ciphertext (base64)",
+                ..
+            }
+        ));
+        assert!(!err.to_string().contains(&oversized[..32]));
     }
 
     #[test]
