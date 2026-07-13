@@ -9,6 +9,11 @@ all-features = true
 [advisories]
 db-path = "target/advisory-dbs"
 db-urls = ["https://github.com/RustSec/advisory-db"]
+# Transitive via age → i18n-embed-fl; no maintained upgrade path until age moves off
+# proc-macro-error2. Track upstream; drop ignore when the graph no longer pulls it.
+ignore = [
+  { id = "RUSTSEC-2026-0173", reason = "unmaintained transitive (age/i18n-embed-fl); no safe upgrade" },
+]
 
 [licenses]
 allow = [
