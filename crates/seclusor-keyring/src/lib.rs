@@ -296,11 +296,11 @@ pub fn seclusor_config_dir() -> Option<PathBuf> {
 ///
 /// On macOS, docs historically used `~/.config/seclusor/` while the platform
 /// primary is Application Support. That path is an explicit secondary root
-/// only (still non-recursive, still no home walk).
+/// only (still non-recursive, still no home walk). Empty on non-macOS.
 pub fn legacy_seclusor_config_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
     #[cfg(target_os = "macos")]
     {
+        let mut dirs = Vec::new();
         if absolute_xdg_config_home().is_none() {
             if let Some(home) = std::env::var_os("HOME") {
                 if !home.is_empty() {
@@ -308,9 +308,12 @@ pub fn legacy_seclusor_config_dirs() -> Vec<PathBuf> {
                 }
             }
         }
+        dirs
     }
-    let _ = &dirs;
-    dirs
+    #[cfg(not(target_os = "macos"))]
+    {
+        Vec::new()
+    }
 }
 
 /// Bounded identity-file search roots for public-key lookup.
