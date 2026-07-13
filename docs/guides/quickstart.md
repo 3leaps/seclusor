@@ -42,7 +42,7 @@ seclusor secrets run \
   --file secrets.age \
   --identity-file ~/.config/seclusor/identity.txt \
   --project demo \
-  --allow APP_* \
+  --allow 'APP_*' \
   -- env | grep APP_
 # You'll be prompted for the passphrase if the identity is protected
 ```

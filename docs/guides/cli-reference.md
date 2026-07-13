@@ -163,8 +163,39 @@ seclusor secrets get --file secrets.age --identity-file ./identity.txt --project
 seclusor secrets list --file secrets.age --identity-file ./identity.txt --project demo
 seclusor secrets validate --file secrets-inline.json
 seclusor secrets validate --file secrets.age --identity-public-key age1...
-seclusor secrets export-env --file secrets.age --identity-file ./identity.txt --project demo --format export
-seclusor secrets run --file secrets.age --identity-file ./identity.txt --project demo --allow APP_API_KEY -- env | grep APP_API_KEY
+seclusor secrets export-env --file secrets.age --identity-file ./identity.txt --project demo --format export --allow 'APP_*'
+seclusor secrets run --file secrets.age --identity-file ./identity.txt --project demo --allow 'APP_API_KEY' -- env | grep APP_API_KEY
+```
+
+#### `secrets export-env --format export` (shell) safety
+
+Shell emission is the highest-risk export path (`eval "$(...)"` loads values
+into the current shell). These rules apply **only** to `--format export`
+(dotenv and JSON are unchanged):
+
+- **`--allow` required** — at least one pattern; empty allow does **not**
+  default to `*` for shell format (refuses "export everything"). Quote glob
+  patterns in the shell (e.g. `--allow 'APP_*'`) so zsh/bash do not expand
+  them as pathnames.
+- **TTY refuse without `--force`** — writing secret values to a terminal is
+  refused unless `--force` is set. Pipes/redirects (the normal `eval`
+  pattern) are not TTYs and do not need `--force`.
+- **Completion summary only under `--verbose`** — default success keeps
+  stderr empty (ADR-0006). Verbose may print `Exported N variables from
+<project>` and may echo allow patterns; patterns are not echoed by default.
+- **Quoting** — values are double-quoted with escapes for `\`, `"`, `$`, and
+  backticks; newlines are preserved inside quotes.
+
+```bash
+# Typical (piped; no --force needed):
+eval "$(seclusor secrets export-env --file secrets.age \
+  --identity-file ./identity.txt --project demo \
+  --format export --allow 'APP_*')"
+
+# Interactive TTY (values visible — requires deliberate --force):
+seclusor secrets export-env --file secrets.age \
+  --identity-file ./identity.txt --project demo \
+  --format export --allow 'APP_*' --force
 ```
 
 ### `secrets run` and shell features

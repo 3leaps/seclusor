@@ -325,10 +325,30 @@ pub(crate) struct ExportEnvArgs {
         help = "Include ref credentials as literal strings (default: excluded)"
     )]
     pub(crate) emit_ref: bool,
-    #[arg(long = "allow", help = "Glob pattern for keys to export (repeatable)")]
+    #[arg(
+        long = "allow",
+        help = "Glob pattern for keys to export (repeatable). Required for \
+                --format export (shell); optional for dotenv/json (default: all)"
+    )]
     pub(crate) allow: Vec<String>,
     #[arg(long = "deny", help = "Glob pattern for keys to exclude (repeatable)")]
     pub(crate) deny: Vec<String>,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Allow --format export to write to a TTY (values would be visible). \
+                Not required when stdout is a pipe or redirect (e.g. eval)"
+    )]
+    pub(crate) force: bool,
+    #[arg(
+        long,
+        short = 'v',
+        default_value_t = false,
+        help = "For --format export: print a completion summary on stderr \
+                (variable count + project). Does not echo --allow patterns \
+                unless this flag is set"
+    )]
+    pub(crate) verbose: bool,
     #[command(flatten)]
     pub(crate) identities: IdentityArgs,
     #[command(flatten)]

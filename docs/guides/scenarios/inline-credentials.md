@@ -87,7 +87,7 @@ seclusor secrets run \
   --file secrets-inline.json \
   --identity-file ~/.config/seclusor/identity.txt \
   --project myapp \
-  --allow MYAPP_* \
+  --allow 'MYAPP_*' \
   -- env | grep MYAPP_
 ```
 
