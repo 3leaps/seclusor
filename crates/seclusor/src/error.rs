@@ -9,6 +9,19 @@ use thiserror::Error;
 pub(crate) enum CliError {
     #[error("{0}")]
     Message(String),
+    /// Write command refused a positively identified encrypted target (bundle or inline).
+    ///
+    /// Display must never include document content — only path and source classification.
+    #[error(
+        "refusing to write into encrypted secrets file at {path} (source: {source_kind}); \
+         encrypted write support is not available in this version. \
+         Use a plaintext secrets file, or decrypt/convert first."
+    )]
+    EncryptedWriteUnsupported {
+        path: String,
+        /// Machine-readable source token: `bundle` or `inline`.
+        source_kind: &'static str,
+    },
     #[error(transparent)]
     Core(#[from] SeclusorError),
     #[error(transparent)]

@@ -13,19 +13,29 @@ use crate::cli::{
 use crate::env_support::resolve_export_env_vars;
 use crate::error::{CliError, CliResult};
 use crate::io::{
-    read_file_with_limit, read_runtime_document_file, read_runtime_secrets_file, read_secrets_file,
-    write_secrets_file,
+    probe_write_target, read_file_with_limit, read_runtime_document_file,
+    read_runtime_secrets_file, refuse_encrypted_write, secrets_from_bytes, write_secrets_file,
+    WriteTargetProbe,
 };
-use crate::lenient::{handle_unset_lenient, should_use_lenient_unset};
+use crate::lenient::{handle_unset_lenient_bytes, should_use_lenient_unset};
 use crate::resolve::resolve_identities;
 use crate::REDACTED_OUTPUT;
 
 pub(crate) fn handle_init(args: InitArgs) -> CliResult<()> {
-    if args.file.exists() && !args.force {
-        return Err(CliError::Message(format!(
-            "secrets file already exists at {}; use --force to overwrite",
-            args.file.display()
-        )));
+    if args.file.exists() {
+        if !args.force {
+            return Err(CliError::Message(format!(
+                "secrets file already exists at {}; use --force to overwrite",
+                args.file.display()
+            )));
+        }
+        // Refuse overwriting a positively identified encrypted target.
+        match probe_write_target(&args.file)? {
+            WriteTargetProbe::Encrypted { source } => {
+                return Err(refuse_encrypted_write(&args.file, source));
+            }
+            WriteTargetProbe::Plaintext(_) | WriteTargetProbe::NotEncrypted(_) => {}
+        }
     }
 
     let mut secrets = SecretsFile::new(&args.project);
@@ -38,7 +48,7 @@ pub(crate) fn handle_init(args: InitArgs) -> CliResult<()> {
 }
 
 pub(crate) fn handle_set(args: SetArgs) -> CliResult<()> {
-    let mut secrets = read_secrets_file(&args.file)?;
+    let mut secrets = load_plaintext_secrets_for_write(&args.file)?;
     let existing_description = get_credential(&secrets, args.project.as_deref(), &args.key)
         .ok()
         .and_then(|credential| credential.description.clone());
@@ -118,24 +128,48 @@ pub(crate) fn handle_list(args: ListArgs) -> CliResult<()> {
 }
 
 pub(crate) fn handle_unset(args: UnsetArgs) -> CliResult<()> {
-    match read_secrets_file(&args.file) {
-        Ok(mut secrets) => {
-            let _ = get_credential(&secrets, args.project.as_deref(), &args.key)?;
-            let removed = unset_credential(&mut secrets, args.project.as_deref(), &args.key)?;
-            if !removed {
-                return Err(CliError::Message("credential was not removed".to_string()));
-            }
-            validate_strict(&secrets)?;
+    match probe_write_target(&args.file)? {
+        WriteTargetProbe::Encrypted { source } => Err(refuse_encrypted_write(&args.file, source)),
+        WriteTargetProbe::Plaintext(mut secrets) => {
+            unset_strict(&mut secrets, &args)?;
             write_secrets_file(&args.file, &secrets, false)?;
             println!("ok");
             Ok(())
         }
-        Err(err)
-            if should_use_lenient_unset(&args.file, args.project.as_deref(), &args.key, &err) =>
-        {
-            handle_unset_lenient(args)
-        }
-        Err(err) => Err(err),
+        WriteTargetProbe::NotEncrypted(bytes) => match secrets_from_bytes(&bytes) {
+            Ok(mut secrets) => {
+                unset_strict(&mut secrets, &args)?;
+                write_secrets_file(&args.file, &secrets, false)?;
+                println!("ok");
+                Ok(())
+            }
+            Err(err)
+                if should_use_lenient_unset(&bytes, args.project.as_deref(), &args.key, &err) =>
+            {
+                // Same bounded bytes through eligibility and mutation (no path reopen).
+                handle_unset_lenient_bytes(args, bytes)
+            }
+            Err(err) => Err(err),
+        },
+    }
+}
+
+fn unset_strict(secrets: &mut SecretsFile, args: &UnsetArgs) -> CliResult<()> {
+    let _ = get_credential(secrets, args.project.as_deref(), &args.key)?;
+    let removed = unset_credential(secrets, args.project.as_deref(), &args.key)?;
+    if !removed {
+        return Err(CliError::Message("credential was not removed".to_string()));
+    }
+    validate_strict(secrets)?;
+    Ok(())
+}
+
+/// Refuse positively encrypted write targets; otherwise load plaintext.
+fn load_plaintext_secrets_for_write(path: &std::path::Path) -> CliResult<SecretsFile> {
+    match probe_write_target(path)? {
+        WriteTargetProbe::Plaintext(secrets) => Ok(secrets),
+        WriteTargetProbe::Encrypted { source } => Err(refuse_encrypted_write(path, source)),
+        WriteTargetProbe::NotEncrypted(bytes) => secrets_from_bytes(&bytes),
     }
 }
 
@@ -256,7 +290,7 @@ pub(crate) fn enforce_export_shell_safety(
 }
 
 pub(crate) fn handle_import_env(args: ImportEnvArgs) -> CliResult<()> {
-    let mut secrets = read_secrets_file(&args.file)?;
+    let mut secrets = load_plaintext_secrets_for_write(&args.file)?;
 
     let prefix = args
         .prefix
@@ -1486,5 +1520,277 @@ mod tests {
             None => std::env::remove_var("XDG_CONFIG_HOME"),
         }
         result.expect("list via identity public key");
+    }
+
+    // --- Encrypted write-target guard (fail-closed) ---
+
+    fn assert_bytes_unchanged(path: &std::path::Path, before: &[u8]) {
+        let after = fs::read(path).expect("re-read target");
+        assert_eq!(
+            after, before,
+            "target file must remain byte-identical on refuse"
+        );
+    }
+
+    fn assert_encrypted_write_refused(err: &CliError, expected_source: &str) {
+        match err {
+            CliError::EncryptedWriteUnsupported { path, source_kind } => {
+                assert_eq!(*source_kind, expected_source);
+                assert!(!path.is_empty());
+            }
+            other => panic!("expected EncryptedWriteUnsupported, got {other:?}"),
+        }
+        let rendered = err.to_string();
+        assert!(rendered.contains("refusing to write into encrypted secrets file"));
+        assert!(rendered.contains(&format!("source: {expected_source}")));
+        assert!(rendered.contains("not available in this version"));
+        // Error output must not include plaintext or ciphertext content.
+        assert!(!rendered.contains("sk-123"));
+        assert!(!rendered.contains(seclusor_core::constants::INLINE_CIPHERTEXT_PREFIX));
+        assert!(!rendered.contains("age-encryption.org"));
+        let debug = format!("{err:?}");
+        assert!(!debug.contains("sk-123"));
+        assert!(!debug.contains(seclusor_core::constants::INLINE_CIPHERTEXT_PREFIX));
+    }
+
+    #[test]
+    fn write_guard_set_refuses_inline_encrypted_and_leaves_file_unchanged() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (inline, _identity) = write_inline_encrypted_file(dir.path());
+        let before = fs::read(&inline).expect("read before");
+
+        let err = handle_set(SetArgs {
+            file: inline.clone(),
+            project: Some("demo".to_string()),
+            key: "API_KEY".to_string(),
+            credential_type: "secret".to_string(),
+            value: Some("plaintext-injection".to_string()),
+            reference: None,
+            description: None,
+            create_project: false,
+        })
+        .expect_err("must refuse inline write");
+
+        assert_encrypted_write_refused(&err, "inline");
+        assert_bytes_unchanged(&inline, &before);
+    }
+
+    #[test]
+    fn write_guard_unset_import_init_force_refuse_inline_encrypted() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (inline, _identity) = write_inline_encrypted_file(dir.path());
+        let before = fs::read(&inline).expect("read before");
+
+        let unset_err = handle_unset(UnsetArgs {
+            file: inline.clone(),
+            project: Some("demo".to_string()),
+            key: "API_KEY".to_string(),
+        })
+        .expect_err("unset must refuse");
+        assert_encrypted_write_refused(&unset_err, "inline");
+        assert_bytes_unchanged(&inline, &before);
+
+        let import_err = handle_import_env(ImportEnvArgs {
+            file: inline.clone(),
+            project: Some("demo".to_string()),
+            prefix: Some("APP_".to_string()),
+            strip_prefix: false,
+            credential_type: "secret".to_string(),
+            create_project: false,
+            dotenv_file: None,
+        })
+        .expect_err("import-env must refuse");
+        assert_encrypted_write_refused(&import_err, "inline");
+        assert_bytes_unchanged(&inline, &before);
+
+        let init_err = handle_init(InitArgs {
+            file: inline.clone(),
+            project: "other".to_string(),
+            env_prefix: None,
+            description: None,
+            force: true,
+        })
+        .expect_err("init --force must refuse encrypted target");
+        assert_encrypted_write_refused(&init_err, "inline");
+        assert_bytes_unchanged(&inline, &before);
+    }
+
+    #[test]
+    fn write_guard_set_refuses_bundle_binary_and_leaves_file_unchanged() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("plain.json");
+        let bundle = dir.path().join("secrets.age");
+        write_secrets_file(&input, &fixture_secrets(), true).expect("write plain");
+        handle_bundle_encrypt(BundleEncryptArgs {
+            input,
+            output: bundle.clone(),
+            recipients: RecipientArgs {
+                recipients: vec![fixture_recipient_string()],
+                recipient_file: None,
+                recipient_env_var: None,
+            },
+        })
+        .expect("encrypt bundle");
+        let before = fs::read(&bundle).expect("read before");
+
+        let err = handle_set(SetArgs {
+            file: bundle.clone(),
+            project: Some("demo".to_string()),
+            key: "API_KEY".to_string(),
+            credential_type: "secret".to_string(),
+            value: Some("nope".to_string()),
+            reference: None,
+            description: None,
+            create_project: false,
+        })
+        .expect_err("must refuse bundle write");
+
+        assert_encrypted_write_refused(&err, "bundle");
+        assert_bytes_unchanged(&bundle, &before);
+    }
+
+    #[test]
+    fn write_guard_set_refuses_armored_bundle_marker() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("armored.age");
+        // Marker-only is enough (bundle marker wins even if payload is garbage).
+        let armored = b"-----BEGIN AGE ENCRYPTED FILE-----\nnot-a-real-payload\n";
+        fs::write(&path, armored).expect("write armored");
+        let before = armored.to_vec();
+
+        let err = handle_set(SetArgs {
+            file: path.clone(),
+            project: Some("demo".to_string()),
+            key: "K".to_string(),
+            credential_type: "secret".to_string(),
+            value: Some("x".to_string()),
+            reference: None,
+            description: None,
+            create_project: false,
+        })
+        .expect_err("must refuse armored marker");
+
+        assert_encrypted_write_refused(&err, "bundle");
+        assert_bytes_unchanged(&path, &before);
+    }
+
+    #[test]
+    fn write_guard_unset_refuses_malformed_object_inline_value_before_lenient() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("malformed-inline.json");
+        // Invalid schema_version so strict parse fails; credential value still carries marker.
+        write_raw_json(
+            &path,
+            r#"{
+              "schema_version": "v9.9.9",
+              "projects": [{
+                "project_slug": "demo",
+                "credentials": {
+                  "API_KEY": {
+                    "type": "secret",
+                    "value": "sec:age:v1:dGVzdA"
+                  }
+                }
+              }]
+            }"#,
+        );
+        let before = fs::read(&path).expect("read before");
+
+        let err = handle_unset(UnsetArgs {
+            file: path.clone(),
+            project: Some("demo".to_string()),
+            key: "API_KEY".to_string(),
+        })
+        .expect_err("must refuse before lenient path");
+
+        assert_encrypted_write_refused(&err, "inline");
+        assert_bytes_unchanged(&path, &before);
+    }
+
+    #[test]
+    fn write_guard_unset_refuses_bare_string_inline_credential_before_lenient() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("bare-string-inline.json");
+        // Bare-string credential is malformed model shape but carries the inline marker.
+        write_raw_json(
+            &path,
+            r#"{
+              "schema_version": "v1.0.0",
+              "projects": [{
+                "project_slug": "demo",
+                "credentials": {
+                  "API_KEY": "sec:age:v1:dGVzdA",
+                  "OTHER": {"type":"secret","value":"plain"}
+                }
+              }]
+            }"#,
+        );
+        let before = fs::read(&path).expect("read before");
+
+        let err = handle_unset(UnsetArgs {
+            file: path.clone(),
+            project: Some("demo".to_string()),
+            key: "API_KEY".to_string(),
+        })
+        .expect_err("must refuse bare-string encrypted credential");
+
+        assert_encrypted_write_refused(&err, "inline");
+        assert_bytes_unchanged(&path, &before);
+    }
+
+    #[test]
+    fn write_guard_prefix_in_description_does_not_misclassify_as_encrypted() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("desc-prefix.json");
+        let mut secrets = fixture_secrets();
+        secrets.projects[0]
+            .credentials
+            .get_mut("API_KEY")
+            .unwrap()
+            .description = Some("mentions sec:age:v1: but is not ciphertext".to_string());
+        write_secrets_file(&path, &secrets, true).expect("write");
+
+        handle_set(SetArgs {
+            file: path.clone(),
+            project: Some("demo".to_string()),
+            key: "API_KEY".to_string(),
+            credential_type: "secret".to_string(),
+            value: Some("updated-plain".to_string()),
+            reference: None,
+            description: None,
+            create_project: false,
+        })
+        .expect("description text must not trigger encrypted refuse");
+
+        let loaded = read_secrets_file(&path).expect("reload");
+        assert_eq!(
+            loaded.projects[0].credentials["API_KEY"].value.as_deref(),
+            Some("updated-plain")
+        );
+    }
+
+    #[test]
+    fn write_guard_plaintext_set_still_mutates() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("secrets.json");
+        write_secrets_file(&path, &fixture_secrets(), true).expect("write");
+
+        handle_set(SetArgs {
+            file: path.clone(),
+            project: Some("demo".to_string()),
+            key: "API_KEY".to_string(),
+            credential_type: "secret".to_string(),
+            value: Some("new-value".to_string()),
+            reference: None,
+            description: None,
+            create_project: false,
+        })
+        .expect("plaintext set still works");
+
+        let loaded = read_secrets_file(&path).expect("reload");
+        assert_eq!(
+            loaded.projects[0].credentials["API_KEY"].value.as_deref(),
+            Some("new-value")
+        );
     }
 }
