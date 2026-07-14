@@ -2,7 +2,13 @@
 
 CGo wrapper for `crates/seclusor-ffi`.
 
-Available in `v0.1.2`:
+Secrets handles:
+
+- `LoadSecretsJSON(string)` — plaintext secrets document
+- `LoadSecretsBundle([]byte, *KeyringHandle)` — age bundle ciphertext (full decrypt)
+- `LoadSecretsInline([]byte, *KeyringHandle)` — inline-encrypted JSON (full decrypt)
+
+Signing (from earlier releases):
 
 - Ed25519 signing key generation
 - public-key derivation from the canonical 32-byte seed

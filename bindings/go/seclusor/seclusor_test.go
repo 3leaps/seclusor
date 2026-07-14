@@ -5,8 +5,37 @@ package seclusor
 import (
 	"bytes"
 	"encoding/hex"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
+
+func testDataPath(t *testing.T, name string) string {
+	t.Helper()
+	p := filepath.Join("testdata", name)
+	if _, err := os.Stat(p); err != nil {
+		t.Fatalf("testdata %s: %v", name, err)
+	}
+	return p
+}
+
+// copyIdentityFixture materializes a tracked identity fixture under t.TempDir()
+// with mode 0600. Git stores ordinary files as 0644 on checkout, which
+// AddIdentityFile correctly rejects on Unix.
+func copyIdentityFixture(t *testing.T, name string) string {
+	t.Helper()
+	src := testDataPath(t, name)
+	data, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatalf("read identity fixture %s: %v", name, err)
+	}
+	dst := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(dst, data, 0o600); err != nil {
+		t.Fatalf("write identity fixture %s: %v", name, err)
+	}
+	return dst
+}
 
 func TestSecretsHandleListGetExport(t *testing.T) {
 	jsonText := `{"schema_version":"v1.0.0","env_prefix":"APP_","projects":[{"project_slug":"demo","credentials":{"API_KEY":{"type":"secret","value":"sk-123"}}}]}`
@@ -188,5 +217,165 @@ func TestWipeBytesZeroesSlice(t *testing.T) {
 	WipeBytes(value)
 	if !bytes.Equal(value, []byte{0, 0, 0, 0}) {
 		t.Fatalf("expected wiped slice, got %#v", value)
+	}
+}
+
+func openTestKeyring(t *testing.T) *KeyringHandle {
+	t.Helper()
+	kr, err := NewKeyringHandle()
+	if err != nil {
+		t.Fatalf("NewKeyringHandle: %v", err)
+	}
+	if err := kr.AddIdentityFile(copyIdentityFixture(t, "test-identity.txt")); err != nil {
+		t.Fatalf("AddIdentityFile: %v", err)
+	}
+	return kr
+}
+
+func assertRevealedAPIKey(t *testing.T, h *SecretsHandle) {
+	t.Helper()
+	keys, err := h.List("demo")
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(keys) != 1 || keys[0] != "API_KEY" {
+		t.Fatalf("unexpected keys: %#v", keys)
+	}
+	cred, err := h.Get("demo", "API_KEY", true)
+	if err != nil {
+		t.Fatalf("Get reveal: %v", err)
+	}
+	if cred.Value == nil || *cred.Value != "sk-123" || cred.Redacted {
+		t.Fatalf("unexpected revealed credential: %#v", cred)
+	}
+	vars, err := h.ExportEnv("demo", "APP_", false)
+	if err != nil {
+		t.Fatalf("ExportEnv: %v", err)
+	}
+	if len(vars) != 1 || vars[0].Key != "APP_API_KEY" || vars[0].Value != "sk-123" {
+		t.Fatalf("unexpected export: %#v", vars)
+	}
+}
+
+func TestLoadSecretsBundleRoundtrip(t *testing.T) {
+	data, err := os.ReadFile(testDataPath(t, "secrets.age"))
+	if err != nil {
+		t.Fatalf("read bundle: %v", err)
+	}
+	if !bytes.Contains(data, []byte("age-encryption.org")) {
+		t.Fatalf("bundle fixture missing age header")
+	}
+	// Pointer+length must tolerate embedded NULs (C strings cannot).
+	if !bytes.Contains(data, []byte{0}) {
+		t.Fatalf("bundle fixture must contain at least one NUL byte for pointer+length coverage")
+	}
+	kr := openTestKeyring(t)
+	defer kr.Close()
+
+	h, err := LoadSecretsBundle(data, kr)
+	if err != nil {
+		t.Fatalf("LoadSecretsBundle: %v", err)
+	}
+	defer h.Close()
+	assertRevealedAPIKey(t, h)
+}
+
+func TestLoadSecretsInlineRoundtrip(t *testing.T) {
+	data, err := os.ReadFile(testDataPath(t, "inline-encrypted.json"))
+	if err != nil {
+		t.Fatalf("read inline: %v", err)
+	}
+	kr := openTestKeyring(t)
+	defer kr.Close()
+
+	h, err := LoadSecretsInline(data, kr)
+	if err != nil {
+		t.Fatalf("LoadSecretsInline: %v", err)
+	}
+	defer h.Close()
+	assertRevealedAPIKey(t, h)
+}
+
+func TestLoadSecretsEncryptedFailures(t *testing.T) {
+	bundle, err := os.ReadFile(testDataPath(t, "secrets.age"))
+	if err != nil {
+		t.Fatalf("read bundle: %v", err)
+	}
+	inline, err := os.ReadFile(testDataPath(t, "inline-encrypted.json"))
+	if err != nil {
+		t.Fatalf("read inline: %v", err)
+	}
+	plain, err := os.ReadFile(testDataPath(t, "plaintext.json"))
+	if err != nil {
+		t.Fatalf("read plaintext: %v", err)
+	}
+
+	emptyKR, err := NewKeyringHandle()
+	if err != nil {
+		t.Fatalf("empty keyring: %v", err)
+	}
+	defer emptyKR.Close()
+
+	if _, err := LoadSecretsBundle(bundle, emptyKR); err == nil {
+		t.Fatalf("expected empty keyring bundle load to fail")
+	}
+	if _, err := LoadSecretsInline(inline, emptyKR); err == nil {
+		t.Fatalf("expected empty keyring inline load to fail")
+	}
+	if _, err := LoadSecretsBundle(nil, emptyKR); err == nil {
+		t.Fatalf("expected empty data to fail")
+	}
+	if _, err := LoadSecretsBundle(bundle, nil); err == nil {
+		t.Fatalf("expected nil keyring to fail")
+	}
+
+	kr := openTestKeyring(t)
+	defer kr.Close()
+
+	// Named constructor rejects the other codec / plaintext.
+	if _, err := LoadSecretsBundle(inline, kr); err == nil {
+		t.Fatalf("bundle loader must reject inline JSON")
+	}
+	if _, err := LoadSecretsInline(bundle, kr); err == nil {
+		t.Fatalf("inline loader must reject bundle")
+	}
+	if _, err := LoadSecretsInline(plain, kr); err == nil {
+		t.Fatalf("inline loader must reject plaintext JSON")
+	}
+
+	// Closed keyring.
+	kr2 := openTestKeyring(t)
+	kr2.Close()
+	if _, err := LoadSecretsBundle(bundle, kr2); err == nil {
+		t.Fatalf("closed keyring must fail")
+	}
+
+	// Wrong identity: fails closed without leaking secrets or ciphertext body.
+	wrongKR, err := NewKeyringHandle()
+	if err != nil {
+		t.Fatalf("NewKeyringHandle wrong: %v", err)
+	}
+	defer wrongKR.Close()
+	if err := wrongKR.AddIdentityFile(copyIdentityFixture(t, "wrong-identity.txt")); err != nil {
+		t.Fatalf("AddIdentityFile wrong: %v", err)
+	}
+	_, err = LoadSecretsBundle(bundle, wrongKR)
+	if err == nil {
+		t.Fatalf("expected wrong identity to fail")
+	}
+	msg := err.Error()
+	for _, leak := range []string{"sk-123", "AGE-SECRET-KEY-", "age-encryption.org"} {
+		if strings.Contains(msg, leak) {
+			t.Fatalf("wrong-identity error leaked sensitive material %q: %q", leak, msg)
+		}
+	}
+
+	// Wrong-codec error must not include the secret value either.
+	_, err = LoadSecretsBundle(inline, kr)
+	if err == nil {
+		t.Fatalf("expected wrong-codec error")
+	}
+	if strings.Contains(err.Error(), "sk-123") {
+		t.Fatalf("error leaked secret: %q", err.Error())
 	}
 }

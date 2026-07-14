@@ -10,8 +10,11 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::slice;
 
-use seclusor_codec::{decrypt_bundle_from_file, encrypt_bundle_to_file, CodecError};
-use seclusor_core::constants::MAX_SECRETS_DOC_BYTES;
+use seclusor_codec::{
+    decrypt_bundle_from_file, encrypt_bundle_to_file, resolve_runtime_document, CodecError,
+    DocumentSource, LoadMode,
+};
+use seclusor_core::constants::{MAX_BUNDLE_CIPHERTEXT_BYTES, MAX_SECRETS_DOC_BYTES};
 use seclusor_core::crud::{get_credential, list_credential_keys};
 use seclusor_core::env::{export_env, EnvExportOptions};
 use seclusor_core::error::sanitize_serde_json_error_message;
@@ -359,7 +362,9 @@ pub unsafe extern "C" fn seclusor_secrets_handle_new_from_json(
 ///
 /// # Safety
 /// `handle` must be either null or a pointer previously returned by
-/// `seclusor_secrets_handle_new_from_json` and not already freed.
+/// `seclusor_secrets_handle_new_from_json`,
+/// `seclusor_secrets_handle_new_from_bundle`, or
+/// `seclusor_secrets_handle_new_from_inline`, and not already freed.
 #[no_mangle]
 pub unsafe extern "C" fn seclusor_secrets_handle_free(handle: *mut SeclusorSecretsHandle) {
     if handle.is_null() {
@@ -367,6 +372,134 @@ pub unsafe extern "C" fn seclusor_secrets_handle_free(handle: *mut SeclusorSecre
     }
     // SAFETY: handle must be allocated by Box::into_raw in this library.
     drop(unsafe { Box::from_raw(handle) });
+}
+
+/// Open a secrets handle from whole-document age **bundle** ciphertext.
+///
+/// Input is raw bytes (`bytes` + `len`); do not pass a C string (NUL may appear
+/// in binary age ciphertext). Decryption uses identities currently loaded in
+/// `keyring`. On success the handle always contains a **fully decrypted**
+/// document (`LoadMode::Full`); structural-only / wrong-codec inputs fail.
+///
+/// # Safety
+/// - `bytes` must be non-null when `len > 0` and point to `len` readable bytes
+///   valid for the duration of the call.
+/// - `keyring` must be a valid non-null keyring handle; identities are borrowed
+///   only for this call (do not free/mutate the keyring concurrently).
+/// - `out_handle` must be a valid non-null pointer to storage for a handle
+///   pointer; set to null on entry and on every failure path.
+#[no_mangle]
+pub unsafe extern "C" fn seclusor_secrets_handle_new_from_bundle(
+    bytes: *const u8,
+    len: usize,
+    keyring: *const SeclusorKeyringHandle,
+    out_handle: *mut *mut SeclusorSecretsHandle,
+) -> SeclusorResult {
+    secrets_handle_new_from_encrypted(bytes, len, keyring, out_handle, DocumentSource::Bundle)
+}
+
+/// Open a secrets handle from **inline-encrypted** secrets JSON bytes.
+///
+/// Input is raw bytes (`bytes` + `len`). Decryption uses identities currently
+/// loaded in `keyring`. On success the handle always contains a **fully
+/// decrypted** document; structural-only opens and non-inline codecs fail.
+/// Plaintext JSON must use `seclusor_secrets_handle_new_from_json`.
+///
+/// # Safety
+/// Same contract as [`seclusor_secrets_handle_new_from_bundle`].
+#[no_mangle]
+pub unsafe extern "C" fn seclusor_secrets_handle_new_from_inline(
+    bytes: *const u8,
+    len: usize,
+    keyring: *const SeclusorKeyringHandle,
+    out_handle: *mut *mut SeclusorSecretsHandle,
+) -> SeclusorResult {
+    secrets_handle_new_from_encrypted(bytes, len, keyring, out_handle, DocumentSource::Inline)
+}
+
+fn secrets_handle_new_from_encrypted(
+    bytes: *const u8,
+    len: usize,
+    keyring: *const SeclusorKeyringHandle,
+    out_handle: *mut *mut SeclusorSecretsHandle,
+    expected: DocumentSource,
+) -> SeclusorResult {
+    match with_ffi_boundary(|| {
+        require_non_null(out_handle, "out_handle")?;
+        // SAFETY: out_handle validated non-null.
+        unsafe { *out_handle = ptr::null_mut() };
+
+        if len == 0 {
+            return Err(fail(
+                SeclusorResult::InvalidArgument,
+                "encrypted secrets input must not be empty",
+            ));
+        }
+        // Bound ciphertext/document size before any decrypt work (parity with
+        // file-path loaders and the oversized-input acceptance contract).
+        let max_input = match expected {
+            DocumentSource::Bundle => MAX_BUNDLE_CIPHERTEXT_BYTES,
+            DocumentSource::Inline | DocumentSource::Plaintext => MAX_SECRETS_DOC_BYTES,
+        };
+        if len > max_input {
+            return Err(match expected {
+                DocumentSource::Bundle => CodecError::BundleCiphertextTooLarge {
+                    actual: len as u64,
+                    max: MAX_BUNDLE_CIPHERTEXT_BYTES as u64,
+                }
+                .into(),
+                DocumentSource::Inline | DocumentSource::Plaintext => {
+                    SeclusorError::DocumentTooLarge {
+                        actual: len,
+                        max: MAX_SECRETS_DOC_BYTES,
+                    }
+                    .into()
+                }
+            });
+        }
+        require_non_null(keyring, "keyring")?;
+        let input = bytes_input(bytes, len, "bytes")?;
+        // SAFETY: keyring validated non-null; immutable borrow for this call only.
+        let keyring_ref = unsafe { &*keyring };
+        if keyring_ref.identities.is_empty() {
+            return Err(fail(
+                SeclusorResult::ValidationError,
+                "keyring has no identities loaded",
+            ));
+        }
+
+        let resolved = resolve_runtime_document(input, &keyring_ref.identities)?;
+        if resolved.source != expected {
+            let msg = match expected {
+                DocumentSource::Bundle => {
+                    "input is not bundle ciphertext (use the matching load API or LoadSecretsJSON for plaintext)"
+                }
+                DocumentSource::Inline => {
+                    "input is not inline-encrypted secrets JSON (use the matching load API or LoadSecretsJSON for plaintext)"
+                }
+                DocumentSource::Plaintext => "unexpected document source",
+            };
+            return Err(fail(SeclusorResult::CodecError, msg));
+        }
+        // Full-decrypt-only: never box structural-only (would expose sec:age:v1:
+        // ciphertext through seclusor_secrets_get reveal).
+        if resolved.mode != LoadMode::Full {
+            return Err(fail(
+                SeclusorResult::ValidationError,
+                "encrypted load requires full decryption",
+            ));
+        }
+
+        let boxed = Box::new(SeclusorSecretsHandle {
+            secrets: resolved.secrets,
+        });
+        // SAFETY: out_handle validated non-null.
+        unsafe { *out_handle = Box::into_raw(boxed) };
+        Ok(())
+    }) {
+        Ok(()) => SeclusorResult::Ok,
+        Err(code) => code,
+    }
 }
 
 /// Create an empty keyring handle.
@@ -1360,5 +1493,401 @@ mod tests {
 
         // SAFETY: handle was allocated by this library and not freed yet.
         unsafe { seclusor_keyring_handle_free(keyring) };
+    }
+
+    fn fixture_secrets() -> SecretsFile {
+        let mut secrets = SecretsFile::new("demo");
+        secrets.env_prefix = Some("APP_".to_string());
+        secrets.projects[0].credentials.insert(
+            "API_KEY".to_string(),
+            seclusor_core::Credential::with_value("secret", "sk-123"),
+        );
+        secrets
+    }
+
+    fn keyring_with_test_identity() -> *mut SeclusorKeyringHandle {
+        let dir = tempfile::tempdir().expect("temp");
+        let path = dir.path().join("identity.txt");
+        write_identity_file(&path, TEST_IDENTITY);
+        let mut keyring: *mut SeclusorKeyringHandle = ptr::null_mut();
+        assert_eq!(
+            unsafe { seclusor_keyring_handle_new(&mut keyring) },
+            SeclusorResult::Ok
+        );
+        let path_c = cstring(path.to_str().expect("utf8"));
+        assert_eq!(
+            unsafe { seclusor_keyring_handle_add_identity_file(keyring, path_c.as_ptr()) },
+            SeclusorResult::Ok
+        );
+        // Identity material is already in the keyring; tempdir may drop.
+        keyring
+    }
+
+    #[test]
+    fn secrets_handle_from_bundle_full_decrypt_roundtrip() {
+        let secrets = fixture_secrets();
+        let identity = TEST_IDENTITY
+            .parse::<seclusor_crypto::Identity>()
+            .expect("parse");
+        let ciphertext =
+            seclusor_codec::encrypt_bundle(&secrets, &[identity.to_public()]).expect("encrypt");
+        let keyring = keyring_with_test_identity();
+        let mut handle: *mut SeclusorSecretsHandle = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                seclusor_secrets_handle_new_from_bundle(
+                    ciphertext.as_ptr(),
+                    ciphertext.len(),
+                    keyring,
+                    &mut handle,
+                )
+            },
+            SeclusorResult::Ok
+        );
+        assert!(!handle.is_null());
+
+        let key = cstring("API_KEY");
+        let mut get_ptr: *mut c_char = ptr::null_mut();
+        assert_eq!(
+            unsafe { seclusor_secrets_get(handle, ptr::null(), key.as_ptr(), 1, &mut get_ptr) },
+            SeclusorResult::Ok
+        );
+        let got: serde_json::Value = serde_json::from_str(&take_json(get_ptr)).expect("parse get");
+        assert_eq!(got["value"], "sk-123");
+        assert_eq!(got["redacted"], false);
+
+        let mut export_ptr: *mut c_char = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                seclusor_secrets_export_env(handle, ptr::null(), ptr::null(), 0, &mut export_ptr)
+            },
+            SeclusorResult::Ok
+        );
+        let env: serde_json::Value = serde_json::from_str(&take_json(export_ptr)).expect("export");
+        assert_eq!(env[0]["value"], "sk-123");
+
+        unsafe {
+            seclusor_secrets_handle_free(handle);
+            seclusor_keyring_handle_free(keyring);
+        }
+    }
+
+    #[test]
+    fn secrets_handle_from_inline_full_decrypt_roundtrip() {
+        let secrets = fixture_secrets();
+        let identity = TEST_IDENTITY
+            .parse::<seclusor_crypto::Identity>()
+            .expect("parse");
+        let encrypted =
+            seclusor_codec::encrypt_inline(&secrets, &[identity.to_public()]).expect("inline");
+        let json = serde_json::to_vec(&encrypted).expect("serialize");
+        let keyring = keyring_with_test_identity();
+        let mut handle: *mut SeclusorSecretsHandle = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                seclusor_secrets_handle_new_from_inline(
+                    json.as_ptr(),
+                    json.len(),
+                    keyring,
+                    &mut handle,
+                )
+            },
+            SeclusorResult::Ok
+        );
+        assert!(!handle.is_null());
+
+        let key = cstring("API_KEY");
+        let mut get_ptr: *mut c_char = ptr::null_mut();
+        assert_eq!(
+            unsafe { seclusor_secrets_get(handle, ptr::null(), key.as_ptr(), 1, &mut get_ptr) },
+            SeclusorResult::Ok
+        );
+        let got: serde_json::Value = serde_json::from_str(&take_json(get_ptr)).expect("parse get");
+        assert_eq!(got["value"], "sk-123");
+
+        unsafe {
+            seclusor_secrets_handle_free(handle);
+            seclusor_keyring_handle_free(keyring);
+        }
+    }
+
+    #[test]
+    fn secrets_handle_encrypted_constructors_reject_empty_keyring_and_empty_input() {
+        let mut keyring: *mut SeclusorKeyringHandle = ptr::null_mut();
+        assert_eq!(
+            unsafe { seclusor_keyring_handle_new(&mut keyring) },
+            SeclusorResult::Ok
+        );
+        let mut handle: *mut SeclusorSecretsHandle = ptr::null_mut();
+        let dummy = b"x";
+        let r = unsafe {
+            seclusor_secrets_handle_new_from_bundle(dummy.as_ptr(), 1, keyring, &mut handle)
+        };
+        assert_ne!(r, SeclusorResult::Ok);
+        assert!(handle.is_null());
+        assert!(last_error_text().contains("no identities"));
+
+        let keyring2 = keyring_with_test_identity();
+        let r = unsafe {
+            seclusor_secrets_handle_new_from_inline(ptr::null(), 0, keyring2, &mut handle)
+        };
+        assert_eq!(r, SeclusorResult::InvalidArgument);
+        assert!(handle.is_null());
+        assert!(last_error_text().contains("empty"));
+
+        unsafe {
+            seclusor_keyring_handle_free(keyring);
+            seclusor_keyring_handle_free(keyring2);
+        }
+    }
+
+    #[test]
+    fn secrets_handle_named_constructors_reject_wrong_codec() {
+        let secrets = fixture_secrets();
+        let identity = TEST_IDENTITY
+            .parse::<seclusor_crypto::Identity>()
+            .expect("parse");
+        let bundle =
+            seclusor_codec::encrypt_bundle(&secrets, &[identity.to_public()]).expect("bundle");
+        let inline = seclusor_codec::encrypt_inline(&secrets, &[identity.to_public()]).expect("in");
+        let inline_json = serde_json::to_vec(&inline).expect("ser");
+        let plaintext = serde_json::to_vec(&secrets).expect("plain");
+        let keyring = keyring_with_test_identity();
+        let mut handle: *mut SeclusorSecretsHandle = ptr::null_mut();
+
+        // Bundle API rejects inline JSON
+        let r = unsafe {
+            seclusor_secrets_handle_new_from_bundle(
+                inline_json.as_ptr(),
+                inline_json.len(),
+                keyring,
+                &mut handle,
+            )
+        };
+        assert_eq!(r, SeclusorResult::CodecError);
+        assert!(handle.is_null());
+
+        // Inline API rejects bundle
+        let r = unsafe {
+            seclusor_secrets_handle_new_from_inline(
+                bundle.as_ptr(),
+                bundle.len(),
+                keyring,
+                &mut handle,
+            )
+        };
+        assert_eq!(r, SeclusorResult::CodecError);
+        assert!(handle.is_null());
+
+        // Inline API rejects plaintext JSON
+        let r = unsafe {
+            seclusor_secrets_handle_new_from_inline(
+                plaintext.as_ptr(),
+                plaintext.len(),
+                keyring,
+                &mut handle,
+            )
+        };
+        assert_eq!(r, SeclusorResult::CodecError);
+        assert!(handle.is_null());
+
+        unsafe { seclusor_keyring_handle_free(keyring) };
+    }
+
+    #[test]
+    fn secrets_handle_from_bundle_wrong_identity_no_secret_leak() {
+        let secrets = fixture_secrets();
+        let identity = TEST_IDENTITY
+            .parse::<seclusor_crypto::Identity>()
+            .expect("parse");
+        let ciphertext =
+            seclusor_codec::encrypt_bundle(&secrets, &[identity.to_public()]).expect("encrypt");
+
+        let wrong = seclusor_crypto::Identity::generate();
+        let dir = tempfile::tempdir().expect("temp");
+        let path = dir.path().join("wrong.txt");
+        write_identity_file(&path, &seclusor_crypto::identity_to_string(&wrong));
+        let mut keyring: *mut SeclusorKeyringHandle = ptr::null_mut();
+        assert_eq!(
+            unsafe { seclusor_keyring_handle_new(&mut keyring) },
+            SeclusorResult::Ok
+        );
+        let path_c = cstring(path.to_str().expect("utf8"));
+        assert_eq!(
+            unsafe { seclusor_keyring_handle_add_identity_file(keyring, path_c.as_ptr()) },
+            SeclusorResult::Ok
+        );
+
+        let mut handle: *mut SeclusorSecretsHandle = ptr::null_mut();
+        let r = unsafe {
+            seclusor_secrets_handle_new_from_bundle(
+                ciphertext.as_ptr(),
+                ciphertext.len(),
+                keyring,
+                &mut handle,
+            )
+        };
+        assert_ne!(r, SeclusorResult::Ok);
+        assert!(handle.is_null());
+        let err = last_error_text();
+        assert!(!err.contains("sk-123"));
+        // Ciphertext body should not appear in error text.
+        assert!(!err.contains("age-encryption.org"));
+
+        unsafe { seclusor_keyring_handle_free(keyring) };
+    }
+
+    #[test]
+    fn secrets_handle_from_bundle_null_out_pointer() {
+        let keyring = keyring_with_test_identity();
+        let dummy = b"not-empty";
+        let r = unsafe {
+            seclusor_secrets_handle_new_from_bundle(
+                dummy.as_ptr(),
+                dummy.len(),
+                keyring,
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(r, SeclusorResult::InvalidArgument);
+        unsafe { seclusor_keyring_handle_free(keyring) };
+    }
+
+    #[test]
+    fn secrets_handle_encrypted_failure_matrix_resets_out_handle() {
+        let secrets = fixture_secrets();
+        let identity = TEST_IDENTITY
+            .parse::<seclusor_crypto::Identity>()
+            .expect("parse");
+        let mut ciphertext =
+            seclusor_codec::encrypt_bundle(&secrets, &[identity.to_public()]).expect("encrypt");
+        // Prefer a ciphertext that contains a real NUL for pointer+length coverage.
+        for _ in 0..32 {
+            if ciphertext.contains(&0) {
+                break;
+            }
+            ciphertext =
+                seclusor_codec::encrypt_bundle(&secrets, &[identity.to_public()]).expect("retry");
+        }
+        assert!(
+            ciphertext.contains(&0),
+            "could not produce age ciphertext containing NUL for test"
+        );
+
+        let keyring = keyring_with_test_identity();
+        let mut handle: *mut SeclusorSecretsHandle = ptr::null_mut();
+
+        // Success path still works with NUL-containing bundle bytes.
+        assert_eq!(
+            unsafe {
+                seclusor_secrets_handle_new_from_bundle(
+                    ciphertext.as_ptr(),
+                    ciphertext.len(),
+                    keyring,
+                    &mut handle,
+                )
+            },
+            SeclusorResult::Ok
+        );
+        assert!(!handle.is_null());
+        unsafe { seclusor_secrets_handle_free(handle) };
+
+        // Pre-seed out_handle with a non-null sentinel; failures must clear it.
+        let mut seeded: *mut SeclusorSecretsHandle =
+            std::ptr::dangling_mut::<SeclusorSecretsHandle>();
+
+        // null bytes pointer with nonzero length
+        let r = unsafe {
+            seclusor_secrets_handle_new_from_bundle(ptr::null(), 8, keyring, &mut seeded)
+        };
+        assert_eq!(r, SeclusorResult::InvalidArgument);
+        assert!(seeded.is_null());
+
+        seeded = std::ptr::dangling_mut::<SeclusorSecretsHandle>();
+        // null keyring
+        let r = unsafe {
+            seclusor_secrets_handle_new_from_inline(b"{}".as_ptr(), 2, ptr::null(), &mut seeded)
+        };
+        assert_eq!(r, SeclusorResult::InvalidArgument);
+        assert!(seeded.is_null());
+
+        // empty keyring on inline
+        let mut empty_kr: *mut SeclusorKeyringHandle = ptr::null_mut();
+        assert_eq!(
+            unsafe { seclusor_keyring_handle_new(&mut empty_kr) },
+            SeclusorResult::Ok
+        );
+        seeded = std::ptr::dangling_mut::<SeclusorSecretsHandle>();
+        let inline = seclusor_codec::encrypt_inline(&secrets, &[identity.to_public()]).expect("in");
+        let inline_json = serde_json::to_vec(&inline).expect("ser");
+        let r = unsafe {
+            seclusor_secrets_handle_new_from_inline(
+                inline_json.as_ptr(),
+                inline_json.len(),
+                empty_kr,
+                &mut seeded,
+            )
+        };
+        assert_eq!(r, SeclusorResult::ValidationError);
+        assert!(seeded.is_null());
+        assert!(last_error_text().contains("no identities"));
+
+        // oversized bundle input (beyond MAX_BUNDLE_CIPHERTEXT_BYTES) — no decrypt
+        seeded = std::ptr::dangling_mut::<SeclusorSecretsHandle>();
+        let over = MAX_BUNDLE_CIPHERTEXT_BYTES + 1;
+        // Age header so classification would treat as bundle if we ever reached decrypt.
+        let mut big = b"age-encryption.org/v1\n".to_vec();
+        big.resize(over, b'A');
+        let r = unsafe {
+            seclusor_secrets_handle_new_from_bundle(big.as_ptr(), big.len(), keyring, &mut seeded)
+        };
+        assert_eq!(r, SeclusorResult::CodecError);
+        assert!(seeded.is_null());
+        let err = last_error_text();
+        assert!(err.contains("bundle ciphertext exceeds") || err.contains("maximum size"));
+        assert!(!err.contains("sk-123"));
+
+        // oversized inline/document input
+        seeded = std::ptr::dangling_mut::<SeclusorSecretsHandle>();
+        let big_doc = vec![b'{'; MAX_SECRETS_DOC_BYTES + 1];
+        let r = unsafe {
+            seclusor_secrets_handle_new_from_inline(
+                big_doc.as_ptr(),
+                big_doc.len(),
+                keyring,
+                &mut seeded,
+            )
+        };
+        assert_eq!(r, SeclusorResult::ValidationError);
+        assert!(seeded.is_null());
+        assert!(
+            last_error_text().contains("document exceeds")
+                || last_error_text().contains("maximum size")
+        );
+
+        // malformed inline JSON (not age, not valid secrets)
+        seeded = std::ptr::dangling_mut::<SeclusorSecretsHandle>();
+        let junk = b"not-a-document{{{{";
+        let r = unsafe {
+            seclusor_secrets_handle_new_from_inline(junk.as_ptr(), junk.len(), keyring, &mut seeded)
+        };
+        assert_ne!(r, SeclusorResult::Ok);
+        assert!(seeded.is_null());
+        let malformed_err = last_error_text();
+        assert!(!malformed_err.contains("sk-123"));
+        // Payload disclosure guard: raw junk must not appear in diagnostics.
+        assert!(
+            !malformed_err.contains("not-a-document"),
+            "malformed payload leaked into error: {malformed_err}"
+        );
+        assert!(
+            !malformed_err.contains("{{{{"),
+            "malformed payload braces leaked into error: {malformed_err}"
+        );
+
+        unsafe {
+            seclusor_keyring_handle_free(keyring);
+            seclusor_keyring_handle_free(empty_kr);
+        }
     }
 }

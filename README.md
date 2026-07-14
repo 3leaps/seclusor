@@ -125,7 +125,7 @@ seclusor secrets run \
   --file secrets.age \
   --identity-file ~/.config/seclusor/identity.txt \
   --project myapp \
-  --allow DB_* \
+  --allow 'DB_*' \
   -- env | grep DB_
 ```
 

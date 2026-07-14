@@ -9,6 +9,7 @@ import "C"
 import (
 	"encoding/json"
 	"errors"
+	"runtime"
 	"unsafe"
 )
 
@@ -111,6 +112,58 @@ func LoadSecretsJSON(jsonText string) (*SecretsHandle, error) {
 
 	var handle *C.SeclusorSecretsHandle
 	if err := toError(C.seclusor_secrets_handle_new_from_json(cJSON, &handle)); err != nil {
+		return nil, err
+	}
+	return &SecretsHandle{ptr: handle}, nil
+}
+
+// LoadSecretsBundle opens a fully decrypted secrets handle from age bundle ciphertext.
+//
+// data must be the raw age ciphertext bytes (may contain NULs). keyring must
+// already contain at least one identity that can open the bundle. On failure the
+// returned handle is nil.
+func LoadSecretsBundle(data []byte, keyring *KeyringHandle) (*SecretsHandle, error) {
+	return loadSecretsEncrypted(data, keyring, true)
+}
+
+// LoadSecretsInline opens a fully decrypted secrets handle from inline-encrypted
+// secrets JSON bytes. Plaintext JSON must use LoadSecretsJSON instead.
+func LoadSecretsInline(data []byte, keyring *KeyringHandle) (*SecretsHandle, error) {
+	return loadSecretsEncrypted(data, keyring, false)
+}
+
+func loadSecretsEncrypted(data []byte, keyring *KeyringHandle, bundle bool) (*SecretsHandle, error) {
+	if len(data) == 0 {
+		return nil, errors.New("encrypted secrets data must not be empty")
+	}
+	if keyring == nil {
+		return nil, errors.New("keyring handle is nil or closed")
+	}
+	if err := keyring.ensureOpen(); err != nil {
+		return nil, err
+	}
+
+	var handle *C.SeclusorSecretsHandle
+	var code C.enum_SeclusorResult
+	if bundle {
+		code = C.seclusor_secrets_handle_new_from_bundle(
+			bytesPtr(data),
+			C.size_t(len(data)),
+			keyring.ptr,
+			&handle,
+		)
+	} else {
+		code = C.seclusor_secrets_handle_new_from_inline(
+			bytesPtr(data),
+			C.size_t(len(data)),
+			keyring.ptr,
+			&handle,
+		)
+	}
+	// Keep Go slices/handles live across the C call.
+	runtime.KeepAlive(data)
+	runtime.KeepAlive(keyring)
+	if err := toError(code); err != nil {
 		return nil, err
 	}
 	return &SecretsHandle{ptr: handle}, nil

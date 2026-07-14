@@ -66,9 +66,48 @@ enum SeclusorResult seclusor_secrets_handle_new_from_json(const char *json,
  *
  * # Safety
  * `handle` must be either null or a pointer previously returned by
- * `seclusor_secrets_handle_new_from_json` and not already freed.
+ * `seclusor_secrets_handle_new_from_json`,
+ * `seclusor_secrets_handle_new_from_bundle`, or
+ * `seclusor_secrets_handle_new_from_inline`, and not already freed.
  */
 void seclusor_secrets_handle_free(struct SeclusorSecretsHandle *handle);
+
+/**
+ * Open a secrets handle from whole-document age **bundle** ciphertext.
+ *
+ * Input is raw bytes (`bytes` + `len`); do not pass a C string (NUL may appear
+ * in binary age ciphertext). Decryption uses identities currently loaded in
+ * `keyring`. On success the handle always contains a **fully decrypted**
+ * document (`LoadMode::Full`); structural-only / wrong-codec inputs fail.
+ *
+ * # Safety
+ * - `bytes` must be non-null when `len > 0` and point to `len` readable bytes
+ *   valid for the duration of the call.
+ * - `keyring` must be a valid non-null keyring handle; identities are borrowed
+ *   only for this call (do not free/mutate the keyring concurrently).
+ * - `out_handle` must be a valid non-null pointer to storage for a handle
+ *   pointer; set to null on entry and on every failure path.
+ */
+enum SeclusorResult seclusor_secrets_handle_new_from_bundle(const uint8_t *bytes,
+                                                            uintptr_t len,
+                                                            const struct SeclusorKeyringHandle *keyring,
+                                                            struct SeclusorSecretsHandle **out_handle);
+
+/**
+ * Open a secrets handle from **inline-encrypted** secrets JSON bytes.
+ *
+ * Input is raw bytes (`bytes` + `len`). Decryption uses identities currently
+ * loaded in `keyring`. On success the handle always contains a **fully
+ * decrypted** document; structural-only opens and non-inline codecs fail.
+ * Plaintext JSON must use `seclusor_secrets_handle_new_from_json`.
+ *
+ * # Safety
+ * Same contract as [`seclusor_secrets_handle_new_from_bundle`].
+ */
+enum SeclusorResult seclusor_secrets_handle_new_from_inline(const uint8_t *bytes,
+                                                            uintptr_t len,
+                                                            const struct SeclusorKeyringHandle *keyring,
+                                                            struct SeclusorSecretsHandle **out_handle);
 
 /**
  * Create an empty keyring handle.

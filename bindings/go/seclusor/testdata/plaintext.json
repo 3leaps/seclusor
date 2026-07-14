@@ -1,0 +1,15 @@
+{
+  "schema_version": "v1.0.0",
+  "env_prefix": "APP_",
+  "projects": [
+    {
+      "project_slug": "demo",
+      "credentials": {
+        "API_KEY": {
+          "type": "secret",
+          "value": "sk-123"
+        }
+      }
+    }
+  ]
+}
