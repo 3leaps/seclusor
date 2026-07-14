@@ -1,17 +1,15 @@
-use std::path::Path;
-
-use seclusor_core::constants::{MAX_SECRETS_DOC_BYTES, SCHEMA_VERSION};
+use seclusor_core::constants::SCHEMA_VERSION;
 use seclusor_core::validate::validate_strict;
 use seclusor_core::{Credential, SeclusorError, SecretsFile};
 
 use crate::cli::UnsetArgs;
 use crate::error::{CliError, CliResult};
-use crate::io::{read_file_with_limit, read_secrets_file, write_json_value_file};
+use crate::io::{read_secrets_file, write_json_value_file};
 
-pub(crate) fn handle_unset_lenient(args: UnsetArgs) -> CliResult<()> {
+/// Lenient unset using already-read bounded bytes (shares the write-target probe read).
+pub(crate) fn handle_unset_lenient_bytes(args: UnsetArgs, bytes: Vec<u8>) -> CliResult<()> {
     eprintln!("warning: file contains malformed credentials; using lenient parse");
 
-    let bytes = read_file_with_limit(&args.file, MAX_SECRETS_DOC_BYTES)?;
     let mut root: serde_json::Value = serde_json::from_slice(&bytes)?;
     remove_credential_lenient(&mut root, args.project.as_deref(), &args.key)?;
     write_json_value_file(&args.file, &root)?;
@@ -31,8 +29,9 @@ pub(crate) fn handle_unset_lenient(args: UnsetArgs) -> CliResult<()> {
     Ok(())
 }
 
+/// Decide lenient eligibility from the **same** bounded bytes as the probe (no path reopen).
 pub(crate) fn should_use_lenient_unset(
-    path: &Path,
+    bytes: &[u8],
     project_slug: Option<&str>,
     key: &str,
     err: &CliError,
@@ -40,19 +39,18 @@ pub(crate) fn should_use_lenient_unset(
     match err {
         CliError::Json(_) => true,
         CliError::Core(SeclusorError::Validation(_)) => {
-            target_credential_requires_lenient_repair(path, project_slug, key).unwrap_or(false)
+            target_credential_requires_lenient_repair(bytes, project_slug, key).unwrap_or(false)
         }
         _ => false,
     }
 }
 
 fn target_credential_requires_lenient_repair(
-    path: &Path,
+    bytes: &[u8],
     project_slug: Option<&str>,
     key: &str,
 ) -> CliResult<bool> {
-    let bytes = read_file_with_limit(path, MAX_SECRETS_DOC_BYTES)?;
-    let root: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let root: serde_json::Value = serde_json::from_slice(bytes)?;
     let Some(raw_credential) = target_credential_value(&root, project_slug, key)? else {
         return Ok(false);
     };
