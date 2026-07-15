@@ -20,7 +20,7 @@ use thiserror::Error;
 pub use mutate::{
     encrypted_value_keys, ensure_no_plaintext_credential_values, mutate_bundle,
     reencrypt_all_inline, set_inline_description, set_inline_value, unset_inline_value,
-    BundleMutateResult, InlineMutateResult,
+    BundleMutateResult, DescriptionAction, InlineMutateResult, SetInlineValueOptions,
 };
 
 /// Supported storage codecs (conversion surface: bundle ↔ JSON form).

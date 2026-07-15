@@ -38,6 +38,8 @@ pub(crate) enum SecretsSubcommand {
     Validate(ValidateArgs),
     ExportEnv(ExportEnvArgs),
     ImportEnv(ImportEnvArgs),
+    /// Re-encrypt all fields to a new recipient set.
+    Rekey(RekeyArgs),
     Run(RunArgs),
     Bundle(BundleCommand),
     Inline(InlineCommand),
@@ -222,35 +224,61 @@ pub(crate) struct SetArgs {
     pub(crate) credential_type: String,
     #[arg(
         long,
-        help = "Store a direct secret value (mutually exclusive with --ref). \
-                Omit both --value and --ref with --description for a \
-                description-only edit of an existing credential"
+        help = "Store a direct secret value via argv (legacy; warns on stderr). \
+                Prefer --value-stdin, --value-file, or --value-env. Mutually \
+                exclusive with other value channels and --ref. Omit all value \
+                channels and --ref with --description for a description-only edit"
     )]
     pub(crate) value: Option<String>,
+    #[arg(
+        long = "value-stdin",
+        default_value_t = false,
+        help = "Read the secret value from stdin (preferred non-argv channel)"
+    )]
+    pub(crate) value_stdin: bool,
+    #[arg(
+        long = "value-file",
+        value_name = "PATH",
+        help = "Read the secret value from a file (preferred non-argv channel)"
+    )]
+    pub(crate) value_file: Option<PathBuf>,
+    #[arg(
+        long = "value-env",
+        value_name = "VAR",
+        help = "Read the secret value from an environment variable (preferred \
+                non-argv channel)"
+    )]
+    pub(crate) value_env: Option<String>,
     #[arg(
         long = "ref",
         help = "Store a reference pointer instead of a value (e.g. vault path, \
                 env var name, URI). Use forward slashes for portability; \
                 backslashes are preserved but may not be portable across \
-                platforms. Mutually exclusive with --value"
+                platforms. Mutually exclusive with value channels"
     )]
     pub(crate) reference: Option<String>,
     #[arg(
         long,
         help = "Human-readable description (single-line, max 128 chars). \
-                With neither --value nor --ref: description-only edit \
+                With neither a value channel nor --ref: description-only edit \
                 (existing credential required; empty string clears). \
-                With --value/--ref: set or replace description; omit to \
+                With value/--ref: set or replace description; omit to \
                 preserve an existing description"
     )]
     pub(crate) description: Option<String>,
     #[arg(
         long,
         default_value_t = false,
-        help = "Create project if it does not exist (requires --value or --ref; \
-                not valid for description-only edits)"
+        help = "Create project if it does not exist (requires a value channel or \
+                --ref; not valid for description-only edits)"
     )]
     pub(crate) create_project: bool,
+    #[command(flatten)]
+    pub(crate) recipients: RecipientArgs,
+    #[command(flatten)]
+    pub(crate) identities: IdentityArgs,
+    #[command(flatten)]
+    pub(crate) passphrase: PassphraseArgs,
 }
 
 #[derive(Debug, Parser)]
@@ -307,6 +335,13 @@ pub(crate) struct UnsetArgs {
     pub(crate) project: Option<String>,
     #[arg(long, help = "Credential key name to remove")]
     pub(crate) key: String,
+    /// Required for bundle unset (encrypting whole-document rewrite).
+    #[command(flatten)]
+    pub(crate) recipients: RecipientArgs,
+    #[command(flatten)]
+    pub(crate) identities: IdentityArgs,
+    #[command(flatten)]
+    pub(crate) passphrase: PassphraseArgs,
 }
 
 #[derive(Debug, Parser)]
@@ -392,6 +427,29 @@ pub(crate) struct ImportEnvArgs {
         help = "Create project if it does not exist"
     )]
     pub(crate) create_project: bool,
+    #[command(flatten)]
+    pub(crate) recipients: RecipientArgs,
+    #[command(flatten)]
+    pub(crate) identities: IdentityArgs,
+    #[command(flatten)]
+    pub(crate) passphrase: PassphraseArgs,
+}
+
+#[derive(Debug, Parser)]
+pub(crate) struct RekeyArgs {
+    #[arg(long, default_value = DEFAULT_SECRETS_FILE, help = "Path to secrets file")]
+    pub(crate) file: PathBuf,
+    #[arg(
+        long,
+        help = "Write rekeyed output to this path (default: overwrite --file in place)"
+    )]
+    pub(crate) output: Option<PathBuf>,
+    #[command(flatten)]
+    pub(crate) recipients: RecipientArgs,
+    #[command(flatten)]
+    pub(crate) identities: IdentityArgs,
+    #[command(flatten)]
+    pub(crate) passphrase: PassphraseArgs,
 }
 
 #[derive(Debug, Parser)]

@@ -6,7 +6,9 @@ use seclusor_codec::{
     resolve_runtime_document_from_file, resolve_runtime_source_from_file, DocumentSource,
     ResolvedDocument,
 };
-use seclusor_core::constants::{INLINE_CIPHERTEXT_PREFIX, MAX_SECRETS_DOC_BYTES};
+use seclusor_core::constants::{
+    INLINE_CIPHERTEXT_PREFIX, MAX_BUNDLE_CIPHERTEXT_BYTES, MAX_SECRETS_DOC_BYTES,
+};
 use seclusor_core::validate::validate_strict;
 use seclusor_core::{SeclusorError, SecretsFile};
 use seclusor_crypto::Identity;
@@ -20,12 +22,17 @@ use crate::error::{CliError, CliResult};
 #[derive(Debug)]
 pub(crate) enum WriteTargetProbe {
     /// Strict-valid plaintext secrets document — safe for existing write paths.
-    Plaintext(SecretsFile),
+    ///
+    /// `bytes` are the exact load-time contents for CAS (e.g. plaintext rekey).
+    Plaintext {
+        secrets: SecretsFile,
+        bytes: Vec<u8>,
+    },
     /// Positively identified encrypted document.
     ///
-    /// `bytes` are the same bounded contents used for classification (full JSON
-    /// for inline; may be marker-prefix only for early bundle detection). Used
-    /// for CAS on structural-only inline writes; refuse paths ignore them.
+    /// `bytes` are the same bounded contents used for classification and commit
+    /// CAS: full JSON for inline, full ciphertext (bounded) for bundle. One
+    /// read must cover classify → mutate → CAS.
     Encrypted {
         source: DocumentSource,
         bytes: Vec<u8>,
@@ -64,18 +71,27 @@ fn read_write_target_bytes(path: &Path) -> CliResult<Vec<u8>> {
     let prefix_len = file.read(&mut prefix)?;
     let prefix = &prefix[..prefix_len];
 
-    if seclusor_codec::is_bundle_ciphertext(prefix) {
-        // Positively identified bundle — return only the marker prefix bytes.
-        // Handlers refuse before mutation; full ciphertext is not needed here.
-        return Ok(prefix.to_vec());
-    }
+    // One open: rewind and bound-read with the codec-appropriate limit so the
+    // same bytes serve classification, decrypt/mutate, and commit-time CAS.
+    let max = if seclusor_codec::is_bundle_ciphertext(prefix) {
+        MAX_BUNDLE_CIPHERTEXT_BYTES
+    } else {
+        MAX_SECRETS_DOC_BYTES
+    };
 
-    // Not a bundle: rewind and apply the document size limit on the same fd.
     file.seek(SeekFrom::Start(0))?;
-    let mut limited = file.take((MAX_SECRETS_DOC_BYTES as u64) + 1);
+    let mut limited = file.take((max as u64) + 1);
     let mut buf = Vec::new();
     limited.read_to_end(&mut buf)?;
-    if buf.len() > MAX_SECRETS_DOC_BYTES {
+    if buf.len() > max {
+        if seclusor_codec::is_bundle_ciphertext(prefix) {
+            return Err(CliError::Codec(
+                seclusor_codec::CodecError::BundleCiphertextTooLarge {
+                    actual: buf.len() as u64,
+                    max: max as u64,
+                },
+            ));
+        }
         return Err(CliError::Core(SeclusorError::DocumentTooLarge {
             actual: buf.len(),
             max: MAX_SECRETS_DOC_BYTES,
@@ -105,7 +121,10 @@ pub(crate) fn probe_write_target_bytes(bytes: &[u8]) -> WriteTargetProbe {
             bytes: bytes.to_vec(),
         },
         Ok(DocumentSource::Plaintext) => match secrets_from_bytes(bytes) {
-            Ok(secrets) => WriteTargetProbe::Plaintext(secrets),
+            Ok(secrets) => WriteTargetProbe::Plaintext {
+                secrets,
+                bytes: bytes.to_vec(),
+            },
             // Classification said plaintext but re-parse failed — treat as
             // unclassified so existing error paths remain available.
             Err(_) => WriteTargetProbe::NotEncrypted(bytes.to_vec()),

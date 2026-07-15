@@ -82,6 +82,36 @@ pub fn ensure_no_plaintext_credential_values(secrets: &SecretsFile) -> Result<()
     Ok(())
 }
 
+/// How [`set_inline_value`] should treat the credential description.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DescriptionAction<'a> {
+    /// Leave any existing description unchanged (new credentials stay `None`).
+    Preserve,
+    /// Replace description (`None` / empty after normalize clears).
+    Replace(Option<&'a str>),
+}
+
+/// Options for [`set_inline_value`].
+#[derive(Debug, Clone, Copy)]
+pub struct SetInlineValueOptions<'a> {
+    /// When true, insert the credential if missing.
+    pub create_if_missing: bool,
+    /// Credential type label (`secret` by default at the CLI).
+    pub credential_type: &'a str,
+    /// Description update policy.
+    pub description: DescriptionAction<'a>,
+}
+
+impl Default for SetInlineValueOptions<'_> {
+    fn default() -> Self {
+        Self {
+            create_if_missing: false,
+            credential_type: "secret",
+            description: DescriptionAction::Preserve,
+        }
+    }
+}
+
 /// Set (or replace) one credential **value** in an inline secrets document.
 ///
 /// Encrypts **only** the target value with `recipients`. All other credential
@@ -107,7 +137,7 @@ pub fn set_inline_value(
     key: &str,
     plaintext_value: &str,
     recipients: &[Recipient],
-    create_if_missing: bool,
+    options: SetInlineValueOptions<'_>,
 ) -> Result<InlineMutateResult> {
     ensure_recipients(recipients)?;
     validate_strict(secrets)?;
@@ -120,23 +150,36 @@ pub fn set_inline_value(
         .ok_or_else(|| CodecError::ProjectNotFound(project_slug.to_string()))?;
 
     let encrypted = seclusor_crypto::encrypt_inline_value(plaintext_value.as_bytes(), recipients)?;
+    let credential_type = if options.credential_type.is_empty() {
+        "secret"
+    } else {
+        options.credential_type
+    };
 
     match project.credentials.get_mut(key) {
         Some(credential) => {
             // Domain parity with `set_credential`: ref→value replacement is allowed.
             // Clear ref and write the new encrypted value.
             credential.reference = None;
-            if credential.credential_type.is_empty() {
-                credential.credential_type = "secret".to_string();
-            }
+            credential.credential_type = credential_type.to_string();
             credential.value = Some(encrypted);
+            match options.description {
+                DescriptionAction::Preserve => {}
+                DescriptionAction::Replace(desc) => {
+                    credential.description = seclusor_core::validate::normalize_description(desc);
+                }
+            }
         }
-        None if create_if_missing => {
+        None if options.create_if_missing => {
             // `encrypted` is already a `sec:age:v1:` string.
-            project.credentials.insert(
-                key.to_string(),
-                Credential::with_value("secret", &encrypted),
-            );
+            let mut cred = Credential::with_value(credential_type, &encrypted);
+            match options.description {
+                DescriptionAction::Preserve => {}
+                DescriptionAction::Replace(desc) => {
+                    cred.description = seclusor_core::validate::normalize_description(desc);
+                }
+            }
+            project.credentials.insert(key.to_string(), cred);
         }
         None => {
             return Err(CodecError::CredentialNotFound {
@@ -473,7 +516,10 @@ mod tests {
             "A_KEY",
             SENTINEL,
             std::slice::from_ref(&recipient),
-            false,
+            SetInlineValueOptions {
+                create_if_missing: false,
+                ..Default::default()
+            },
         )
         .expect("set A_KEY");
 
@@ -670,8 +716,15 @@ mod tests {
     #[test]
     fn empty_recipients_refused() {
         let secrets = plain_secrets();
-        let err = set_inline_value(&secrets, "demo", "A_KEY", "x", &[], false)
-            .expect_err("empty recipients");
+        let err = set_inline_value(
+            &secrets,
+            "demo",
+            "A_KEY",
+            "x",
+            &[],
+            SetInlineValueOptions::default(),
+        )
+        .expect_err("empty recipients");
         assert!(matches!(err, CodecError::EmptyRecipientSet));
     }
 
@@ -757,7 +810,10 @@ mod tests {
             "REF_KEY",
             SENTINEL,
             std::slice::from_ref(&recipient),
-            false,
+            SetInlineValueOptions {
+                create_if_missing: false,
+                ..Default::default()
+            },
         )
         .expect("ref→value");
         assert!(result.secrets.projects[0].credentials["REF_KEY"]
@@ -808,7 +864,10 @@ mod tests {
             "A_KEY",
             SENTINEL,
             std::slice::from_ref(&recipient),
-            false,
+            SetInlineValueOptions {
+                create_if_missing: false,
+                ..Default::default()
+            },
         )
         .expect("set");
         assert_eq!(
@@ -842,7 +901,10 @@ mod tests {
             "NEW_KEY",
             SENTINEL,
             std::slice::from_ref(&recipient),
-            true,
+            SetInlineValueOptions {
+                create_if_missing: true,
+                ..Default::default()
+            },
         )
         .expect("create");
         assert!(result.secrets.projects[0]
