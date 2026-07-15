@@ -274,7 +274,7 @@ pub fn seclusor_config_dir() -> Option<PathBuf> {
                 return Some(PathBuf::from(home).join(".config").join("seclusor"));
             }
         }
-        return None;
+        None
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]

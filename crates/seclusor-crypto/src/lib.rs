@@ -167,6 +167,18 @@ pub fn decrypt(ciphertext: &[u8], identities: &[Identity]) -> Result<Vec<u8>> {
     decrypt_with_limit(ciphertext, identities, MAX_DECRYPT_PLAINTEXT_BYTES)
 }
 
+/// Return true when `ciphertext` is a passphrase (scrypt) age file.
+///
+/// Accepts both binary age files and ASCII-armored age files. Armored input is
+/// decoded via [`age::armor::ArmoredReader`] (which also passes through binary
+/// age bytes), matching the repository’s other armored-age call sites.
+pub fn is_scrypt_ciphertext(ciphertext: &[u8]) -> Result<bool> {
+    let reader = age::armor::ArmoredReader::new(ciphertext);
+    let decryptor =
+        age::Decryptor::new_buffered(reader).map_err(|_| CryptoError::InvalidCiphertext)?;
+    Ok(decryptor.is_scrypt())
+}
+
 /// Decrypt ciphertext with identities specified as string values.
 pub fn decrypt_with_identity_strings<I, S>(ciphertext: &[u8], identities: I) -> Result<Vec<u8>>
 where
@@ -441,6 +453,27 @@ mod tests {
         ciphertext
     }
 
+    /// Produce an ASCII-armored scrypt age file (BEGIN/END AGE ENCRYPTED FILE).
+    fn encrypt_scrypt_ascii_armored(plaintext: &[u8], passphrase: &str) -> Vec<u8> {
+        let encryptor =
+            age::Encryptor::with_user_passphrase(SecretString::from(passphrase.to_owned()));
+        let mut armored = Vec::new();
+        {
+            let armor_writer = age::armor::ArmoredWriter::wrap_output(
+                &mut armored,
+                age::armor::Format::AsciiArmor,
+            )
+            .expect("armor wrap");
+            let mut writer = encryptor.wrap_output(armor_writer).expect("encryptor wrap");
+            writer.write_all(plaintext).expect("write plaintext");
+            writer
+                .finish()
+                .and_then(|a| a.finish())
+                .expect("finish armor");
+        }
+        armored
+    }
+
     #[test]
     fn recipient_roundtrip_known_vector() {
         let recipient = parsed_recipient();
@@ -464,6 +497,73 @@ mod tests {
             decrypt_with_passphrase(&ciphertext, passphrase).expect("decrypt should succeed");
 
         assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn is_scrypt_ciphertext_detects_binary_scrypt() {
+        let ct = encrypt_with_passphrase(b"payload", "test-passphrase-not-a-secret")
+            .expect("encrypt scrypt");
+        assert!(
+            ct.starts_with(b"age-encryption.org/"),
+            "fixture must be binary age"
+        );
+        assert!(is_scrypt_ciphertext(&ct).expect("classify binary scrypt"));
+    }
+
+    #[test]
+    fn is_scrypt_ciphertext_detects_ascii_armored_scrypt() {
+        let ct = encrypt_scrypt_ascii_armored(b"payload", "test-passphrase-not-a-secret");
+        let as_str = std::str::from_utf8(&ct).expect("armored is utf8");
+        assert!(
+            as_str.contains("-----BEGIN AGE ENCRYPTED FILE-----"),
+            "fixture must be ASCII-armored"
+        );
+        assert!(
+            !ct.starts_with(b"age-encryption.org/"),
+            "armored body must not look like raw binary header at offset 0"
+        );
+        assert!(
+            is_scrypt_ciphertext(&ct).expect("classify armored scrypt"),
+            "armored scrypt must be detected (not InvalidCiphertext)"
+        );
+    }
+
+    #[test]
+    fn is_scrypt_ciphertext_false_for_recipient_binary_and_armored() {
+        let recipient = parsed_recipient();
+        let binary =
+            encrypt(b"payload", std::slice::from_ref(&recipient)).expect("encrypt recipient");
+        assert!(!is_scrypt_ciphertext(&binary).expect("classify binary X25519"));
+
+        // Re-armor a recipient ciphertext for the negative armored case.
+        let mut armored = Vec::new();
+        {
+            // age does not re-wrap existing binary ciphertext as armor via Encryptor;
+            // armor an independent encrypt through ArmoredWriter instead.
+            let encryptor =
+                age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
+                    .expect("recipients");
+            let armor_writer = age::armor::ArmoredWriter::wrap_output(
+                &mut armored,
+                age::armor::Format::AsciiArmor,
+            )
+            .expect("armor");
+            let mut writer = encryptor.wrap_output(armor_writer).expect("wrap");
+            writer.write_all(b"payload").expect("write");
+            writer.finish().and_then(|a| a.finish()).expect("finish");
+        }
+        assert!(std::str::from_utf8(&armored)
+            .unwrap()
+            .contains("BEGIN AGE ENCRYPTED FILE"));
+        assert!(!is_scrypt_ciphertext(&armored).expect("classify armored X25519"));
+    }
+
+    #[test]
+    fn is_scrypt_ciphertext_rejects_garbage() {
+        let err = is_scrypt_ciphertext(b"not-age-at-all").expect_err("garbage");
+        assert!(matches!(err, CryptoError::InvalidCiphertext));
+        assert!(!err.to_string().contains("not-age-at-all"));
+        assert!(!format!("{err:?}").contains("not-age-at-all"));
     }
 
     #[test]

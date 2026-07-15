@@ -1,4 +1,4 @@
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Read;
 use std::path::Path;
 
@@ -34,15 +34,53 @@ pub(crate) fn read_secrets_file(path: &Path) -> CliResult<SecretsFile> {
 }
 
 /// One bounded read + fail-closed encrypted-write probe.
+///
+/// Opens the path **once**: probes the first 64 bytes for a bundle marker from
+/// that descriptor, then continues the bounded read from the same handle so
+/// classification and any later plaintext handling share identical bytes.
 pub(crate) fn probe_write_target(path: &Path) -> CliResult<WriteTargetProbe> {
-    let bytes = read_file_with_limit(path, MAX_SECRETS_DOC_BYTES)?;
+    let bytes = read_write_target_bytes(path)?;
     Ok(probe_write_target_bytes(&bytes))
+}
+
+/// Single-open bounded read for write-target probing.
+///
+/// Bundle markers are detected from a 64-byte prefix on the same file
+/// descriptor used for the remainder of the read, so oversized bundles refuse
+/// as encrypted targets without a second open and without misreporting as
+/// document-too-large when only the prefix is needed for the marker win.
+fn read_write_target_bytes(path: &Path) -> CliResult<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = fs::File::open(path)?;
+    let mut prefix = [0u8; 64];
+    let prefix_len = file.read(&mut prefix)?;
+    let prefix = &prefix[..prefix_len];
+
+    if seclusor_codec::is_bundle_ciphertext(prefix) {
+        // Positively identified bundle — return only the marker prefix bytes.
+        // Handlers refuse before mutation; full ciphertext is not needed here.
+        return Ok(prefix.to_vec());
+    }
+
+    // Not a bundle: rewind and apply the document size limit on the same fd.
+    file.seek(SeekFrom::Start(0))?;
+    let mut limited = file.take((MAX_SECRETS_DOC_BYTES as u64) + 1);
+    let mut buf = Vec::new();
+    limited.read_to_end(&mut buf)?;
+    if buf.len() > MAX_SECRETS_DOC_BYTES {
+        return Err(CliError::Core(SeclusorError::DocumentTooLarge {
+            actual: buf.len(),
+            max: MAX_SECRETS_DOC_BYTES,
+        }));
+    }
+    Ok(buf)
 }
 
 /// Probe already-read document bytes (no second open).
 pub(crate) fn probe_write_target_bytes(bytes: &[u8]) -> WriteTargetProbe {
     // 1. Bundle marker wins even if the payload is malformed.
-    if is_bundle_marker(bytes) {
+    if seclusor_codec::is_bundle_ciphertext(bytes) {
         return WriteTargetProbe::Encrypted {
             source: DocumentSource::Bundle,
         };
@@ -80,14 +118,13 @@ pub(crate) fn probe_write_target_bytes(bytes: &[u8]) -> WriteTargetProbe {
 
 /// Error for refused encrypted write targets. No document body content.
 pub(crate) fn refuse_encrypted_write(path: &Path, source: DocumentSource) -> CliError {
-    let token = match source {
-        DocumentSource::Bundle => "bundle",
-        DocumentSource::Inline => "inline",
-        DocumentSource::Plaintext => "plaintext",
-    };
+    debug_assert!(
+        !matches!(source, DocumentSource::Plaintext),
+        "refuse_encrypted_write is only for positively identified encrypted sources"
+    );
     CliError::EncryptedWriteUnsupported {
         path: path.display().to_string(),
-        source_kind: token,
+        source_kind: source.token(),
     }
 }
 
@@ -95,11 +132,6 @@ pub(crate) fn secrets_from_bytes(bytes: &[u8]) -> CliResult<SecretsFile> {
     let secrets: SecretsFile = serde_json::from_slice(bytes)?;
     validate_strict(&secrets)?;
     Ok(secrets)
-}
-
-fn is_bundle_marker(input: &[u8]) -> bool {
-    input.starts_with(b"age-encryption.org/")
-        || input.starts_with(b"-----BEGIN AGE ENCRYPTED FILE-----")
 }
 
 /// Walk only `projects[].credentials.*` for the inline marker on credential
@@ -151,11 +183,19 @@ pub(crate) fn read_runtime_document_file(
     Ok(resolve_runtime_document_from_file(path, identities)?)
 }
 
+/// Write a **plaintext** secrets JSON document.
+///
+/// Plaintext paths intentionally do **not** use the ciphertext-only atomic
+/// writer (orphan temps must never hold plaintext). Encrypted commits must call
+/// [`crate::atomic_write::atomic_write_ciphertext`] with a CAS token.
 pub(crate) fn write_secrets_file(
     path: &Path,
     secrets: &SecretsFile,
     create_new: bool,
 ) -> CliResult<()> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
     let data = serde_json::to_vec_pretty(secrets)?;
     if data.len() > MAX_SECRETS_DOC_BYTES {
         return Err(CliError::Core(SeclusorError::DocumentTooLarge {
@@ -166,8 +206,8 @@ pub(crate) fn write_secrets_file(
 
     if create_new {
         let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-        std::io::Write::write_all(&mut file, &data)?;
-        std::io::Write::write_all(&mut file, b"\n")?;
+        file.write_all(&data)?;
+        file.write_all(b"\n")?;
         return Ok(());
     }
 

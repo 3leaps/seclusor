@@ -1,5 +1,17 @@
-/// Current schema version for secrets files.
+/// Baseline schema version for secrets files without recipient metadata.
 pub const SCHEMA_VERSION: &str = "v1.0.0";
+
+/// Schema version that may carry optional top-level `recipients` metadata.
+pub const SCHEMA_VERSION_V1_1_0: &str = "v1.1.0";
+
+/// Maximum number of document-level age recipients.
+pub const MAX_RECIPIENTS: usize = 64;
+
+/// Age X25519 recipient bech32 prefix pattern used by schema + validation.
+///
+/// Full cryptographic parseability is enforced by the crypto layer at encrypt
+/// time; core validation uses this structural pattern to stay crypto-free.
+pub const AGE_RECIPIENT_PATTERN: &str = "^age1[0-9a-z]+$";
 
 /// Prefix for inline-encrypted age ciphertext values.
 pub const INLINE_CIPHERTEXT_PREFIX: &str = "sec:age:v1:";

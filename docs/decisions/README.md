@@ -11,6 +11,7 @@ This directory holds ADRs/SDRs/DDRs for the Rust rewrite.
 - `ADR-0006-dry-core-cli-server-and-stdout-purity.md`
 - `ADR-0008-ffi-contract-json-over-ffi-and-opaque-handles.md`
 - `ADR-0011-ed25519-signing-in-seclusor-crypto.md`
+- `ADR-0012-recipients-metadata-schema-v1-1-0.md`
 
 ## Accepted SDRs
 

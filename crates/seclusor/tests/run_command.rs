@@ -51,6 +51,7 @@ fn run_seclusor(args: &[String]) -> Output {
         .expect("run seclusor")
 }
 
+#[cfg(unix)]
 fn run_seclusor_in(dir: &Path, args: &[String]) -> Output {
     Command::new(seclusor_bin())
         .current_dir(dir)
@@ -314,6 +315,11 @@ fn run_resolves_absolute_relative_and_path_commands() {
         perms.set_mode(0o755);
         fs::set_permissions(&path_helper, perms).expect("chmod path helper");
     }
+    assert!(
+        path_helper.exists(),
+        "PATH helper fixture must exist: {}",
+        path_helper.display()
+    );
     let mut path_args = make_base_args(&secrets);
     path_args.push(fixture_name("run-fixture-path"));
     path_args.push("dump".to_string());

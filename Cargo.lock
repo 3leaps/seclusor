@@ -1147,11 +1147,13 @@ dependencies = [
 name = "seclusor-codec"
 version = "0.1.6"
 dependencies = [
+ "age",
  "seclusor-core",
  "seclusor-crypto",
  "serde_json",
  "tempfile",
  "thiserror",
+ "zeroize",
 ]
 
 [[package]]

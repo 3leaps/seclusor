@@ -56,20 +56,50 @@ jobs:
         run: |
           set -euo pipefail
           make ts-test
-  macos-test:
-    name: Test (macOS arm64)
-    runs-on: macos-14
+  # Native cargo clippy + test on every supported OS/arch. Custom runner labels
+  # (ubuntu-latest-arm64-s, windows-latest-arm64-s) are declared in
+  # .github/actionlint.yaml for the 3leaps org.
+  #
+  # Platform matrix (5):
+  #   Linux x64 / arm64, macOS arm64, Windows x64 / arm64
+  native-test:
+    name: Test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-amd64
+          - os: ubuntu-latest-arm64-s
+            name: linux-arm64
+          - os: macos-14
+            name: darwin-arm64
+          - os: windows-latest
+            name: windows-amd64
+          - os: windows-latest-arm64-s
+            name: windows-arm64
     steps:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@1.94.0
-      - name: Build and test
+      - name: Clippy and test (Unix)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
           cargo clippy --workspace --all-targets --all-features -- -D warnings
           cargo test --workspace --all-features
+      - name: Clippy and test (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # FFI crate excluded — platform-specific linking; Windows native path
+          # still runs ReplaceFileW / CAS / DACL unit tests in seclusor CLI.
+          cargo clippy --workspace --all-targets --all-features --exclude seclusor-ffi -- -D warnings
+          cargo test --workspace --all-features --exclude seclusor-ffi
   windows-cross-check:
     name: Cross-check (Windows)
     runs-on: ubuntu-latest

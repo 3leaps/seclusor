@@ -92,11 +92,22 @@ fn validate_schema_version(sf: &SecretsFile, errors: &mut Vec<SeclusorError>) {
         errors.push(SeclusorError::Validation(
             "schema_version must not contain leading/trailing whitespace".to_string(),
         ));
-    } else if sf.schema_version != SCHEMA_VERSION {
+    } else if sf.schema_version != SCHEMA_VERSION && sf.schema_version != SCHEMA_VERSION_V1_1_0 {
         errors.push(SeclusorError::Validation(format!(
             "unsupported schema_version {:?}",
             sf.schema_version
         )));
+    }
+
+    // recipients metadata requires schema v1.1.0 (rewrite-on-establish invariant).
+    if sf.recipients.is_some() && sf.schema_version != SCHEMA_VERSION_V1_1_0 {
+        errors.push(SeclusorError::Validation(
+            "recipients metadata requires schema_version \"v1.1.0\"".to_string(),
+        ));
+    }
+
+    if let Some(recipients) = sf.recipients.as_ref() {
+        validate_recipients_field(recipients, errors);
     }
 
     if let Some(description) = sf.description.as_deref() {
@@ -104,6 +115,124 @@ fn validate_schema_version(sf: &SecretsFile, errors: &mut Vec<SeclusorError>) {
             errors.push(SeclusorError::Validation(format!("description {}", err)));
         }
     }
+}
+
+/// Structural validation for the optional top-level `recipients` array.
+///
+/// Enforces sorted, unique, bounded, and pattern-matching age public keys.
+/// Cryptographic parseability is enforced at encrypt time by seclusor-crypto.
+fn validate_recipients_field(recipients: &[String], errors: &mut Vec<SeclusorError>) {
+    if recipients.len() > MAX_RECIPIENTS {
+        errors.push(SeclusorError::Validation(format!(
+            "too many recipients ({}), maximum is {}",
+            recipients.len(),
+            MAX_RECIPIENTS
+        )));
+        return;
+    }
+
+    if recipients.is_empty() {
+        errors.push(SeclusorError::Validation(
+            "recipients must not be an empty array (omit the field instead)".to_string(),
+        ));
+        return;
+    }
+
+    let mut seen = HashSet::new();
+    let mut prev: Option<&str> = None;
+    for (index, recipient) in recipients.iter().enumerate() {
+        if recipient.trim() != recipient.as_str() {
+            errors.push(SeclusorError::Validation(format!(
+                "recipients[{index}] must not contain leading/trailing whitespace"
+            )));
+        }
+        if !is_valid_age_recipient_shape(recipient) {
+            errors.push(SeclusorError::Validation(format!(
+                "recipients[{index}] is not a valid age recipient public key"
+            )));
+        }
+        if !seen.insert(recipient.as_str()) {
+            errors.push(SeclusorError::Validation(format!(
+                "recipients[{index}] is duplicated; recipients must be unique"
+            )));
+        }
+        if let Some(previous) = prev {
+            if recipient.as_str() < previous {
+                errors.push(SeclusorError::Validation(
+                    "recipients must be sorted in ascending lexicographic order".to_string(),
+                ));
+                // One ordering error is enough to fail closed.
+                break;
+            }
+        }
+        prev = Some(recipient.as_str());
+    }
+}
+
+/// Structural shape check for an age X25519 recipient string.
+///
+/// Implements [`AGE_RECIPIENT_PATTERN`] without a regex crate.
+pub fn is_valid_age_recipient_shape(recipient: &str) -> bool {
+    // Keep in sync with AGE_RECIPIENT_PATTERN (`^age1[0-9a-z]+$`).
+    debug_assert_eq!(AGE_RECIPIENT_PATTERN, "^age1[0-9a-z]+$");
+    let Some(rest) = recipient.strip_prefix("age1") else {
+        return false;
+    };
+    !rest.is_empty()
+        && rest
+            .as_bytes()
+            .iter()
+            .all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+/// Normalize a recipient list for document metadata: trim, shape-check, sort, dedupe.
+///
+/// Returns a non-empty, sorted, unique list or a validation error.
+pub fn normalize_recipients(recipients: Vec<String>) -> crate::error::Result<Vec<String>> {
+    if recipients.is_empty() {
+        return Err(SeclusorError::Validation(
+            "recipients must not be empty (omit the field instead)".to_string(),
+        ));
+    }
+    if recipients.len() > MAX_RECIPIENTS {
+        return Err(SeclusorError::Validation(format!(
+            "too many recipients ({}), maximum is {}",
+            recipients.len(),
+            MAX_RECIPIENTS
+        )));
+    }
+
+    let mut normalized = Vec::with_capacity(recipients.len());
+    for (index, raw) in recipients.into_iter().enumerate() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(SeclusorError::Validation(format!(
+                "recipients[{index}] must not be empty"
+            )));
+        }
+        if !is_valid_age_recipient_shape(trimmed) {
+            return Err(SeclusorError::Validation(format!(
+                "recipients[{index}] is not a valid age recipient public key"
+            )));
+        }
+        normalized.push(trimmed.to_string());
+    }
+
+    normalized.sort();
+    normalized.dedup();
+    if normalized.is_empty() {
+        return Err(SeclusorError::Validation(
+            "recipients must not be empty after normalization".to_string(),
+        ));
+    }
+    if normalized.len() > MAX_RECIPIENTS {
+        return Err(SeclusorError::Validation(format!(
+            "too many recipients after dedupe ({}), maximum is {}",
+            normalized.len(),
+            MAX_RECIPIENTS
+        )));
+    }
+    Ok(normalized)
 }
 
 fn validate_projects(sf: &SecretsFile, errors: &mut Vec<SeclusorError>) {
@@ -278,6 +407,7 @@ mod tests {
             schema_version: "v1.0.0".to_string(),
             env_prefix: None,
             description: None,
+            recipients: None,
             projects: vec![Project {
                 project_slug: "myapp".to_string(),
                 description: None,
@@ -361,6 +491,56 @@ mod tests {
         let errors = validate(&sf);
         assert_eq!(errors.len(), 1);
         assert!(errors[0].to_string().contains("unsupported schema_version"));
+    }
+
+    #[test]
+    fn accepts_v1_1_0_without_recipients() {
+        let mut sf = valid_file();
+        sf.schema_version = "v1.1.0".to_string();
+        assert!(validate(&sf).is_empty());
+    }
+
+    #[test]
+    fn recipients_require_v1_1_0() {
+        let mut sf = valid_file();
+        sf.recipients = Some(vec![
+            "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq".to_string(),
+        ]);
+        let errors = validate(&sf);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.to_string().contains("requires schema_version")),
+            "expected schema/recipients coupling error, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn recipients_must_be_sorted_unique_and_shaped() {
+        let mut sf = valid_file();
+        sf.schema_version = "v1.1.0".to_string();
+        sf.recipients = Some(vec![
+            "age1bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            "age1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        ]);
+        let errors = validate(&sf);
+        assert!(
+            errors.iter().any(|e| e.to_string().contains("sorted")),
+            "expected sort error, got {errors:?}"
+        );
+
+        sf.recipients = Some(vec![
+            "age1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            "age1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        ]);
+        let errors = validate(&sf);
+        assert!(errors.iter().any(|e| e.to_string().contains("duplicated")));
+
+        sf.recipients = Some(vec!["not-an-age-key".to_string()]);
+        let errors = validate(&sf);
+        assert!(errors
+            .iter()
+            .any(|e| e.to_string().contains("not a valid age recipient")));
     }
 
     #[test]

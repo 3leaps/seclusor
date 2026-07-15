@@ -154,6 +154,7 @@ mod tests {
             schema_version: "v1.0.0".to_string(),
             env_prefix: None,
             description: None,
+            recipients: None,
             projects: vec![],
         };
         let err = resolve_project_index(&sf, None).unwrap_err();
@@ -223,6 +224,7 @@ mod tests {
             schema_version: "v1.0.0".to_string(),
             env_prefix: None,
             description: None,
+            recipients: None,
             projects: vec![],
         };
         set_credential(
@@ -243,6 +245,7 @@ mod tests {
             schema_version: "v1.0.0".to_string(),
             env_prefix: None,
             description: None,
+            recipients: None,
             projects: vec![],
         };
         set_credential(
