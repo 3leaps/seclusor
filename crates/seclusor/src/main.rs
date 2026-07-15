@@ -1,8 +1,5 @@
 use clap::Parser;
 
-// Atomic ciphertext commit utility. Kept `pub(crate)` before encrypted write
-// handlers wire it, so durability/CAS can be reviewed and unit-tested now.
-#[allow(dead_code)]
 mod atomic_write;
 mod cli;
 mod env_support;

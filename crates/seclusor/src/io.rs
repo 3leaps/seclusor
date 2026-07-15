@@ -21,8 +21,15 @@ use crate::error::{CliError, CliResult};
 pub(crate) enum WriteTargetProbe {
     /// Strict-valid plaintext secrets document — safe for existing write paths.
     Plaintext(SecretsFile),
-    /// Positively identified encrypted document — refuse before mutation.
-    Encrypted { source: DocumentSource },
+    /// Positively identified encrypted document.
+    ///
+    /// `bytes` are the same bounded contents used for classification (full JSON
+    /// for inline; may be marker-prefix only for early bundle detection). Used
+    /// for CAS on structural-only inline writes; refuse paths ignore them.
+    Encrypted {
+        source: DocumentSource,
+        bytes: Vec<u8>,
+    },
     /// Not positively encrypted. Carry the same bounded bytes into existing
     /// plaintext parse / lenient recovery so those semantics stay intact.
     NotEncrypted(Vec<u8>),
@@ -83,6 +90,7 @@ pub(crate) fn probe_write_target_bytes(bytes: &[u8]) -> WriteTargetProbe {
     if seclusor_codec::is_bundle_ciphertext(bytes) {
         return WriteTargetProbe::Encrypted {
             source: DocumentSource::Bundle,
+            bytes: bytes.to_vec(),
         };
     }
 
@@ -90,9 +98,11 @@ pub(crate) fn probe_write_target_bytes(bytes: &[u8]) -> WriteTargetProbe {
     match seclusor_codec::classify_document_bytes(bytes) {
         Ok(DocumentSource::Bundle) => WriteTargetProbe::Encrypted {
             source: DocumentSource::Bundle,
+            bytes: bytes.to_vec(),
         },
         Ok(DocumentSource::Inline) => WriteTargetProbe::Encrypted {
             source: DocumentSource::Inline,
+            bytes: bytes.to_vec(),
         },
         Ok(DocumentSource::Plaintext) => match secrets_from_bytes(bytes) {
             Ok(secrets) => WriteTargetProbe::Plaintext(secrets),
@@ -107,6 +117,7 @@ pub(crate) fn probe_write_target_bytes(bytes: &[u8]) -> WriteTargetProbe {
             if credential_values_have_inline_ciphertext(bytes) {
                 WriteTargetProbe::Encrypted {
                     source: DocumentSource::Inline,
+                    bytes: bytes.to_vec(),
                 }
             } else {
                 // 4. Not positively encrypted — hand same bytes to plaintext/lenient.

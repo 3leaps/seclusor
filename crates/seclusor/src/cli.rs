@@ -222,7 +222,9 @@ pub(crate) struct SetArgs {
     pub(crate) credential_type: String,
     #[arg(
         long,
-        help = "Store a direct secret value (mutually exclusive with --ref)"
+        help = "Store a direct secret value (mutually exclusive with --ref). \
+                Omit both --value and --ref with --description for a \
+                description-only edit of an existing credential"
     )]
     pub(crate) value: Option<String>,
     #[arg(
@@ -233,12 +235,20 @@ pub(crate) struct SetArgs {
                 platforms. Mutually exclusive with --value"
     )]
     pub(crate) reference: Option<String>,
-    #[arg(long, help = "Human-readable description (single-line, max 128 chars)")]
+    #[arg(
+        long,
+        help = "Human-readable description (single-line, max 128 chars). \
+                With neither --value nor --ref: description-only edit \
+                (existing credential required; empty string clears). \
+                With --value/--ref: set or replace description; omit to \
+                preserve an existing description"
+    )]
     pub(crate) description: Option<String>,
     #[arg(
         long,
         default_value_t = false,
-        help = "Create project if it does not exist"
+        help = "Create project if it does not exist (requires --value or --ref; \
+                not valid for description-only edits)"
     )]
     pub(crate) create_project: bool,
 }

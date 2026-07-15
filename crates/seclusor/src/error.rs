@@ -23,7 +23,6 @@ pub(crate) enum CliError {
         source_kind: &'static str,
     },
     /// Target file changed between load and atomic commit (CAS precondition).
-    #[allow(dead_code)] // Constructed by `atomic_write` (encrypted commit path).
     #[error(
         "concurrent modification detected for {path}; refusing to overwrite. \
          Re-run the command against the current file."

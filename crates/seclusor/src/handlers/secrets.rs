@@ -1,3 +1,9 @@
+use std::path::Path;
+
+use seclusor_codec::{
+    ensure_no_plaintext_credential_values, set_inline_description, unset_inline_value,
+    DocumentSource, LoadMode,
+};
 use seclusor_core::constants::MAX_SECRETS_DOC_BYTES;
 use seclusor_core::crud::{
     get_credential, list_credential_keys, resolve_project_index, set_credential, unset_credential,
@@ -6,6 +12,7 @@ use seclusor_core::env::{format_env_vars, import_env_vars, parse_dotenv};
 use seclusor_core::validate::{normalize_description, validate_strict};
 use seclusor_core::{Credential, SeclusorError, SecretsFile};
 
+use crate::atomic_write::{atomic_write_ciphertext, AtomicWriteOptions};
 use crate::cli::{
     EnvFormatArg, ExportEnvArgs, GetArgs, ImportEnvArgs, InitArgs, ListArgs, SetArgs, UnsetArgs,
     ValidateArgs,
@@ -31,7 +38,7 @@ pub(crate) fn handle_init(args: InitArgs) -> CliResult<()> {
         }
         // Refuse overwriting a positively identified encrypted target.
         match probe_write_target(&args.file)? {
-            WriteTargetProbe::Encrypted { source } => {
+            WriteTargetProbe::Encrypted { source, .. } => {
                 return Err(refuse_encrypted_write(&args.file, source));
             }
             WriteTargetProbe::Plaintext(_) | WriteTargetProbe::NotEncrypted(_) => {}
@@ -48,6 +55,12 @@ pub(crate) fn handle_init(args: InitArgs) -> CliResult<()> {
 }
 
 pub(crate) fn handle_set(args: SetArgs) -> CliResult<()> {
+    if is_description_only_set(&args) {
+        return handle_description_only_set(args);
+    }
+
+    // Value/ref set against positively encrypted targets remains refuse-only;
+    // encrypting writes land on a later path.
     let mut secrets = load_plaintext_secrets_for_write(&args.file)?;
     let existing_description = get_credential(&secrets, args.project.as_deref(), &args.key)
         .ok()
@@ -59,6 +72,82 @@ pub(crate) fn handle_set(args: SetArgs) -> CliResult<()> {
         &args.key,
         credential,
         args.create_project,
+    )?;
+    validate_strict(&secrets)?;
+    write_secrets_file(&args.file, &secrets, false)?;
+    println!("ok");
+    Ok(())
+}
+
+/// Description-only edit: `--description` with neither `--value` nor `--ref`.
+///
+/// - **Plaintext:** normal validated mutation (existing credential required).
+/// - **Inline:** structural-only authorized path (no crypto / identity / recipients).
+/// - **Bundle:** refuse (full encrypting write not yet on this path).
+fn handle_description_only_set(args: SetArgs) -> CliResult<()> {
+    if args.create_project {
+        return Err(CliError::Message(
+            "description-only edit cannot create credentials or projects; \
+             pass --value or --ref to create"
+                .to_string(),
+        ));
+    }
+
+    match probe_write_target(&args.file)? {
+        WriteTargetProbe::Plaintext(secrets) => {
+            apply_plaintext_description_only(secrets, &args)?;
+            Ok(())
+        }
+        WriteTargetProbe::NotEncrypted(bytes) => {
+            let secrets = secrets_from_bytes(&bytes)?;
+            apply_plaintext_description_only(secrets, &args)?;
+            Ok(())
+        }
+        WriteTargetProbe::Encrypted {
+            source: DocumentSource::Inline,
+            bytes,
+        } => {
+            commit_inline_structural_mutation(&args.file, &bytes, |secrets| {
+                let project_slug = resolved_project_slug(secrets, args.project.as_deref())?;
+                let result = set_inline_description(
+                    secrets,
+                    &project_slug,
+                    &args.key,
+                    args.description.as_deref(),
+                )?;
+                Ok(result.secrets)
+            })?;
+            emit_structural_only_write_status("set", DocumentSource::Inline);
+            Ok(())
+        }
+        WriteTargetProbe::Encrypted {
+            source: DocumentSource::Bundle,
+            ..
+        } => Err(refuse_encrypted_write(&args.file, DocumentSource::Bundle)),
+        WriteTargetProbe::Encrypted {
+            source: DocumentSource::Plaintext,
+            ..
+        } => {
+            // Classification never returns Encrypted+Plaintext; defensive.
+            Err(refuse_encrypted_write(
+                &args.file,
+                DocumentSource::Plaintext,
+            ))
+        }
+    }
+}
+
+fn apply_plaintext_description_only(mut secrets: SecretsFile, args: &SetArgs) -> CliResult<()> {
+    // Must exist — description-only never mints credentials.
+    let existing = get_credential(&secrets, args.project.as_deref(), &args.key)?;
+    let mut credential = existing.clone();
+    credential.description = normalize_description(args.description.as_deref());
+    set_credential(
+        &mut secrets,
+        args.project.as_deref(),
+        &args.key,
+        credential,
+        false,
     )?;
     validate_strict(&secrets)?;
     write_secrets_file(&args.file, &secrets, false)?;
@@ -129,7 +218,26 @@ pub(crate) fn handle_list(args: ListArgs) -> CliResult<()> {
 
 pub(crate) fn handle_unset(args: UnsetArgs) -> CliResult<()> {
     match probe_write_target(&args.file)? {
-        WriteTargetProbe::Encrypted { source } => Err(refuse_encrypted_write(&args.file, source)),
+        WriteTargetProbe::Encrypted {
+            source: DocumentSource::Inline,
+            bytes,
+        } => {
+            // Structural-only authorized path: no crypto, identity, or recipients.
+            commit_inline_structural_mutation(&args.file, &bytes, |secrets| {
+                let project_slug = resolved_project_slug(secrets, args.project.as_deref())?;
+                // Fail closed if missing (matches plaintext unset existence check).
+                let _ = get_credential(secrets, Some(&project_slug), &args.key)?;
+                let result = unset_inline_value(secrets, &project_slug, &args.key)?;
+                Ok(result.secrets)
+            })?;
+            emit_structural_only_write_status("unset", DocumentSource::Inline);
+            Ok(())
+        }
+        WriteTargetProbe::Encrypted { source, .. } => {
+            // Bundle (and any non-inline encrypted) unset re-encrypts the whole
+            // document — not on the structural-only path.
+            Err(refuse_encrypted_write(&args.file, source))
+        }
         WriteTargetProbe::Plaintext(mut secrets) => {
             unset_strict(&mut secrets, &args)?;
             write_secrets_file(&args.file, &secrets, false)?;
@@ -165,12 +273,91 @@ fn unset_strict(secrets: &mut SecretsFile, args: &UnsetArgs) -> CliResult<()> {
 }
 
 /// Refuse positively encrypted write targets; otherwise load plaintext.
-fn load_plaintext_secrets_for_write(path: &std::path::Path) -> CliResult<SecretsFile> {
+fn load_plaintext_secrets_for_write(path: &Path) -> CliResult<SecretsFile> {
     match probe_write_target(path)? {
         WriteTargetProbe::Plaintext(secrets) => Ok(secrets),
-        WriteTargetProbe::Encrypted { source } => Err(refuse_encrypted_write(path, source)),
+        WriteTargetProbe::Encrypted { source, .. } => Err(refuse_encrypted_write(path, source)),
         WriteTargetProbe::NotEncrypted(bytes) => secrets_from_bytes(&bytes),
     }
+}
+
+/// True when `--description` is present with neither `--value` nor `--ref`.
+fn is_description_only_set(args: &SetArgs) -> bool {
+    args.value.is_none() && args.reference.is_none() && args.description.is_some()
+}
+
+fn resolved_project_slug(secrets: &SecretsFile, project: Option<&str>) -> CliResult<String> {
+    let idx = resolve_project_index(secrets, project)?;
+    Ok(secrets.projects[idx].project_slug.clone())
+}
+
+/// Structural-only inline mutation: load without identities, mutate in memory,
+/// commit encrypted JSON only via atomic writer + CAS on the original bytes.
+///
+/// `pub(crate)` so unit tests can exercise CAS wiring through this helper
+/// (race inside the mutation closure) without production hooks.
+pub(crate) fn commit_inline_structural_mutation<F>(
+    path: &Path,
+    prior_bytes: &[u8],
+    mutate: F,
+) -> CliResult<()>
+where
+    F: FnOnce(&SecretsFile) -> CliResult<SecretsFile>,
+{
+    // Empty identities → StructuralOnly for inline (shape-checked; no decrypt).
+    let resolved = seclusor_codec::resolve_runtime_document(prior_bytes, &[])?;
+    if resolved.source != DocumentSource::Inline {
+        return Err(refuse_encrypted_write(path, resolved.source));
+    }
+    if resolved.mode != LoadMode::StructuralOnly {
+        // Defensive: with no identities, inline must be structural-only.
+        return Err(CliError::Message(
+            "inline structural-only write requires a structural-only load \
+             (do not pass identities for this path)"
+                .to_string(),
+        ));
+    }
+
+    let mutated = mutate(&resolved.secrets)?;
+    validate_strict(&mutated)?;
+    // Ciphertext-only writer contract: no direct plaintext values may enter an
+    // orphanable temp. Refs and sec:age:v1: values are allowed.
+    ensure_no_plaintext_credential_values(&mutated)?;
+
+    let mut out = serde_json::to_vec_pretty(&mutated)?;
+    // Match create_new secrets pretty-print convention (git-friendly trailing newline).
+    if !out.ends_with(b"\n") {
+        out.push(b'\n');
+    }
+    if out.len() > MAX_SECRETS_DOC_BYTES {
+        return Err(CliError::Core(SeclusorError::DocumentTooLarge {
+            actual: out.len(),
+            max: MAX_SECRETS_DOC_BYTES,
+        }));
+    }
+
+    atomic_write_ciphertext(
+        path,
+        &out,
+        AtomicWriteOptions {
+            expected_prior_bytes: Some(prior_bytes.to_vec()),
+            create_new: false,
+        },
+    )?;
+    Ok(())
+}
+
+/// Stdout/stderr vocabulary for structural-only authorized writes.
+///
+/// Mode token is library-owned ([`LoadMode::token`]); mirrors `validate`.
+fn emit_structural_only_write_status(command: &str, source: DocumentSource) {
+    let mode = LoadMode::StructuralOnly.token();
+    println!("{mode} ok");
+    eprintln!(
+        "{command}: {mode} (source: {}); inline ciphertext encodings checked \
+         without decryption; no identity or recipients required.",
+        source.token()
+    );
 }
 
 pub(crate) fn handle_validate(args: ValidateArgs) -> CliResult<()> {
@@ -417,10 +604,14 @@ fn credential_from_set_args(
             Ok(credential)
         }
         (Some(_), Some(_)) => Err(CliError::Message(
-            "set requires exactly one of --value or --ref".to_string(),
+            "set requires exactly one of --value or --ref \
+             (or --description alone for a description-only edit)"
+                .to_string(),
         )),
         (None, None) => Err(CliError::Message(
-            "set requires exactly one of --value or --ref".to_string(),
+            "set requires exactly one of --value or --ref \
+             (or --description alone for a description-only edit)"
+                .to_string(),
         )),
     }
 }
@@ -1576,19 +1767,10 @@ mod tests {
     }
 
     #[test]
-    fn write_guard_unset_import_init_force_refuse_inline_encrypted() {
+    fn write_guard_import_init_force_refuse_inline_encrypted() {
         let dir = tempfile::tempdir().expect("temp dir");
         let (inline, _identity) = write_inline_encrypted_file(dir.path());
         let before = fs::read(&inline).expect("read before");
-
-        let unset_err = handle_unset(UnsetArgs {
-            file: inline.clone(),
-            project: Some("demo".to_string()),
-            key: "API_KEY".to_string(),
-        })
-        .expect_err("unset must refuse");
-        assert_encrypted_write_refused(&unset_err, "inline");
-        assert_bytes_unchanged(&inline, &before);
 
         let import_err = handle_import_env(ImportEnvArgs {
             file: inline.clone(),
@@ -1613,6 +1795,650 @@ mod tests {
         .expect_err("init --force must refuse encrypted target");
         assert_encrypted_write_refused(&init_err, "inline");
         assert_bytes_unchanged(&inline, &before);
+    }
+
+    #[test]
+    fn handle_unset_inline_structural_only_preserves_untouched_ciphertext() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (inline, _identity) = write_inline_encrypted_file(dir.path());
+        let before = fs::read(&inline).expect("read before");
+        let before_secrets: SecretsFile = serde_json::from_slice(&before).expect("parse before");
+        let vault_ct = before_secrets.projects[0].credentials["VAULT"]
+            .reference
+            .clone();
+        // VAULT is a ref in the fixture; use a second encrypted value if present.
+        // Fixture has API_KEY (value, encrypted) and VAULT (ref, plaintext pointer).
+        let api_before = before_secrets.projects[0].credentials["API_KEY"]
+            .value
+            .clone()
+            .expect("API_KEY value");
+
+        // Encrypt a second value so we can assert untouched ciphertext identity.
+        let mut multi = before_secrets.clone();
+        let recipients = vec![fixture_identity().to_public()];
+        let other_ct = seclusor_crypto::encrypt_inline_value(b"other-secret", &recipients)
+            .expect("encrypt OTHER");
+        multi.projects[0].credentials.insert(
+            "OTHER".to_string(),
+            seclusor_core::Credential::with_value("secret", &other_ct),
+        );
+        write_secrets_file(&inline, &multi, false).expect("write multi");
+        let prior = fs::read(&inline).expect("re-read multi");
+        let other_before = other_ct.clone();
+
+        handle_unset(UnsetArgs {
+            file: inline.clone(),
+            project: Some("demo".to_string()),
+            key: "API_KEY".to_string(),
+        })
+        .expect("inline structural unset");
+
+        let after = fs::read(&inline).expect("read after");
+        assert_ne!(after, prior, "file content must change");
+        let after_secrets: SecretsFile = serde_json::from_slice(&after).expect("parse after");
+        assert!(!after_secrets.projects[0]
+            .credentials
+            .contains_key("API_KEY"));
+        assert_eq!(
+            after_secrets.projects[0].credentials["OTHER"]
+                .value
+                .as_deref(),
+            Some(other_before.as_str()),
+            "untouched ciphertext must be byte-identical"
+        );
+        // Removed key's ciphertext must not reappear as another field's value.
+        for cred in after_secrets.projects[0].credentials.values() {
+            if let Some(v) = &cred.value {
+                assert_ne!(v, &api_before);
+            }
+        }
+        let _ = vault_ct;
+    }
+
+    #[test]
+    fn handle_set_description_only_inline_preserves_ciphertext() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (inline, _identity) = write_inline_encrypted_file(dir.path());
+        let before_secrets: SecretsFile =
+            serde_json::from_slice(&fs::read(&inline).expect("read")).expect("parse");
+        let api_ct = before_secrets.projects[0].credentials["API_KEY"]
+            .value
+            .clone()
+            .expect("API_KEY ciphertext");
+
+        handle_set(SetArgs {
+            file: inline.clone(),
+            project: Some("demo".to_string()),
+            key: "API_KEY".to_string(),
+            credential_type: "secret".to_string(),
+            value: None,
+            reference: None,
+            description: Some("  rotated note  ".to_string()),
+            create_project: false,
+        })
+        .expect("description-only inline");
+
+        let after_secrets: SecretsFile =
+            serde_json::from_slice(&fs::read(&inline).expect("read after")).expect("parse after");
+        assert_eq!(
+            after_secrets.projects[0].credentials["API_KEY"]
+                .description
+                .as_deref(),
+            Some("rotated note")
+        );
+        assert_eq!(
+            after_secrets.projects[0].credentials["API_KEY"]
+                .value
+                .as_deref(),
+            Some(api_ct.as_str()),
+            "value ciphertext must be byte-identical"
+        );
+    }
+
+    #[test]
+    fn handle_set_description_only_plaintext() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("secrets.json");
+        write_fixture_secrets(&path, &fixture_secrets());
+
+        handle_set(SetArgs {
+            file: path.clone(),
+            project: Some("demo".to_string()),
+            key: "API_KEY".to_string(),
+            credential_type: "secret".to_string(),
+            value: None,
+            reference: None,
+            description: Some("plain note".to_string()),
+            create_project: false,
+        })
+        .expect("plaintext description-only");
+
+        let loaded = read_secrets_file(&path).expect("reload");
+        assert_eq!(
+            loaded.projects[0].credentials["API_KEY"]
+                .description
+                .as_deref(),
+            Some("plain note")
+        );
+        assert_eq!(
+            loaded.projects[0].credentials["API_KEY"].value.as_deref(),
+            Some("sk-123")
+        );
+    }
+
+    #[test]
+    fn handle_set_description_only_refuses_missing_key_and_create_project() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("secrets.json");
+        write_fixture_secrets(&path, &fixture_secrets());
+
+        let missing = handle_set(SetArgs {
+            file: path.clone(),
+            project: Some("demo".to_string()),
+            key: "NO_SUCH".to_string(),
+            credential_type: "secret".to_string(),
+            value: None,
+            reference: None,
+            description: Some("x".to_string()),
+            create_project: false,
+        })
+        .expect_err("missing key");
+        assert!(matches!(
+            missing,
+            CliError::Core(SeclusorError::CredentialNotFound { .. })
+        ));
+
+        let create = handle_set(SetArgs {
+            file: path,
+            project: Some("demo".to_string()),
+            key: "API_KEY".to_string(),
+            credential_type: "secret".to_string(),
+            value: None,
+            reference: None,
+            description: Some("x".to_string()),
+            create_project: true,
+        })
+        .expect_err("create_project");
+        let msg = create.to_string();
+        assert!(msg.contains("description-only"));
+        assert!(msg.contains("cannot create"));
+    }
+
+    #[test]
+    fn handle_set_description_only_bundle_still_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("plain.json");
+        let bundle = dir.path().join("secrets.age");
+        write_secrets_file(&input, &fixture_secrets(), true).expect("write plain");
+        handle_bundle_encrypt(BundleEncryptArgs {
+            input,
+            output: bundle.clone(),
+            recipients: RecipientArgs {
+                recipients: vec![fixture_recipient_string()],
+                recipient_file: None,
+                recipient_env_var: None,
+            },
+        })
+        .expect("encrypt");
+        let before = fs::read(&bundle).expect("before");
+
+        let err = handle_set(SetArgs {
+            file: bundle.clone(),
+            project: Some("demo".to_string()),
+            key: "API_KEY".to_string(),
+            credential_type: "secret".to_string(),
+            value: None,
+            reference: None,
+            description: Some("nope".to_string()),
+            create_project: false,
+        })
+        .expect_err("bundle description-only remains refuse");
+
+        assert_encrypted_write_refused(&err, "bundle");
+        assert_bytes_unchanged(&bundle, &before);
+    }
+
+    #[test]
+    fn handle_unset_bundle_still_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("plain.json");
+        let bundle = dir.path().join("secrets.age");
+        write_secrets_file(&input, &fixture_secrets(), true).expect("write plain");
+        handle_bundle_encrypt(BundleEncryptArgs {
+            input,
+            output: bundle.clone(),
+            recipients: RecipientArgs {
+                recipients: vec![fixture_recipient_string()],
+                recipient_file: None,
+                recipient_env_var: None,
+            },
+        })
+        .expect("encrypt");
+        let before = fs::read(&bundle).expect("before");
+
+        let err = handle_unset(UnsetArgs {
+            file: bundle.clone(),
+            project: Some("demo".to_string()),
+            key: "API_KEY".to_string(),
+        })
+        .expect_err("bundle unset remains refuse");
+
+        assert_encrypted_write_refused(&err, "bundle");
+        assert_bytes_unchanged(&bundle, &before);
+    }
+
+    #[test]
+    fn commit_inline_structural_mutation_cas_uses_load_time_bytes() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (inline, _identity) = write_inline_encrypted_file(dir.path());
+        let prior = fs::read(&inline).expect("prior");
+        let racing = b"racing-concurrent-bytes-v2";
+
+        let err = commit_inline_structural_mutation(&inline, &prior, |secrets| {
+            // Simulate concurrent writer between load and commit.
+            fs::write(&inline, racing).expect("race write");
+            let project_slug = secrets.projects[0].project_slug.clone();
+            let result = unset_inline_value(secrets, &project_slug, "API_KEY").expect("mutate");
+            Ok(result.secrets)
+        })
+        .expect_err("CAS must fail when target changed mid-mutation");
+
+        assert!(
+            matches!(err, CliError::ConcurrentModification { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(
+            fs::read(&inline).expect("after race"),
+            racing,
+            "racing content must remain (CAS refused overwrite)"
+        );
+    }
+
+    const MIXED_PLAINTEXT_SENTINEL: &str = "SECLUSOR_PLAINTEXT_SENTINEL_7f3a";
+
+    fn write_mixed_inline_with_plaintext_sentinel(path: &std::path::Path) {
+        let recipients = vec![fixture_identity().to_public()];
+        let mut secrets = SecretsFile::new("demo");
+        let ct = seclusor_crypto::encrypt_inline_value(b"encrypted-secret", &recipients)
+            .expect("encrypt");
+        secrets.projects[0].credentials.insert(
+            "ENC_KEY".to_string(),
+            seclusor_core::Credential::with_value("secret", &ct),
+        );
+        secrets.projects[0].credentials.insert(
+            "PLAIN_KEY".to_string(),
+            seclusor_core::Credential::with_value("secret", MIXED_PLAINTEXT_SENTINEL),
+        );
+        secrets.projects[0].credentials.insert(
+            "REF_KEY".to_string(),
+            seclusor_core::Credential::with_ref("ref", "vault://keep"),
+        );
+        write_secrets_file(path, &secrets, true).expect("write mixed");
+    }
+
+    #[test]
+    fn handle_unset_mixed_doc_refuses_when_plaintext_remains() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("mixed.json");
+        write_mixed_inline_with_plaintext_sentinel(&path);
+        let before = fs::read(&path).expect("before");
+        let names_before = list_sibling_names(dir.path());
+
+        let err = handle_unset(UnsetArgs {
+            file: path.clone(),
+            project: Some("demo".to_string()),
+            key: "ENC_KEY".to_string(),
+        })
+        .expect_err("must refuse plaintext residual");
+
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("plaintext value") || rendered.contains("PLAIN_KEY"),
+            "error={rendered}"
+        );
+        assert!(!rendered.contains(MIXED_PLAINTEXT_SENTINEL));
+        assert!(!rendered.contains(seclusor_core::constants::INLINE_CIPHERTEXT_PREFIX));
+        assert_bytes_unchanged(&path, &before);
+        assert_eq!(list_sibling_names(dir.path()), names_before);
+    }
+
+    #[test]
+    fn handle_set_description_only_mixed_doc_refuses_when_plaintext_remains() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("mixed.json");
+        write_mixed_inline_with_plaintext_sentinel(&path);
+        let before = fs::read(&path).expect("before");
+        let names_before = list_sibling_names(dir.path());
+
+        let err = handle_set(SetArgs {
+            file: path.clone(),
+            project: Some("demo".to_string()),
+            key: "ENC_KEY".to_string(),
+            credential_type: "secret".to_string(),
+            value: None,
+            reference: None,
+            description: Some("note".to_string()),
+            create_project: false,
+        })
+        .expect_err("must refuse plaintext residual");
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("plaintext value") || rendered.contains("PLAIN_KEY"));
+        assert!(!rendered.contains(MIXED_PLAINTEXT_SENTINEL));
+        assert_bytes_unchanged(&path, &before);
+        assert_eq!(list_sibling_names(dir.path()), names_before);
+    }
+
+    #[test]
+    fn handle_unset_mixed_doc_succeeds_when_last_plaintext_removed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("mixed.json");
+        write_mixed_inline_with_plaintext_sentinel(&path);
+        let before_secrets: SecretsFile =
+            serde_json::from_slice(&fs::read(&path).expect("read")).expect("parse");
+        let enc_ct = before_secrets.projects[0].credentials["ENC_KEY"]
+            .value
+            .clone()
+            .expect("enc");
+
+        handle_unset(UnsetArgs {
+            file: path.clone(),
+            project: Some("demo".to_string()),
+            key: "PLAIN_KEY".to_string(),
+        })
+        .expect("removing last plaintext is allowed");
+
+        let after: SecretsFile =
+            serde_json::from_slice(&fs::read(&path).expect("after")).expect("parse after");
+        assert!(!after.projects[0].credentials.contains_key("PLAIN_KEY"));
+        assert_eq!(
+            after.projects[0].credentials["ENC_KEY"].value.as_deref(),
+            Some(enc_ct.as_str())
+        );
+        assert_eq!(
+            after.projects[0].credentials["REF_KEY"]
+                .reference
+                .as_deref(),
+            Some("vault://keep")
+        );
+        ensure_no_plaintext_credential_values(&after).expect("result is ciphertext/ref only");
+    }
+
+    #[test]
+    fn handle_set_description_only_ref_credential_and_clear() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (inline, _identity) = write_inline_encrypted_file(dir.path());
+        // Fixture VAULT is a ref; description-only must not touch ref body.
+        let before: SecretsFile =
+            serde_json::from_slice(&fs::read(&inline).expect("read")).expect("parse");
+        let ref_before = before.projects[0].credentials["VAULT"]
+            .reference
+            .clone()
+            .expect("ref");
+
+        handle_set(SetArgs {
+            file: inline.clone(),
+            project: Some("demo".to_string()),
+            key: "VAULT".to_string(),
+            credential_type: "ref".to_string(),
+            value: None,
+            reference: None,
+            description: Some("  ref note  ".to_string()),
+            create_project: false,
+        })
+        .expect("description on ref");
+
+        let mid: SecretsFile =
+            serde_json::from_slice(&fs::read(&inline).expect("mid")).expect("parse mid");
+        assert_eq!(
+            mid.projects[0].credentials["VAULT"].description.as_deref(),
+            Some("ref note")
+        );
+        assert_eq!(
+            mid.projects[0].credentials["VAULT"].reference.as_deref(),
+            Some(ref_before.as_str())
+        );
+
+        handle_set(SetArgs {
+            file: inline.clone(),
+            project: Some("demo".to_string()),
+            key: "VAULT".to_string(),
+            credential_type: "ref".to_string(),
+            value: None,
+            reference: None,
+            description: Some(String::new()),
+            create_project: false,
+        })
+        .expect("clear description");
+
+        let after: SecretsFile =
+            serde_json::from_slice(&fs::read(&inline).expect("after")).expect("parse after");
+        assert!(after.projects[0].credentials["VAULT"].description.is_none());
+        assert_eq!(
+            after.projects[0].credentials["VAULT"].reference.as_deref(),
+            Some(ref_before.as_str())
+        );
+    }
+
+    #[test]
+    fn structural_ops_preserve_recipients_and_multi_project_ciphertext() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("multi.json");
+        let recipients = vec![fixture_identity().to_public()];
+        let mut secrets = SecretsFile::new("alpha");
+        secrets.schema_version = seclusor_core::constants::SCHEMA_VERSION_V1_1_0.to_string();
+        secrets.recipients = Some(vec![fixture_recipient_string()]);
+        let a_ct =
+            seclusor_crypto::encrypt_inline_value(b"alpha-secret", &recipients).expect("enc a");
+        let b_ct =
+            seclusor_crypto::encrypt_inline_value(b"beta-secret", &recipients).expect("enc b");
+        secrets.projects[0].credentials.insert(
+            "A_KEY".to_string(),
+            seclusor_core::Credential::with_value("secret", &a_ct),
+        );
+        secrets.projects.push(seclusor_core::Project {
+            project_slug: "beta".to_string(),
+            description: None,
+            credentials: {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert(
+                    "B_KEY".to_string(),
+                    seclusor_core::Credential::with_value("secret", &b_ct),
+                );
+                m
+            },
+        });
+        write_secrets_file(&path, &secrets, true).expect("write multi");
+
+        handle_set(SetArgs {
+            file: path.clone(),
+            project: Some("alpha".to_string()),
+            key: "A_KEY".to_string(),
+            credential_type: "secret".to_string(),
+            value: None,
+            reference: None,
+            description: Some("alpha note".to_string()),
+            create_project: false,
+        })
+        .expect("desc multi");
+
+        let after_desc: SecretsFile =
+            serde_json::from_slice(&fs::read(&path).expect("read")).expect("parse");
+        assert_eq!(
+            after_desc.schema_version,
+            seclusor_core::constants::SCHEMA_VERSION_V1_1_0
+        );
+        assert_eq!(
+            after_desc.recipients.as_deref(),
+            Some([fixture_recipient_string()].as_slice())
+        );
+        assert_eq!(
+            after_desc.projects[0].credentials["A_KEY"].value.as_deref(),
+            Some(a_ct.as_str())
+        );
+        assert_eq!(
+            after_desc.projects[1].credentials["B_KEY"].value.as_deref(),
+            Some(b_ct.as_str())
+        );
+
+        handle_unset(UnsetArgs {
+            file: path.clone(),
+            project: Some("alpha".to_string()),
+            key: "A_KEY".to_string(),
+        })
+        .expect("unset multi");
+
+        let after_unset: SecretsFile =
+            serde_json::from_slice(&fs::read(&path).expect("read2")).expect("parse2");
+        assert!(!after_unset.projects[0].credentials.contains_key("A_KEY"));
+        assert_eq!(
+            after_unset.projects[1].credentials["B_KEY"]
+                .value
+                .as_deref(),
+            Some(b_ct.as_str())
+        );
+        assert_eq!(
+            after_unset.recipients.as_deref(),
+            Some([fixture_recipient_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn handle_set_description_only_refuses_ambiguous_and_missing_project() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("two.json");
+        let mut secrets = fixture_secrets();
+        secrets.projects.push(seclusor_core::Project {
+            project_slug: "other".to_string(),
+            description: None,
+            credentials: std::collections::BTreeMap::new(),
+        });
+        // Encrypt so structural path is taken if we ever load it; plaintext multi
+        // also exercises project resolution before write.
+        let recipients = vec![fixture_identity().to_public()];
+        let encrypted = seclusor_codec::encrypt_inline(&secrets, &recipients).expect("encrypt");
+        write_secrets_file(&path, &encrypted, true).expect("write");
+        let before = fs::read(&path).expect("before");
+
+        let ambiguous = handle_set(SetArgs {
+            file: path.clone(),
+            project: None,
+            key: "API_KEY".to_string(),
+            credential_type: "secret".to_string(),
+            value: None,
+            reference: None,
+            description: Some("x".to_string()),
+            create_project: false,
+        })
+        .expect_err("ambiguous project");
+        assert!(matches!(
+            ambiguous,
+            CliError::Core(SeclusorError::AmbiguousProject(_))
+        ));
+        assert_bytes_unchanged(&path, &before);
+
+        let missing = handle_set(SetArgs {
+            file: path.clone(),
+            project: Some("nope".to_string()),
+            key: "API_KEY".to_string(),
+            credential_type: "secret".to_string(),
+            value: None,
+            reference: None,
+            description: Some("x".to_string()),
+            create_project: false,
+        })
+        .expect_err("missing project");
+        assert!(
+            matches!(missing, CliError::Core(SeclusorError::ProjectNotFound(_)))
+                || matches!(
+                    missing,
+                    CliError::Codec(seclusor_codec::CodecError::ProjectNotFound(_))
+                )
+        );
+        assert_bytes_unchanged(&path, &before);
+    }
+
+    #[test]
+    fn commit_structural_refuses_when_pretty_output_exceeds_document_limit() {
+        use seclusor_core::constants::{
+            MAX_CREDENTIALS_PER_PROJECT, MAX_PROJECTS, MAX_SECRETS_DOC_BYTES,
+        };
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("near-limit.json");
+        let recipients = vec![fixture_identity().to_public()];
+        // Minified valid inline document under the limit.
+        let mut base = SecretsFile::new("demo");
+        let ct = seclusor_crypto::encrypt_inline_value(b"seed", &recipients).expect("encrypt seed");
+        base.projects[0].credentials.insert(
+            "SEED".to_string(),
+            seclusor_core::Credential::with_value("secret", &ct),
+        );
+        let compact = serde_json::to_vec(&base).expect("compact");
+        assert!(compact.len() < MAX_SECRETS_DOC_BYTES);
+        fs::write(&path, &compact).expect("write compact");
+        let before = fs::read(&path).expect("before");
+
+        // Grow with ref-only credentials (no plaintext values) until pretty-print
+        // exceeds the document limit while still passing validate_strict.
+        let err = commit_inline_structural_mutation(&path, &before, |loaded| {
+            let mut out = loaded.clone();
+            let pad = "P".repeat(1800);
+            let mut n = 0usize;
+            for p in 0..MAX_PROJECTS {
+                if p >= out.projects.len() {
+                    out.projects.push(seclusor_core::Project {
+                        project_slug: format!("p{p}"),
+                        description: None,
+                        credentials: std::collections::BTreeMap::new(),
+                    });
+                }
+                while out.projects[p].credentials.len() < MAX_CREDENTIALS_PER_PROJECT {
+                    out.projects[p].credentials.insert(
+                        format!("K{n}"),
+                        seclusor_core::Credential {
+                            credential_type: "ref".to_string(),
+                            value: None,
+                            reference: Some(format!("vault://{pad}/{n}")),
+                            description: None,
+                        },
+                    );
+                    n += 1;
+                }
+                // Probe after each full project to stop early once over limit.
+                if serde_json::to_vec_pretty(&out).expect("pretty probe").len()
+                    > MAX_SECRETS_DOC_BYTES
+                {
+                    break;
+                }
+            }
+            let pretty_len = serde_json::to_vec_pretty(&out).expect("pretty final").len();
+            assert!(
+                pretty_len > MAX_SECRETS_DOC_BYTES,
+                "test fixture must exceed document limit after pretty-print (got {pretty_len})"
+            );
+            Ok(out)
+        })
+        .expect_err("must refuse oversized pretty output");
+
+        assert!(
+            matches!(err, CliError::Core(SeclusorError::DocumentTooLarge { .. })),
+            "got {err:?}"
+        );
+        assert_bytes_unchanged(&path, &before);
+        assert_eq!(
+            list_sibling_names(dir.path()),
+            vec!["near-limit.json".to_string()]
+        );
+    }
+
+    fn list_sibling_names(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .expect("read dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
     }
 
     #[test]
@@ -1679,6 +2505,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("malformed-inline.json");
         // Invalid schema_version so strict parse fails; credential value still carries marker.
+        // Probe classifies as encrypted inline → structural path (not lenient).
         write_raw_json(
             &path,
             r#"{
@@ -1701,9 +2528,15 @@ mod tests {
             project: Some("demo".to_string()),
             key: "API_KEY".to_string(),
         })
-        .expect_err("must refuse before lenient path");
+        .expect_err("must fail closed before lenient path");
 
-        assert_encrypted_write_refused(&err, "inline");
+        // Structural load fails validation — never mutates or enters lenient recovery.
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("schema_version") || rendered.contains("Validation"),
+            "error={rendered}"
+        );
+        assert!(!rendered.contains("sec:age:v1:"));
         assert_bytes_unchanged(&path, &before);
     }
 
@@ -1712,6 +2545,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("bare-string-inline.json");
         // Bare-string credential is malformed model shape but carries the inline marker.
+        // Probe classifies as encrypted inline → structural path (not lenient).
         write_raw_json(
             &path,
             r#"{
@@ -1732,9 +2566,12 @@ mod tests {
             project: Some("demo".to_string()),
             key: "API_KEY".to_string(),
         })
-        .expect_err("must refuse bare-string encrypted credential");
+        .expect_err("must fail closed on bare-string encrypted credential");
 
-        assert_encrypted_write_refused(&err, "inline");
+        let rendered = err.to_string();
+        // Must not lenient-strip; must not echo ciphertext body.
+        assert!(!rendered.contains("sec:age:v1:dGVzdA"));
+        assert!(!rendered.contains("file was updated"));
         assert_bytes_unchanged(&path, &before);
     }
 
