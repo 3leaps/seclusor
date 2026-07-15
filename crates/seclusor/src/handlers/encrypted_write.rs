@@ -203,14 +203,11 @@ pub(crate) fn ensure_inline_stanza_count_matches(
     Ok(())
 }
 
-/// Fail closed when a **bundle** ciphertext stanza count diverges from the set.
+/// Refuse scrypt (passphrase) data-bundle inputs on encrypting write/rekey paths.
 ///
-/// On establishment this is explicit cardinality must match the prior
-/// header. Resize → rekey only. Residual: same-count key swap not detectable.
-pub(crate) fn ensure_bundle_stanza_count_matches(
-    ciphertext: &[u8],
-    expected_recipients: usize,
-) -> CliResult<()> {
+/// Call **before** identity decrypt so CLI failures name SC-011 instead of a
+/// generic decryption error.
+pub(crate) fn refuse_scrypt_bundle_write(ciphertext: &[u8]) -> CliResult<()> {
     if seclusor_crypto::is_scrypt_ciphertext(ciphertext)? {
         return Err(CliError::Message(
             "passphrase-encrypted (scrypt) bundle writes are not supported; \
@@ -219,6 +216,18 @@ pub(crate) fn ensure_bundle_stanza_count_matches(
                 .to_string(),
         ));
     }
+    Ok(())
+}
+
+/// Fail closed when a **bundle** ciphertext stanza count diverges from the set.
+///
+/// On establishment this is explicit cardinality must match the prior
+/// header. Resize → rekey only. Residual: same-count key swap not detectable.
+pub(crate) fn ensure_bundle_stanza_count_matches(
+    ciphertext: &[u8],
+    expected_recipients: usize,
+) -> CliResult<()> {
+    refuse_scrypt_bundle_write(ciphertext)?;
     let count = seclusor_crypto::count_x25519_recipient_stanzas(ciphertext)?;
     if count != expected_recipients {
         return Err(CliError::Message(format!(

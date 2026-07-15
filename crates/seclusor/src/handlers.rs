@@ -6,6 +6,8 @@ pub(crate) mod docs;
 pub(crate) mod encrypted_write;
 pub(crate) mod inline;
 pub(crate) mod keys;
+#[cfg(test)]
+mod packaging_matrix;
 pub(crate) mod rekey;
 pub(crate) mod run;
 pub(crate) mod secrets;

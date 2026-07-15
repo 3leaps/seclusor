@@ -348,6 +348,114 @@ fn process_set_inline_with_recipient_covers_single_field_doc() {
 }
 
 #[test]
+fn process_import_env_inline_encrypted_happy_and_mismatch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("one.json");
+    fs::write(
+        &input,
+        r#"{
+  "schema_version": "v1.0.0",
+  "env_prefix": "APP_",
+  "projects": [{
+    "project_slug": "demo",
+    "credentials": {
+      "TOKEN": { "type": "secret", "value": "old" }
+    }
+  }]
+}"#,
+    )
+    .expect("write");
+    let identity = dir.path().join("identity.txt");
+    let gen = run_seclusor(&[
+        "keys",
+        "age",
+        "identity",
+        "generate",
+        "--output",
+        identity.to_str().unwrap(),
+    ]);
+    assert!(gen.status.success());
+    let recipient = String::from_utf8(gen.stdout).unwrap();
+    let recipient = recipient.trim();
+    let inline = dir.path().join("inline.json");
+    let enc = run_seclusor(&[
+        "secrets",
+        "inline",
+        "encrypt",
+        "--input",
+        input.to_str().unwrap(),
+        "--output",
+        inline.to_str().unwrap(),
+        "--recipient",
+        recipient,
+    ]);
+    assert!(
+        enc.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&enc.stderr)
+    );
+
+    let dotenv = dir.path().join("import.env");
+    fs::write(&dotenv, "APP_TOKEN=from-process\n").expect("dotenv");
+    let import = run_seclusor(&[
+        "secrets",
+        "import-env",
+        "--file",
+        inline.to_str().unwrap(),
+        "--project",
+        "demo",
+        "--prefix",
+        "APP_",
+        "--dotenv-file",
+        dotenv.to_str().unwrap(),
+        "--recipient",
+        recipient,
+        "--identity-file",
+        identity.to_str().unwrap(),
+    ]);
+    assert!(
+        import.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&import.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&import.stdout).trim(), "1");
+
+    // Mismatch recipients refuse without mutating.
+    let before = fs::read(&inline).expect("before");
+    let other_id = dir.path().join("other.txt");
+    let gen2 = run_seclusor(&[
+        "keys",
+        "age",
+        "identity",
+        "generate",
+        "--output",
+        other_id.to_str().unwrap(),
+    ]);
+    assert!(gen2.status.success());
+    let other_r = String::from_utf8(gen2.stdout).unwrap();
+    let other_r = other_r.trim();
+    let bad = run_seclusor(&[
+        "secrets",
+        "import-env",
+        "--file",
+        inline.to_str().unwrap(),
+        "--project",
+        "demo",
+        "--prefix",
+        "APP_",
+        "--dotenv-file",
+        dotenv.to_str().unwrap(),
+        "--recipient",
+        other_r,
+        "--identity-file",
+        identity.to_str().unwrap(),
+    ]);
+    assert!(!bad.status.success());
+    assert_eq!(fs::read(&inline).expect("after"), before);
+    assert!(String::from_utf8_lossy(&bad.stdout).is_empty());
+}
+
+#[test]
 fn process_inline_unset_structural_only_stdout() {
     let dir = tempfile::tempdir().expect("tempdir");
     let inline = prepare_inline_encrypted(dir.path());

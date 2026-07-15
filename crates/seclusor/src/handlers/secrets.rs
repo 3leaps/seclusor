@@ -23,8 +23,8 @@ use crate::error::{CliError, CliResult};
 use crate::handlers::encrypted_write::{
     apply_establishment, commit_bundle_mutation, commit_inline_ciphertext_document,
     emit_establishment_notice, ensure_inline_stanza_count_matches,
-    inline_establishment_coverage_ok, load_inline_full_for_write, resolve_set_material,
-    resolve_write_recipients, SetMaterial, ValueChannelArgs,
+    inline_establishment_coverage_ok, load_inline_full_for_write, refuse_scrypt_bundle_write,
+    resolve_set_material, resolve_write_recipients, SetMaterial, ValueChannelArgs,
 };
 use crate::io::{
     probe_write_target, read_file_with_limit, read_runtime_document_file,
@@ -234,6 +234,7 @@ fn handle_set_inline_encrypted(mut args: SetArgs, prior_bytes: &[u8]) -> CliResu
 }
 
 fn handle_set_bundle_encrypted(mut args: SetArgs, prior_bytes: &[u8]) -> CliResult<()> {
+    refuse_scrypt_bundle_write(prior_bytes)?;
     let identities = resolve_identities(&args.identities, &args.passphrase, true)?;
     let material = resolve_set_material(value_channels_from_set(&mut args))?;
 
@@ -388,6 +389,7 @@ fn handle_description_only_set(args: SetArgs) -> CliResult<()> {
             source: DocumentSource::Bundle,
             bytes,
         } => {
+            refuse_scrypt_bundle_write(&bytes)?;
             let identities = resolve_identities(&args.identities, &args.passphrase, true)?;
             let peek = seclusor_codec::resolve_runtime_document(&bytes, &identities)?;
             let resolved = resolve_write_recipients(
@@ -538,6 +540,7 @@ pub(crate) fn handle_unset(args: UnsetArgs) -> CliResult<()> {
             source: DocumentSource::Bundle,
             bytes,
         } => {
+            refuse_scrypt_bundle_write(&bytes)?;
             let identities = resolve_identities(&args.identities, &args.passphrase, true)?;
             let peek = seclusor_codec::resolve_runtime_document(&bytes, &identities)?;
             let resolved = resolve_write_recipients(
@@ -960,6 +963,7 @@ fn handle_import_env_inline(args: ImportEnvArgs, prior_bytes: &[u8]) -> CliResul
 }
 
 fn handle_import_env_bundle(args: ImportEnvArgs, prior_bytes: &[u8]) -> CliResult<()> {
+    refuse_scrypt_bundle_write(prior_bytes)?;
     let identities = resolve_identities(&args.identities, &args.passphrase, true)?;
     let peek = seclusor_codec::resolve_runtime_document(prior_bytes, &identities)?;
     let imported = prepare_import_pairs(&peek.secrets, &args)?;
