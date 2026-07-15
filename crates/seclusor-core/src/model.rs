@@ -3,7 +3,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::constants::{INLINE_CIPHERTEXT_PREFIX, SCHEMA_VERSION};
+use crate::constants::{INLINE_CIPHERTEXT_PREFIX, SCHEMA_VERSION, SCHEMA_VERSION_V1_1_0};
 use crate::validate::normalize_description;
 
 /// A seclusor secrets file containing one or more projects.
@@ -19,6 +19,12 @@ pub struct SecretsFile {
         deserialize_with = "deserialize_normalized_description_opt"
     )]
     pub description: Option<String>,
+    /// Optional whole-document age recipient public keys (schema v1.1.0+).
+    ///
+    /// Absent on v1.0.0 documents. When present, must be sorted, deduped, and
+    /// structurally valid age recipients (see ADR-0012).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipients: Option<Vec<String>>,
     pub projects: Vec<Project>,
 }
 
@@ -224,6 +230,7 @@ impl SecretsFile {
             schema_version: SCHEMA_VERSION.to_string(),
             env_prefix: None,
             description: None,
+            recipients: None,
             projects: vec![Project {
                 project_slug: project_slug.to_string(),
                 description: None,
@@ -237,6 +244,19 @@ impl SecretsFile {
         self.projects
             .iter()
             .any(|p| p.credentials.values().any(|c| c.is_inline_encrypted()))
+    }
+
+    /// Persist whole-document recipient metadata and rewrite schema to v1.1.0.
+    ///
+    /// Normalizes input: trim, validate structural age-recipient shape, sort,
+    /// and dedupe. Empty or invalid sets fail closed.
+    ///
+    /// Policy about *when* establishment is permitted lives in the CLI.
+    pub fn establish_recipients(&mut self, recipients: Vec<String>) -> crate::error::Result<()> {
+        let normalized = crate::validate::normalize_recipients(recipients)?;
+        self.schema_version = SCHEMA_VERSION_V1_1_0.to_string();
+        self.recipients = Some(normalized);
+        Ok(())
     }
 }
 

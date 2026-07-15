@@ -2,6 +2,8 @@
 //!
 //! Storage codecs (bundle + inline) and format conversion.
 
+mod mutate;
+
 use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -14,6 +16,11 @@ use seclusor_core::validate::validate_strict;
 use seclusor_core::{SeclusorError, SecretsFile};
 use seclusor_crypto::{CryptoError, Identity, Recipient};
 use thiserror::Error;
+
+pub use mutate::{
+    encrypted_value_keys, mutate_bundle, reencrypt_all_inline, set_inline_description,
+    set_inline_value, unset_inline_value, BundleMutateResult, InlineMutateResult,
+};
 
 /// Supported storage codecs (conversion surface: bundle ↔ JSON form).
 ///
@@ -30,8 +37,8 @@ pub enum StorageCodec {
 
 /// How secrets document bytes were classified before optional decryption.
 ///
-/// Used by read-side operations (SC-018) so callers can distinguish full
-/// validation from structural-only inspection of encrypted inputs.
+/// Used by read-side operations so callers can distinguish full validation
+/// from structural-only inspection of encrypted inputs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DocumentSource {
     /// Whole-file age ciphertext (binary or armored header).
@@ -40,6 +47,17 @@ pub enum DocumentSource {
     Plaintext,
     /// Valid secrets JSON containing at least one inline-encrypted value.
     Inline,
+}
+
+impl DocumentSource {
+    /// Machine-readable classification token (`bundle`, `plaintext`, or `inline`).
+    pub fn token(self) -> &'static str {
+        match self {
+            DocumentSource::Bundle => "bundle",
+            DocumentSource::Plaintext => "plaintext",
+            DocumentSource::Inline => "inline",
+        }
+    }
 }
 
 /// Whether encrypted material was opened for this load.
@@ -74,16 +92,16 @@ impl ResolvedDocument {
 
     /// Machine-readable source classification (`bundle`, `plaintext`, or `inline`).
     pub fn source_token(&self) -> &'static str {
-        match self.source {
-            DocumentSource::Bundle => "bundle",
-            DocumentSource::Plaintext => "plaintext",
-            DocumentSource::Inline => "inline",
-        }
+        self.source.token()
     }
 }
 
 /// Error type for codec operations.
+///
+/// Marked `non_exhaustive` so write-side variants can land without breaking
+/// downstream exhaustive matches (semver note in CHANGELOG when public).
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum CodecError {
     /// Unsupported document format for autodetection/parsing.
     #[error("unsupported secrets document format")]
@@ -127,6 +145,28 @@ pub enum CodecError {
         "bundle plaintext must not contain nested inline ciphertext (found credential {key:?} in project {project:?}); nested codecs are not supported"
     )]
     NestedInlineInBundle { project: String, key: String },
+
+    /// Targeted mutation could not locate the requested project.
+    #[error("project not found: {0}")]
+    ProjectNotFound(String),
+
+    /// Targeted mutation could not locate the requested credential.
+    #[error("credential {key:?} not found in project {project:?}")]
+    CredentialNotFound { project: String, key: String },
+
+    /// Mutation called with an empty recipient set.
+    #[error("recipient set is empty; supply at least one age recipient")]
+    EmptyRecipientSet,
+
+    /// Passphrase-encrypted (scrypt) data bundles are not supported on this write surface.
+    ///
+    /// Write paths here are X25519 recipient documents only. Convert to recipient
+    /// mode or use passphrase-specific tooling outside this path.
+    #[error(
+        "passphrase-encrypted (scrypt) bundle writes are not supported; \
+         convert to X25519 recipient mode first"
+    )]
+    ScryptBundleUnsupported,
 
     /// Core-domain validation or model error.
     #[error(transparent)]
@@ -421,7 +461,7 @@ pub fn classify_document_bytes(input: &[u8]) -> Result<DocumentSource> {
 }
 
 /// Resolve runtime source bytes as plaintext JSON, bundle ciphertext, or
-/// inline-encrypted JSON, retaining classification metadata for SC-018.
+/// inline-encrypted JSON, retaining classification metadata.
 ///
 /// Classification is fail-closed: bundle marker detection takes precedence and
 /// never falls back to plaintext JSON if bundle decryption fails.
@@ -582,9 +622,21 @@ fn read_runtime_input_bytes(input_path: &Path) -> Result<Vec<u8>> {
     read_file_with_limit(input_path, max, kind)
 }
 
-fn is_bundle_ciphertext(input: &[u8]) -> bool {
+/// Return true when `input` begins with a binary or armored age bundle marker.
+///
+/// Bounded prefix probe suitable for classification without reading a full file.
+/// Does not validate the remainder of the ciphertext.
+pub fn is_bundle_ciphertext(input: &[u8]) -> bool {
     input.starts_with(b"age-encryption.org/")
         || input.starts_with(b"-----BEGIN AGE ENCRYPTED FILE-----")
+}
+
+/// Probe only the first bytes of a file for a bundle marker (64-byte prefix).
+///
+/// Used by write guards so oversized bundles refuse as encrypted targets
+/// rather than failing with a document-size error.
+pub fn file_has_bundle_marker(path: impl AsRef<Path>) -> Result<bool> {
+    detect_bundle_marker_from_file(path.as_ref())
 }
 
 fn ensure_document_size(actual: usize) -> Result<()> {
@@ -716,6 +768,7 @@ mod tests {
             schema_version: "v1.0.0".to_string(),
             env_prefix: Some("APP_".to_string()),
             description: Some("fixture".to_string()),
+            recipients: None,
             projects: vec![seclusor_core::Project {
                 project_slug: "demo".to_string(),
                 description: None,
@@ -871,6 +924,32 @@ mod tests {
         assert_eq!(resolved.mode_token(), "full");
         assert_eq!(resolved.source_token(), "plaintext");
         assert_eq!(resolved.secrets, secrets);
+    }
+
+    #[test]
+    fn resolve_runtime_document_accepts_v1_1_0_with_recipients() {
+        // Read loaders must accept schema v1.1.0 documents with optional recipients.
+        let mut secrets = fixture_secrets();
+        let recipient = fixture_recipient().to_string();
+        secrets
+            .establish_recipients(vec![recipient])
+            .expect("establish");
+        let json = serde_json::to_vec(&secrets).expect("serialize");
+        let resolved = resolve_runtime_document(&json, &[]).expect("v1.1.0 resolve");
+        assert_eq!(resolved.source, DocumentSource::Plaintext);
+        assert_eq!(resolved.mode, LoadMode::Full);
+        assert_eq!(
+            resolved.secrets.schema_version,
+            seclusor_core::constants::SCHEMA_VERSION_V1_1_0
+        );
+        assert!(resolved.secrets.recipients.is_some());
+    }
+
+    #[test]
+    fn document_source_token_matches_resolved_source_token() {
+        assert_eq!(DocumentSource::Bundle.token(), "bundle");
+        assert_eq!(DocumentSource::Plaintext.token(), "plaintext");
+        assert_eq!(DocumentSource::Inline.token(), "inline");
     }
 
     #[test]

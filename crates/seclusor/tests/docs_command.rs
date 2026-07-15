@@ -30,6 +30,9 @@ fn docs_show_plain_returns_markdown() {
     assert_eq!(String::from_utf8(output.stderr).expect("utf8 stderr"), "");
 
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    // Normalize line endings: git checkout on Windows may present embedded
+    // markdown with CRLF while the assertion is written for LF.
+    let stdout = stdout.replace("\r\n", "\n");
     assert!(stdout.starts_with("# Quick Start\n"));
     assert!(stdout.contains("secrets export-env --file secrets.age --identity-file"));
     assert!(stdout.contains("seclusor secrets run"));

@@ -22,6 +22,13 @@ pub(crate) enum CliError {
         /// Machine-readable source token: `bundle` or `inline`.
         source_kind: &'static str,
     },
+    /// Target file changed between load and atomic commit (CAS precondition).
+    #[allow(dead_code)] // Constructed by `atomic_write` (encrypted commit path).
+    #[error(
+        "concurrent modification detected for {path}; refusing to overwrite. \
+         Re-run the command against the current file."
+    )]
+    ConcurrentModification { path: String },
     #[error(transparent)]
     Core(#[from] SeclusorError),
     #[error(transparent)]

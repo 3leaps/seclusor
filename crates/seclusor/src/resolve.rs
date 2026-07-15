@@ -251,10 +251,11 @@ fn resolve_passphrase_for_protected(
     Ok(pp)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
 
     use seclusor_crypto::CryptoError;
     use seclusor_keyring::generate_identity_file_with_passphrase;
@@ -264,10 +265,7 @@ mod tests {
     use crate::error::CliError;
 
     #[test]
-    #[cfg(unix)]
     fn resolve_identities_insecure_protected_file_fails_before_passphrase_probe() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("protected.txt");
         let pp = SecretString::from("test-passphrase-for-cli-preflight".to_owned());
@@ -302,10 +300,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn resolve_identities_public_key_insecure_protected_fails_before_passphrase_probe() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().expect("temp dir");
         let xdg = dir.path().join("xdg-config");
         let seclusor_cfg = xdg.join("seclusor");
