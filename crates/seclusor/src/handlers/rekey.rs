@@ -17,7 +17,7 @@ use crate::atomic_write::{atomic_write_ciphertext, AtomicWriteOptions};
 use crate::cli::RekeyArgs;
 use crate::error::{CliError, CliResult};
 use crate::handlers::encrypted_write::{
-    apply_establishment, emit_establishment_notice, recipient_strings,
+    apply_establishment, emit_establishment_notice, recipient_strings, refuse_scrypt_bundle_write,
 };
 use crate::io::{probe_write_target, WriteTargetProbe};
 use crate::resolve::{resolve_identities, resolve_recipients};
@@ -33,9 +33,19 @@ pub(crate) fn handle_rekey(args: RekeyArgs) -> CliResult<()> {
     }
     let new_recipients = resolve_recipients(&args.recipients)?;
     let new_strings = recipient_strings(&new_recipients);
-    let identities = resolve_identities(&args.identities, &args.passphrase, true)?;
 
+    // Classify target before identity resolution so scrypt data-bundles refuse
+    // naming SC-011 even when identity channels are missing/protected.
     let probe = probe_write_target(&args.file)?;
+    if let WriteTargetProbe::Encrypted {
+        source: DocumentSource::Bundle,
+        bytes,
+    } = &probe
+    {
+        refuse_scrypt_bundle_write(bytes)?;
+    }
+
+    let identities = resolve_identities(&args.identities, &args.passphrase, true)?;
     let output_path = args.output.as_ref().unwrap_or(&args.file);
     let in_place = paths_equal(output_path, &args.file);
 
@@ -108,14 +118,8 @@ pub(crate) fn handle_rekey(args: RekeyArgs) -> CliResult<()> {
             source: DocumentSource::Bundle,
             bytes,
         } => {
-            if seclusor_crypto::is_scrypt_ciphertext(&bytes)? {
-                return Err(CliError::Message(
-                    "passphrase-encrypted (scrypt) bundle rekey is not supported; \
-                     SC-011 owns data-passphrase UX"
-                        .to_string(),
-                ));
-            }
-
+            // Scrypt already refused before identity resolve; mutate_bundle
+            // re-checks as defense in depth.
             let result = mutate_bundle(&bytes, &identities, &new_recipients, |secrets| {
                 secrets
                     .establish_recipients(new_strings.clone())

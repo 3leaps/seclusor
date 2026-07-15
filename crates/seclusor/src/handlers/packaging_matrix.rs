@@ -194,21 +194,47 @@ mod tests {
         assert_eq!(fs::read(&inline).expect("after"), before);
     }
 
+    fn with_import_prefix(inline: &std::path::Path) {
+        let mut secrets = read_secrets_file(inline).expect("load");
+        secrets.env_prefix = Some("APP_".into());
+        write_secrets_file(inline, &secrets, false).expect("write");
+    }
+
     #[test]
-    fn import_env_inline_recipient_file_mismatch_byte_identical() {
+    fn import_env_inline_recipient_file_equality_and_mismatch() {
         let dir = tempfile::tempdir().expect("temp");
         let (inline, identity_file, recipient) = established_inline_one_field(dir.path());
-        // Ensure env_prefix for import
-        let mut secrets = read_secrets_file(&inline).expect("load");
-        secrets.env_prefix = Some("APP_".into());
-        write_secrets_file(&inline, &secrets, false).expect("write");
+        with_import_prefix(&inline);
+        let rfile = dir.path().join("recipients.txt");
+        write_recipient_file(&rfile, &[recipient.as_str()]);
+        let dotenv = dir.path().join("import.env");
+        fs::write(&dotenv, "APP_API_KEY=via-file\n").expect("dotenv");
+
+        handle_import_env(ImportEnvArgs {
+            file: inline.clone(),
+            project: Some("demo".into()),
+            credential_type: "secret".into(),
+            prefix: Some("APP_".into()),
+            strip_prefix: true,
+            dotenv_file: Some(dotenv.clone()),
+            create_project: false,
+            recipients: RecipientArgs {
+                recipients: vec![],
+                recipient_file: Some(rfile.clone()),
+                recipient_env_var: None,
+            },
+            identities: IdentityArgs {
+                identity_files: vec![identity_file.clone()],
+                identity_public_key: None,
+            },
+            passphrase: PassphraseArgs::default(),
+        })
+        .expect("import recipient-file equality");
 
         let other = seclusor_keyring::generate_identity_file(dir.path().join("other.txt"))
             .expect("other")
             .recipient;
-        let rfile = dir.path().join("bad-recipients.txt");
         write_recipient_file(&rfile, &[other.as_str()]);
-        let dotenv = dir.path().join("import.env");
         fs::write(&dotenv, "APP_API_KEY=should-not-land\n").expect("dotenv");
         let before = fs::read(&inline).expect("before");
         let names = list_sibling_names(dir.path());
@@ -232,9 +258,75 @@ mod tests {
             },
             passphrase: PassphraseArgs::default(),
         })
-        .expect_err("import mismatch");
-        let _ = recipient;
+        .expect_err("import file mismatch");
+        assert!(err.to_string().contains("do not match") || err.to_string().contains("rekey"));
         assert!(!err.to_string().contains("should-not-land"));
+        assert_eq!(fs::read(&inline).expect("after"), before);
+        assert_eq!(list_sibling_names(dir.path()), names);
+    }
+
+    #[test]
+    fn import_env_inline_recipient_env_equality_and_mismatch() {
+        let dir = tempfile::tempdir().expect("temp");
+        let (inline, identity_file, recipient) = established_inline_one_field(dir.path());
+        with_import_prefix(&inline);
+        let var = "SECLUSOR_TEST_PKG_IMPORT_RECIPIENTS";
+        std::env::set_var(var, &recipient);
+        let dotenv = dir.path().join("import.env");
+        fs::write(&dotenv, "APP_API_KEY=via-env\n").expect("dotenv");
+
+        handle_import_env(ImportEnvArgs {
+            file: inline.clone(),
+            project: Some("demo".into()),
+            credential_type: "secret".into(),
+            prefix: Some("APP_".into()),
+            strip_prefix: true,
+            dotenv_file: Some(dotenv.clone()),
+            create_project: false,
+            recipients: RecipientArgs {
+                recipients: vec![],
+                recipient_file: None,
+                recipient_env_var: Some(var.to_string()),
+            },
+            identities: IdentityArgs {
+                identity_files: vec![identity_file.clone()],
+                identity_public_key: None,
+            },
+            passphrase: PassphraseArgs::default(),
+        })
+        .expect("import recipient-env equality");
+
+        let other = seclusor_keyring::generate_identity_file(dir.path().join("other.txt"))
+            .expect("other")
+            .recipient;
+        std::env::set_var(var, &other);
+        fs::write(&dotenv, "APP_API_KEY=env-mismatch-body\n").expect("dotenv");
+        let before = fs::read(&inline).expect("before");
+        let names = list_sibling_names(dir.path());
+
+        let err = handle_import_env(ImportEnvArgs {
+            file: inline.clone(),
+            project: Some("demo".into()),
+            credential_type: "secret".into(),
+            prefix: Some("APP_".into()),
+            strip_prefix: true,
+            dotenv_file: Some(dotenv),
+            create_project: false,
+            recipients: RecipientArgs {
+                recipients: vec![],
+                recipient_file: None,
+                recipient_env_var: Some(var.to_string()),
+            },
+            identities: IdentityArgs {
+                identity_files: vec![identity_file],
+                identity_public_key: None,
+            },
+            passphrase: PassphraseArgs::default(),
+        })
+        .expect_err("import env mismatch");
+        std::env::remove_var(var);
+        assert!(err.to_string().contains("do not match") || err.to_string().contains("rekey"));
+        assert!(!err.to_string().contains("env-mismatch-body"));
         assert_eq!(fs::read(&inline).expect("after"), before);
         assert_eq!(list_sibling_names(dir.path()), names);
     }
@@ -281,20 +373,16 @@ mod tests {
         .expect_err("scrypt refuse");
 
         let msg = err.to_string();
-        assert!(
-            msg.contains("SC-011") || msg.contains("scrypt") || msg.contains("passphrase"),
-            "{msg}"
-        );
+        assert!(msg.contains("SC-011"), "must name SC-011, got {msg}");
         assert!(!msg.contains("nope"));
         assert_eq!(fs::read(&path).expect("after"), before);
         assert_eq!(list_sibling_names(dir.path()), names);
     }
 
     #[test]
-    fn rekey_scrypt_bundle_refuses_naming_sc011() {
+    fn rekey_scrypt_bundle_refuses_naming_sc011_before_identity() {
+        // No identity files: classification must still name SC-011 (probe before resolve).
         let dir = tempfile::tempdir().expect("temp");
-        let identity_file = dir.path().join("id.txt");
-        write_identity_file(&identity_file, TEST_IDENTITY);
         let secrets = fixture_secrets();
         let scrypt =
             seclusor_codec::encrypt_bundle_with_passphrase(&secrets, "test-passphrase-not-secret")
@@ -302,6 +390,7 @@ mod tests {
         let path = dir.path().join("scrypt.age");
         fs::write(&path, &scrypt).expect("write");
         let before = scrypt;
+        let names = list_sibling_names(dir.path());
 
         let err = handle_rekey(RekeyArgs {
             file: path.clone(),
@@ -311,15 +400,17 @@ mod tests {
                 recipient_file: None,
                 recipient_env_var: None,
             },
-            identities: IdentityArgs {
-                identity_files: vec![identity_file],
-                identity_public_key: None,
-            },
+            identities: IdentityArgs::default(),
             passphrase: PassphraseArgs::default(),
         })
-        .expect_err("scrypt rekey");
-        assert!(err.to_string().contains("SC-011") || err.to_string().contains("scrypt"));
+        .expect_err("scrypt rekey without identity");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SC-011"),
+            "must name SC-011 before identity fail, got {msg}"
+        );
         assert_eq!(fs::read(&path).expect("after"), before);
+        assert_eq!(list_sibling_names(dir.path()), names);
     }
 
     // --- Stanza divergence (metadata present, heterogeneous field) ---
@@ -411,10 +502,11 @@ mod tests {
     }
 
     #[test]
-    fn rekey_missing_identity_refuses() {
+    fn rekey_missing_identity_refuses_hygiene() {
         let dir = tempfile::tempdir().expect("temp");
         let (inline, _) = write_inline_encrypted_file(dir.path());
         let before = fs::read(&inline).expect("before");
+        let names = list_sibling_names(dir.path());
         let err = handle_rekey(RekeyArgs {
             file: inline.clone(),
             output: None,
@@ -429,15 +521,17 @@ mod tests {
         .expect_err("missing identity");
         assert!(err.to_string().contains("identity"));
         assert_eq!(fs::read(&inline).expect("after"), before);
+        assert_eq!(list_sibling_names(dir.path()), names);
     }
 
     #[test]
-    fn rekey_wrong_identity_refuses_byte_identical() {
+    fn rekey_wrong_identity_refuses_hygiene() {
         let dir = tempfile::tempdir().expect("temp");
         let (inline, _) = write_inline_encrypted_file(dir.path());
         let wrong = dir.path().join("wrong.txt");
         seclusor_keyring::generate_identity_file(&wrong).expect("wrong");
         let before = fs::read(&inline).expect("before");
+        let names = list_sibling_names(dir.path());
         let err = handle_rekey(RekeyArgs {
             file: inline.clone(),
             output: None,
@@ -455,6 +549,112 @@ mod tests {
         .expect_err("wrong identity");
         assert!(!err.to_string().contains("sk-123"));
         assert_eq!(fs::read(&inline).expect("after"), before);
+        assert_eq!(list_sibling_names(dir.path()), names);
+    }
+
+    #[test]
+    fn rekey_passphrase_protected_identity_roundtrip() {
+        use seclusor_keyring::generate_identity_file_with_passphrase;
+        use secrecy::SecretString;
+
+        let dir = tempfile::tempdir().expect("temp");
+        let protected = dir.path().join("protected.txt");
+        let pp = SecretString::from("test-rekey-passphrase-not-a-secret".to_owned());
+        let gen = generate_identity_file_with_passphrase(&protected, &pp).expect("protected id");
+        let recipient = gen.recipient;
+
+        let input = dir.path().join("plain.json");
+        let bundle = dir.path().join("secrets.age");
+        write_secrets_file(&input, &fixture_secrets(), true).expect("write");
+        handle_bundle_encrypt(BundleEncryptArgs {
+            input,
+            output: bundle.clone(),
+            recipients: RecipientArgs {
+                recipients: vec![recipient.clone()],
+                recipient_file: None,
+                recipient_env_var: None,
+            },
+        })
+        .expect("encrypt for protected recipient");
+
+        // Rekey in place to same set (establishes metadata) with passphrase-env.
+        let var = "SECLUSOR_TEST_REKEY_PP";
+        std::env::set_var(var, "test-rekey-passphrase-not-a-secret");
+        handle_rekey(RekeyArgs {
+            file: bundle.clone(),
+            output: None,
+            recipients: RecipientArgs {
+                recipients: vec![recipient.clone()],
+                recipient_file: None,
+                recipient_env_var: None,
+            },
+            identities: IdentityArgs {
+                identity_files: vec![protected.clone()],
+                identity_public_key: None,
+            },
+            passphrase: PassphraseArgs {
+                passphrase: false,
+                passphrase_env: Some(var.to_string()),
+                passphrase_file: None,
+                passphrase_stdin: false,
+            },
+        })
+        .expect("rekey with protected identity");
+        std::env::remove_var(var);
+
+        let identities =
+            seclusor_keyring::load_identity_file_auto(&protected, Some(&pp)).expect("load");
+        let secrets =
+            seclusor_codec::decrypt_bundle(&fs::read(&bundle).expect("read"), &identities)
+                .expect("decrypt after rekey");
+        assert!(secrets.recipients.is_some());
+        assert_eq!(
+            secrets.projects[0].credentials["API_KEY"].value.as_deref(),
+            Some("sk-123")
+        );
+    }
+
+    #[test]
+    fn rekey_protected_identity_missing_passphrase_refuses() {
+        use seclusor_keyring::generate_identity_file_with_passphrase;
+        use secrecy::SecretString;
+
+        let dir = tempfile::tempdir().expect("temp");
+        let protected = dir.path().join("protected.txt");
+        let pp = SecretString::from("unused-passphrase-for-protected-file".to_owned());
+        let gen = generate_identity_file_with_passphrase(&protected, &pp).expect("protected");
+        let (inline, _) = write_inline_encrypted_file(dir.path());
+        // Re-encrypt inline for protected recipient so rekey would need it.
+        let secrets = fixture_secrets();
+        let r: seclusor_crypto::Recipient = gen.recipient.parse().expect("r");
+        let encrypted =
+            seclusor_codec::encrypt_inline(&secrets, std::slice::from_ref(&r)).expect("encrypt");
+        write_secrets_file(&inline, &encrypted, false).expect("write");
+        let before = fs::read(&inline).expect("before");
+        let names = list_sibling_names(dir.path());
+
+        let err = handle_rekey(RekeyArgs {
+            file: inline.clone(),
+            output: None,
+            recipients: RecipientArgs {
+                recipients: vec![gen.recipient],
+                recipient_file: None,
+                recipient_env_var: None,
+            },
+            identities: IdentityArgs {
+                identity_files: vec![protected],
+                identity_public_key: None,
+            },
+            passphrase: PassphraseArgs::default(),
+        })
+        .expect_err("missing passphrase");
+        let msg = err.to_string();
+        assert!(
+            msg.to_lowercase().contains("passphrase") || msg.contains("protected"),
+            "{msg}"
+        );
+        assert_eq!(fs::read(&inline).expect("after"), before);
+        assert_eq!(list_sibling_names(dir.path()), names);
     }
 
     // --- S1 packaging strengtheners ---
