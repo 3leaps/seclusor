@@ -52,7 +52,10 @@ pub(crate) enum AtomicFault {
     ForceCasMismatch,
     /// Fail the replace step itself.
     ReplaceFail,
-    /// Fail parent directory sync (Unix).
+    /// Fail parent directory sync (Unix-only path; variant is cfg-gated so
+    /// Windows test builds do not see an unconstructed dead variant under
+    /// `-D warnings`).
+    #[cfg(unix)]
     DirSyncFail,
 }
 
