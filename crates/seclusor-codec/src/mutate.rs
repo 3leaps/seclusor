@@ -53,6 +53,35 @@ pub fn encrypted_value_keys(secrets: &SecretsFile) -> Vec<(String, String)> {
     keys
 }
 
+/// Fail closed if any credential still carries a **direct plaintext value**.
+///
+/// Required before committing through the ciphertext-only atomic writer: mixed
+/// documents (some `sec:age:v1:` values plus untouched plaintext values) must
+/// not place plaintext into an orphanable temp.
+///
+/// - **Allowed:** inline-encrypted values (`sec:age:v1:…`), reference-only
+///   credentials, empty projects.
+/// - **Refused:** any `value` that is present and does not use the inline
+///   ciphertext prefix.
+///
+/// Error text names project/key only — never the value body.
+pub fn ensure_no_plaintext_credential_values(secrets: &SecretsFile) -> Result<()> {
+    for project in &secrets.projects {
+        for (key, credential) in &project.credentials {
+            let Some(value) = credential.value.as_ref() else {
+                continue;
+            };
+            if !value.starts_with(INLINE_CIPHERTEXT_PREFIX) {
+                return Err(CodecError::PlaintextCredentialValuePresent {
+                    project: project.project_slug.clone(),
+                    key: key.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Set (or replace) one credential **value** in an inline secrets document.
 ///
 /// Encrypts **only** the target value with `recipients`. All other credential
@@ -389,6 +418,37 @@ mod tests {
                 credentials,
             }],
         }
+    }
+
+    #[test]
+    fn ensure_no_plaintext_credential_values_allows_encrypted_and_refs() {
+        let recipient = fixture_recipient();
+        let mut secrets = crate::encrypt_inline(&plain_secrets(), std::slice::from_ref(&recipient))
+            .expect("encrypt");
+        secrets.projects[0].credentials.insert(
+            "REF_KEY".to_string(),
+            Credential::with_ref("ref", "vault://demo"),
+        );
+        ensure_no_plaintext_credential_values(&secrets).expect("encrypted+ref ok");
+    }
+
+    #[test]
+    fn ensure_no_plaintext_credential_values_refuses_plaintext_sentinel() {
+        let recipient = fixture_recipient();
+        let mut secrets = crate::encrypt_inline(&plain_secrets(), std::slice::from_ref(&recipient))
+            .expect("encrypt");
+        secrets.projects[0].credentials.insert(
+            "PLAIN".to_string(),
+            Credential::with_value("secret", SENTINEL),
+        );
+        let err = ensure_no_plaintext_credential_values(&secrets).expect_err("mixed");
+        let rendered = err.to_string();
+        assert!(matches!(
+            err,
+            CodecError::PlaintextCredentialValuePresent { .. }
+        ));
+        assert!(rendered.contains("PLAIN"));
+        assert!(!rendered.contains(SENTINEL));
     }
 
     #[test]

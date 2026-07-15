@@ -18,8 +18,9 @@ use seclusor_crypto::{CryptoError, Identity, Recipient};
 use thiserror::Error;
 
 pub use mutate::{
-    encrypted_value_keys, mutate_bundle, reencrypt_all_inline, set_inline_description,
-    set_inline_value, unset_inline_value, BundleMutateResult, InlineMutateResult,
+    encrypted_value_keys, ensure_no_plaintext_credential_values, mutate_bundle,
+    reencrypt_all_inline, set_inline_description, set_inline_value, unset_inline_value,
+    BundleMutateResult, InlineMutateResult,
 };
 
 /// Supported storage codecs (conversion surface: bundle ↔ JSON form).
@@ -69,6 +70,18 @@ pub enum LoadMode {
     StructuralOnly,
 }
 
+impl LoadMode {
+    /// Machine-readable mode token (`full` or `structural-only`).
+    ///
+    /// Single vocabulary source for CLI status lines (validate, structural-only writes).
+    pub fn token(self) -> &'static str {
+        match self {
+            LoadMode::Full => "full",
+            LoadMode::StructuralOnly => "structural-only",
+        }
+    }
+}
+
 /// Classified load of a secrets document for read-side operations.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedDocument {
@@ -84,10 +97,7 @@ pub struct ResolvedDocument {
 impl ResolvedDocument {
     /// Machine-readable token for validate/list tooling (`full` or `structural-only`).
     pub fn mode_token(&self) -> &'static str {
-        match self.mode {
-            LoadMode::Full => "full",
-            LoadMode::StructuralOnly => "structural-only",
-        }
+        self.mode.token()
     }
 
     /// Machine-readable source classification (`bundle`, `plaintext`, or `inline`).
@@ -167,6 +177,18 @@ pub enum CodecError {
          convert to X25519 recipient mode first"
     )]
     ScryptBundleUnsupported,
+
+    /// Document still contains a direct plaintext credential value after mutation.
+    ///
+    /// Structural ciphertext commits must not place plaintext values into
+    /// orphanable temps. Reference credentials are allowed. Names project/key
+    /// only — never the value body.
+    #[error(
+        "refusing ciphertext commit: credential {key:?} in project {project:?} \
+         still has a plaintext value; encrypt remaining values or use a \
+         fully encrypted document"
+    )]
+    PlaintextCredentialValuePresent { project: String, key: String },
 
     /// Core-domain validation or model error.
     #[error(transparent)]

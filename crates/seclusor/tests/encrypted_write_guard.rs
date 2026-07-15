@@ -173,14 +173,15 @@ fn assert_refusal(
     );
 }
 
-fn refuse_matrix_for_target(path: &Path, dir: &Path, expected_source: &str) {
+/// Encrypting / unsupported write entry points that must still refuse on encrypted targets.
+fn refuse_encrypting_matrix_for_target(path: &Path, dir: &Path, expected_source: &str) {
     let before = fs::read(path).expect("read before");
     let names_before = list_dir_names(dir);
     let path_s = path.to_str().expect("utf8 path");
 
-    let cases: &[(&str, Vec<&str>)] = &[
+    let mut cases: Vec<(&str, Vec<&str>)> = vec![
         (
-            "set",
+            "set --value",
             vec![
                 "secrets",
                 "set",
@@ -195,16 +196,18 @@ fn refuse_matrix_for_target(path: &Path, dir: &Path, expected_source: &str) {
             ],
         ),
         (
-            "unset",
+            "set --ref",
             vec![
                 "secrets",
-                "unset",
+                "set",
                 "--file",
                 path_s,
                 "--project",
                 "demo",
                 "--key",
                 "API_KEY",
+                "--ref",
+                "vault://injected",
             ],
         ),
         (
@@ -234,25 +237,57 @@ fn refuse_matrix_for_target(path: &Path, dir: &Path, expected_source: &str) {
         ),
     ];
 
+    // Bundle (and marker-only) unset remains refuse; inline unset is supported.
+    if expected_source == "bundle" {
+        cases.push((
+            "unset",
+            vec![
+                "secrets",
+                "unset",
+                "--file",
+                path_s,
+                "--project",
+                "demo",
+                "--key",
+                "API_KEY",
+            ],
+        ));
+        cases.push((
+            "set description-only",
+            vec![
+                "secrets",
+                "set",
+                "--file",
+                path_s,
+                "--project",
+                "demo",
+                "--key",
+                "API_KEY",
+                "--description",
+                "nope",
+            ],
+        ));
+    }
+
     for (label, args) in cases {
-        let output = run_seclusor(args);
+        let output = run_seclusor(&args);
         assert_refusal(&output, path, &before, dir, &names_before, expected_source);
         let _ = label;
     }
 }
 
 #[test]
-fn process_refuses_valid_inline_for_all_write_entry_points() {
+fn process_refuses_encrypting_writes_on_valid_inline() {
     let dir = tempfile::tempdir().expect("tempdir");
     let inline = prepare_inline_encrypted(dir.path());
-    refuse_matrix_for_target(&inline, dir.path(), "inline");
+    refuse_encrypting_matrix_for_target(&inline, dir.path(), "inline");
 }
 
 #[test]
 fn process_refuses_binary_bundle_for_all_write_entry_points() {
     let dir = tempfile::tempdir().expect("tempdir");
     let bundle = prepare_binary_bundle(dir.path());
-    refuse_matrix_for_target(&bundle, dir.path(), "bundle");
+    refuse_encrypting_matrix_for_target(&bundle, dir.path(), "bundle");
 }
 
 #[test]
@@ -264,7 +299,586 @@ fn process_refuses_armored_bundle_marker_for_all_write_entry_points() {
         b"-----BEGIN AGE ENCRYPTED FILE-----\nnot-a-real-payload\n",
     )
     .expect("write armored");
-    refuse_matrix_for_target(&path, dir.path(), "bundle");
+    refuse_encrypting_matrix_for_target(&path, dir.path(), "bundle");
+}
+
+#[test]
+fn process_inline_unset_structural_only_stdout() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let inline = prepare_inline_encrypted(dir.path());
+    let path_s = inline.to_str().expect("utf8");
+    let before = fs::read(&inline).expect("before");
+    let before_json: serde_json::Value = serde_json::from_slice(&before).expect("parse before");
+    let other_ct = before_json["projects"][0]["credentials"]["OTHER"]["value"]
+        .as_str()
+        .expect("OTHER ciphertext")
+        .to_string();
+
+    let output = run_seclusor(&[
+        "secrets",
+        "unset",
+        "--file",
+        path_s,
+        "--project",
+        "demo",
+        "--key",
+        "API_KEY",
+    ]);
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "structural-only ok\n"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("structural-only"));
+    assert!(stderr.contains("source: inline"));
+    assert!(!stderr.contains("sk-123"));
+    assert!(!stderr.contains("sec:age:v1:"));
+
+    let after = fs::read(&inline).expect("after");
+    assert_ne!(after, before);
+    let after_json: serde_json::Value = serde_json::from_slice(&after).expect("parse after");
+    assert!(after_json["projects"][0]["credentials"]
+        .get("API_KEY")
+        .is_none());
+    assert_eq!(
+        after_json["projects"][0]["credentials"]["OTHER"]["value"]
+            .as_str()
+            .expect("OTHER after"),
+        other_ct,
+        "untouched ciphertext must be byte-identical"
+    );
+}
+
+#[test]
+fn process_inline_description_only_structural_only_stdout() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let inline = prepare_inline_encrypted(dir.path());
+    let path_s = inline.to_str().expect("utf8");
+    let before = fs::read(&inline).expect("before");
+    let before_json: serde_json::Value = serde_json::from_slice(&before).expect("parse before");
+    let api_ct = before_json["projects"][0]["credentials"]["API_KEY"]["value"]
+        .as_str()
+        .expect("API_KEY ciphertext")
+        .to_string();
+
+    let output = run_seclusor(&[
+        "secrets",
+        "set",
+        "--file",
+        path_s,
+        "--project",
+        "demo",
+        "--key",
+        "API_KEY",
+        "--description",
+        "rotated note",
+    ]);
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "structural-only ok\n"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("set: structural-only"));
+    assert!(stderr.contains("source: inline"));
+
+    let after_json: serde_json::Value =
+        serde_json::from_slice(&fs::read(&inline).expect("after")).expect("parse after");
+    assert_eq!(
+        after_json["projects"][0]["credentials"]["API_KEY"]["description"]
+            .as_str()
+            .expect("description"),
+        "rotated note"
+    );
+    assert_eq!(
+        after_json["projects"][0]["credentials"]["API_KEY"]["value"]
+            .as_str()
+            .expect("value"),
+        api_ct
+    );
+    let _ = before;
+}
+
+#[test]
+fn process_plaintext_description_only_stdout_ok() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("secrets.json");
+    write_plaintext_fixture(&path);
+
+    let output = run_seclusor(&[
+        "secrets",
+        "set",
+        "--file",
+        path.to_str().expect("utf8"),
+        "--project",
+        "demo",
+        "--key",
+        "API_KEY",
+        "--description",
+        "plain note",
+    ]);
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "ok\n");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+}
+
+const MIXED_SENTINEL: &str = "SECLUSOR_PLAINTEXT_SENTINEL_7f3a";
+
+fn prepare_mixed_inline(dir: &Path) -> PathBuf {
+    let input = dir.join("mixed-input.json");
+    let inline = dir.join("mixed.json");
+    let fixture = format!(
+        r#"{{
+  "schema_version": "v1.0.0",
+  "projects": [
+    {{
+      "project_slug": "demo",
+      "credentials": {{
+        "ENC_KEY": {{ "type": "secret", "value": "will-encrypt" }},
+        "PLAIN_KEY": {{ "type": "secret", "value": "{MIXED_SENTINEL}" }},
+        "REF_KEY": {{ "type": "ref", "ref": "vault://keep" }}
+      }}
+    }}
+  ]
+}}"#
+    );
+    fs::write(&input, fixture).expect("write mixed input");
+
+    let identity = dir.join("identity.txt");
+    let generated = run_seclusor(&[
+        "keys",
+        "age",
+        "identity",
+        "generate",
+        "--output",
+        identity.to_str().expect("utf8"),
+    ]);
+    assert!(generated.status.success());
+    let recipient = String::from_utf8(generated.stdout).expect("utf8 recipient");
+
+    // Encrypt only ENC_KEY by writing a fully-encrypted file then re-injecting plaintext.
+    let fully = dir.join("fully.json");
+    let encrypted = run_seclusor(&[
+        "secrets",
+        "inline",
+        "encrypt",
+        "--input",
+        input.to_str().expect("utf8"),
+        "--output",
+        fully.to_str().expect("utf8"),
+        "--recipient",
+        recipient.trim(),
+    ]);
+    assert!(
+        encrypted.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&encrypted.stderr)
+    );
+
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&fs::read(&fully).expect("read fully")).expect("parse");
+    doc["projects"][0]["credentials"]["PLAIN_KEY"]["value"] =
+        serde_json::Value::String(MIXED_SENTINEL.to_string());
+    doc["projects"][0]["credentials"]["REF_KEY"] =
+        serde_json::json!({"type": "ref", "ref": "vault://keep"});
+    fs::write(&inline, serde_json::to_vec_pretty(&doc).expect("serialize")).expect("write mixed");
+    inline
+}
+
+#[test]
+fn process_mixed_inline_unset_refuses_plaintext_residual() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = prepare_mixed_inline(dir.path());
+    let before = fs::read(&path).expect("before");
+    let names_before = list_dir_names(dir.path());
+
+    let output = run_seclusor(&[
+        "secrets",
+        "unset",
+        "--file",
+        path.to_str().expect("utf8"),
+        "--project",
+        "demo",
+        "--key",
+        "ENC_KEY",
+    ]);
+    assert!(!output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("plaintext") || stderr.contains("PLAIN_KEY"),
+        "stderr={stderr}"
+    );
+    assert!(!stderr.contains(MIXED_SENTINEL));
+    assert!(!stderr.contains("sec:age:v1:"));
+    assert_eq!(fs::read(&path).expect("after"), before);
+    assert_eq!(list_dir_names(dir.path()), names_before);
+}
+
+#[test]
+fn process_mixed_inline_description_only_refuses_plaintext_residual() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = prepare_mixed_inline(dir.path());
+    let before = fs::read(&path).expect("before");
+    let names_before = list_dir_names(dir.path());
+
+    let output = run_seclusor(&[
+        "secrets",
+        "set",
+        "--file",
+        path.to_str().expect("utf8"),
+        "--project",
+        "demo",
+        "--key",
+        "ENC_KEY",
+        "--description",
+        "note",
+    ]);
+    assert!(!output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("plaintext") || stderr.contains("PLAIN_KEY"),
+        "stderr={stderr}"
+    );
+    assert!(!stderr.contains(MIXED_SENTINEL));
+    assert_eq!(fs::read(&path).expect("after"), before);
+    assert_eq!(list_dir_names(dir.path()), names_before);
+}
+
+#[test]
+fn process_description_only_create_project_refuses_empty_stdout() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("secrets.json");
+    write_plaintext_fixture(&path);
+    let before = fs::read(&path).expect("before");
+
+    let output = run_seclusor(&[
+        "secrets",
+        "set",
+        "--file",
+        path.to_str().expect("utf8"),
+        "--project",
+        "demo",
+        "--key",
+        "API_KEY",
+        "--description",
+        "x",
+        "--create-project",
+    ]);
+    assert!(!output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("description-only"));
+    assert!(!stderr.contains("sk-123"));
+    assert_eq!(fs::read(&path).expect("after"), before);
+}
+
+#[test]
+fn process_description_only_missing_key_empty_stdout() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("secrets.json");
+    write_plaintext_fixture(&path);
+    let before = fs::read(&path).expect("before");
+
+    let output = run_seclusor(&[
+        "secrets",
+        "set",
+        "--file",
+        path.to_str().expect("utf8"),
+        "--project",
+        "demo",
+        "--key",
+        "NO_SUCH_KEY",
+        "--description",
+        "x",
+    ]);
+    assert!(!output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("sk-123"));
+    assert_eq!(fs::read(&path).expect("after"), before);
+}
+
+/// Encrypt an arbitrary plaintext JSON fixture to an inline file in `dir`.
+fn prepare_inline_from_json(dir: &Path, fixture_json: &str, out_name: &str) -> PathBuf {
+    let input = dir.join(format!("{out_name}.input.json"));
+    let inline = dir.join(out_name);
+    fs::write(&input, fixture_json).expect("write input");
+
+    let identity = dir.join(format!("{out_name}.identity.txt"));
+    let generated = run_seclusor(&[
+        "keys",
+        "age",
+        "identity",
+        "generate",
+        "--output",
+        identity.to_str().expect("utf8"),
+    ]);
+    assert!(
+        generated.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let recipient = String::from_utf8(generated.stdout).expect("utf8 recipient");
+
+    let encrypted = run_seclusor(&[
+        "secrets",
+        "inline",
+        "encrypt",
+        "--input",
+        input.to_str().expect("utf8"),
+        "--output",
+        inline.to_str().expect("utf8"),
+        "--recipient",
+        recipient.trim(),
+    ]);
+    assert!(
+        encrypted.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&encrypted.stderr)
+    );
+    inline
+}
+
+fn inline_ciphertext_samples(path: &Path) -> Vec<String> {
+    let doc: serde_json::Value =
+        serde_json::from_slice(&fs::read(path).expect("read")).expect("parse");
+    let mut samples = Vec::new();
+    if let Some(projects) = doc.get("projects").and_then(|p| p.as_array()) {
+        for project in projects {
+            if let Some(creds) = project.get("credentials").and_then(|c| c.as_object()) {
+                for cred in creds.values() {
+                    if let Some(value) = cred.get("value").and_then(|v| v.as_str()) {
+                        if value.starts_with("sec:age:v1:") {
+                            samples.push(value.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    samples
+}
+
+fn assert_inline_structural_failure(
+    label: &str,
+    output: &std::process::Output,
+    path: &Path,
+    before: &[u8],
+    dir: &Path,
+    names_before: &[String],
+    ciphertext_samples: &[String],
+) {
+    assert!(
+        !output.status.success(),
+        "{label}: expected nonzero exit; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "",
+        "{label}: stdout must be empty"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("sk-123") && !stderr.contains("sk-other"),
+        "{label}: stderr leaked plaintext: {stderr}"
+    );
+    assert!(
+        !stderr.contains("sec:age:v1:"),
+        "{label}: stderr leaked ciphertext prefix: {stderr}"
+    );
+    for sample in ciphertext_samples {
+        assert!(
+            !stderr.contains(sample.as_str()),
+            "{label}: stderr leaked ciphertext body"
+        );
+    }
+
+    assert_eq!(
+        fs::read(path).expect("re-read"),
+        before,
+        "{label}: target must remain byte-identical"
+    );
+    assert_eq!(
+        list_dir_names(dir),
+        names_before,
+        "{label}: must not create sibling/temp artifacts"
+    );
+}
+
+/// Valid-inline process matrix for structural failure paths (empty stdout,
+/// sanitized stderr, byte-identical target, no sibling temps).
+#[test]
+fn process_inline_structural_failure_matrix() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Single-project inline for missing-key / missing-project / create-project.
+    let single = prepare_inline_encrypted(dir.path());
+    let single_s = single.to_str().expect("utf8");
+    let single_before = fs::read(&single).expect("before single");
+    let single_names = list_dir_names(dir.path());
+    let single_cts = inline_ciphertext_samples(&single);
+
+    let single_cases: &[(&str, Vec<&str>)] = &[
+        (
+            "description-only missing key",
+            vec![
+                "secrets",
+                "set",
+                "--file",
+                single_s,
+                "--project",
+                "demo",
+                "--key",
+                "NO_SUCH_KEY",
+                "--description",
+                "x",
+            ],
+        ),
+        (
+            "description-only missing project",
+            vec![
+                "secrets",
+                "set",
+                "--file",
+                single_s,
+                "--project",
+                "nope",
+                "--key",
+                "API_KEY",
+                "--description",
+                "x",
+            ],
+        ),
+        (
+            "description-only --create-project",
+            vec![
+                "secrets",
+                "set",
+                "--file",
+                single_s,
+                "--project",
+                "demo",
+                "--key",
+                "API_KEY",
+                "--description",
+                "x",
+                "--create-project",
+            ],
+        ),
+        (
+            "unset missing key",
+            vec![
+                "secrets",
+                "unset",
+                "--file",
+                single_s,
+                "--project",
+                "demo",
+                "--key",
+                "NO_SUCH_KEY",
+            ],
+        ),
+        (
+            "unset missing project",
+            vec![
+                "secrets",
+                "unset",
+                "--file",
+                single_s,
+                "--project",
+                "nope",
+                "--key",
+                "API_KEY",
+            ],
+        ),
+    ];
+
+    for (label, args) in single_cases {
+        let output = run_seclusor(args);
+        assert_inline_structural_failure(
+            label,
+            &output,
+            &single,
+            &single_before,
+            dir.path(),
+            &single_names,
+            &single_cts,
+        );
+    }
+
+    // Two-project inline for omitted-project ambiguity (description-only + unset).
+    let multi_fixture = r#"{
+  "schema_version": "v1.0.0",
+  "projects": [
+    {
+      "project_slug": "demo",
+      "credentials": {
+        "API_KEY": { "type": "secret", "value": "alpha-secret" }
+      }
+    },
+    {
+      "project_slug": "other",
+      "credentials": {
+        "API_KEY": { "type": "secret", "value": "beta-secret" }
+      }
+    }
+  ]
+}"#;
+    let multi = prepare_inline_from_json(dir.path(), multi_fixture, "multi-inline.json");
+    let multi_s = multi.to_str().expect("utf8 multi");
+    let multi_before = fs::read(&multi).expect("before multi");
+    let multi_names = list_dir_names(dir.path());
+    let multi_cts = inline_ciphertext_samples(&multi);
+
+    let multi_cases: &[(&str, Vec<&str>)] = &[
+        (
+            "description-only omitted project ambiguous",
+            vec![
+                "secrets",
+                "set",
+                "--file",
+                multi_s,
+                "--key",
+                "API_KEY",
+                "--description",
+                "x",
+            ],
+        ),
+        (
+            "unset omitted project ambiguous",
+            vec!["secrets", "unset", "--file", multi_s, "--key", "API_KEY"],
+        ),
+    ];
+
+    for (label, args) in multi_cases {
+        let output = run_seclusor(args);
+        assert_inline_structural_failure(
+            label,
+            &output,
+            &multi,
+            &multi_before,
+            dir.path(),
+            &multi_names,
+            &multi_cts,
+        );
+    }
 }
 
 #[test]
