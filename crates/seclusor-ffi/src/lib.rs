@@ -11,8 +11,8 @@ use std::ptr;
 use std::slice;
 
 use seclusor_codec::{
-    decrypt_bundle_from_file, encrypt_bundle_to_file, resolve_runtime_document, CodecError,
-    DocumentSource, LoadMode,
+    decrypt_bundle_from_file, encrypt_bundle_to_file, resolve_runtime_document,
+    serialize_plaintext_at_rest, CodecError, DocumentSource, LoadMode,
 };
 use seclusor_core::constants::{MAX_BUNDLE_CIPHERTEXT_BYTES, MAX_SECRETS_DOC_BYTES};
 use seclusor_core::crud::{get_credential, list_credential_keys};
@@ -847,7 +847,8 @@ pub extern "C" fn seclusor_decrypt_bundle(
 
         let identities = load_identity_file(identity_file_path)?;
         let secrets = decrypt_bundle_from_file(input_ciphertext_path, &identities)?;
-        let json = serde_json::to_vec_pretty(&secrets)?;
+        // Persistence boundary: project to JSON-at-rest plaintext (no recipients).
+        let json = serialize_plaintext_at_rest(&secrets)?;
         fs::write(output_json_path, json)?;
         Ok(())
     }) {
@@ -1358,8 +1359,54 @@ mod tests {
             SeclusorResult::Ok
         );
 
-        let output_json = fs::read_to_string(output).expect("read output");
+        let output_json = fs::read_to_string(&output).expect("read output");
         assert!(output_json.contains("\"API_KEY\""));
+        assert!(
+            !output_json.contains("\"recipients\""),
+            "FFI decrypt must project JSON-at-rest without recipients"
+        );
+    }
+
+    #[test]
+    fn ffi_decrypt_recipients_bearing_bundle_projects_at_rest() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let bundle = dir.path().join("secrets.age");
+        let output = dir.path().join("out.json");
+        let identity_file = dir.path().join("identity.txt");
+        write_identity_file(&identity_file, TEST_IDENTITY);
+
+        let identity = TEST_IDENTITY
+            .parse::<seclusor_crypto::Identity>()
+            .expect("identity parse");
+        let mut secrets = SecretsFile::new("demo");
+        secrets.projects[0].credentials.insert(
+            "API_KEY".to_string(),
+            seclusor_core::Credential::with_value("secret", "sk-123"),
+        );
+        secrets
+            .establish_recipients(vec![identity.to_public().to_string()])
+            .expect("establish");
+        let ct =
+            seclusor_codec::encrypt_bundle(&secrets, std::slice::from_ref(&identity.to_public()))
+                .expect("encrypt");
+        fs::write(&bundle, ct).expect("write bundle");
+
+        let working = seclusor_codec::decrypt_bundle(&fs::read(&bundle).unwrap(), &[identity])
+            .expect("working");
+        assert!(working.recipients.is_some());
+
+        let bundle_c = cstring(bundle.to_str().expect("utf8"));
+        let output_c = cstring(output.to_str().expect("utf8"));
+        let identity_c = cstring(identity_file.to_str().expect("utf8"));
+        assert_eq!(
+            seclusor_decrypt_bundle(bundle_c.as_ptr(), output_c.as_ptr(), identity_c.as_ptr()),
+            SeclusorResult::Ok
+        );
+        let out = fs::read_to_string(output).expect("read");
+        assert!(!out.contains("\"recipients\""));
+        assert!(out.contains("sk-123"));
+        let parsed: SecretsFile = serde_json::from_str(&out).expect("parse");
+        seclusor_core::validate::validate_strict(&parsed).expect("at-rest");
     }
 
     #[test]

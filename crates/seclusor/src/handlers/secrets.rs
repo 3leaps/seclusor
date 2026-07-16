@@ -775,14 +775,13 @@ fn emit_structural_only_write_status(command: &str, source: DocumentSource) {
 pub(crate) fn handle_validate(args: ValidateArgs) -> CliResult<()> {
     let identities = resolve_identities(&args.identities, &args.passphrase, false)?;
     let resolved = read_runtime_document_file(&args.file, &identities)?;
-    // resolve_runtime_document already runs validate_strict (via deserialize /
-    // decrypt paths) and structural-only shape checks when applicable.
-    validate_strict(&resolved.secrets)?;
-
-    // Machine-readable mode distinguishability: structural-only must never
-    // look like full cryptographic validation. Both exit 0 on success.
+    // resolve_runtime_document already validates appropriately. Re-check with
+    // the mode-correct policy: Full loads may be decrypted working copies
+    // (plaintext values + recipients) — structure only. Structural-only keeps
+    // ciphertext JSON-at-rest and uses full validate.
     match resolved.mode {
         seclusor_codec::LoadMode::StructuralOnly => {
+            validate_strict(&resolved.secrets)?;
             // Encoding/shape only — not authenticity or decryptability.
             println!("structural-only valid");
             eprintln!(
@@ -793,6 +792,7 @@ pub(crate) fn handle_validate(args: ValidateArgs) -> CliResult<()> {
             );
         }
         seclusor_codec::LoadMode::Full => {
+            seclusor_core::validate::validate_structure_strict(&resolved.secrets)?;
             println!("valid");
         }
     }

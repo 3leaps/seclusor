@@ -393,11 +393,10 @@ pub fn decrypt_inline(secrets: &SecretsFile, identities: &[Identity]) -> Result<
         }
     }
 
-    // Plaintext output is JSON-at-rest when written to disk: drop recipients so
-    // the at-rest policy (recipients ⇒ ciphertext values) remains consistent.
-    // Callers that re-encrypt (convert/rekey) re-establish the target set.
-    out.recipients = None;
-    validate_strict(&out)?;
+    // Preserve recipients metadata on the in-memory working copy (structure-only).
+    // JSON-at-rest projection (strip recipients) belongs at persistence/export
+    // boundaries via [`project_plaintext_at_rest`].
+    validate_structure_strict(&out)?;
     Ok(out)
 }
 
@@ -438,9 +437,38 @@ pub fn decrypt_inline_with_passphrase(
         }
     }
 
+    validate_structure_strict(&out)?;
+    Ok(out)
+}
+
+/// Project a decrypted **working copy** to JSON-at-rest plaintext form.
+///
+/// Clears `recipients` so plaintext credential values remain valid under the
+/// recipients⇒ciphertext policy, then runs [`validate_strict`]. Use this at
+/// persistence/export boundaries (CLI decrypt writers, FFI/TS file export) —
+/// not on public decrypt APIs that return in-memory working copies.
+pub fn project_plaintext_at_rest(secrets: &SecretsFile) -> Result<SecretsFile> {
+    let mut out = secrets.clone();
     out.recipients = None;
     validate_strict(&out)?;
     Ok(out)
+}
+
+/// Serialize a decrypted working copy as pretty JSON-at-rest plaintext bytes.
+pub fn serialize_plaintext_at_rest(secrets: &SecretsFile) -> Result<Vec<u8>> {
+    let projected = project_plaintext_at_rest(secrets)?;
+    let mut data = serde_json::to_vec_pretty(&projected)?;
+    if !data.ends_with(b"\n") {
+        data.push(b'\n');
+    }
+    if data.len() > MAX_SECRETS_DOC_BYTES {
+        return Err(SeclusorError::DocumentTooLarge {
+            actual: data.len(),
+            max: MAX_SECRETS_DOC_BYTES,
+        }
+        .into());
+    }
+    Ok(data)
 }
 
 /// Convert bundle ciphertext to inline-encrypted document.
@@ -907,14 +935,44 @@ mod tests {
         let recipient = fixture_recipient();
         let identity = fixture_identity();
 
-        let inline = encrypt_inline(&secrets, &[recipient]).expect("encrypt should succeed");
+        let recipient_str = recipient.to_string();
+        let inline = encrypt_inline(&secrets, std::slice::from_ref(&recipient))
+            .expect("encrypt should succeed");
         assert!(inline.has_inline_ciphertext());
 
-        let decrypted = decrypt_inline(&inline, &[identity]).expect("decrypt should succeed");
-        // Encrypt establishes recipients (v1.1.0); decrypt clears them for plaintext at-rest.
+        let decrypted = decrypt_inline(&inline, std::slice::from_ref(&identity))
+            .expect("decrypt should succeed");
+        // Working copy preserves recipients; values are plaintext.
         assert_eq!(decrypted.projects, secrets.projects);
         assert_eq!(decrypted.env_prefix, secrets.env_prefix);
-        assert!(decrypted.recipients.is_none());
+        assert_eq!(
+            decrypted.recipients.as_deref(),
+            Some(std::slice::from_ref(&recipient_str))
+        );
+        let at_rest = project_plaintext_at_rest(&decrypted).expect("project at rest");
+        assert!(at_rest.recipients.is_none());
+        assert_eq!(at_rest.projects, secrets.projects);
+    }
+
+    #[test]
+    fn decrypt_inline_preserves_recipients_on_working_copy() {
+        let secrets = fixture_secrets();
+        let recipient = fixture_recipient();
+        let identity = fixture_identity();
+        let inline = encrypt_inline(&secrets, std::slice::from_ref(&recipient)).expect("encrypt");
+        assert!(inline.recipients.is_some());
+        let working = decrypt_inline(&inline, std::slice::from_ref(&identity)).expect("decrypt");
+        assert_eq!(
+            working.recipients.as_deref(),
+            Some(std::slice::from_ref(&recipient.to_string())),
+            "public decrypt_inline must preserve source recipients metadata"
+        );
+        // Structure-only policy allows plaintext values + recipients in memory.
+        seclusor_core::validate::validate_structure_strict(&working).expect("structure ok");
+        // JSON-at-rest projection strips recipients for disk/export.
+        let projected = project_plaintext_at_rest(&working).expect("project");
+        assert!(projected.recipients.is_none());
+        seclusor_core::validate::validate_strict(&projected).expect("at-rest ok");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use seclusor_codec::{decrypt_bundle_from_file, encrypt_bundle_to_file};
+use seclusor_codec::{decrypt_bundle_from_file, encrypt_bundle_to_file, project_plaintext_at_rest};
 
 use crate::cli::{BundleDecryptArgs, BundleEncryptArgs, BundleSubcommand};
 use crate::error::CliResult;
@@ -23,7 +23,9 @@ pub(crate) fn handle_bundle_encrypt(args: BundleEncryptArgs) -> CliResult<()> {
 pub(crate) fn handle_bundle_decrypt(args: BundleDecryptArgs) -> CliResult<()> {
     let identities = resolve_identities(&args.identities, &args.passphrase, true)?;
     let secrets = decrypt_bundle_from_file(&args.input, &identities)?;
-    write_secrets_file(&args.output, &secrets, false)?;
+    // Persistence boundary: strip recipients so plaintext JSON is at-rest valid.
+    let at_rest = project_plaintext_at_rest(&secrets)?;
+    write_secrets_file(&args.output, &at_rest, false)?;
     println!("{}", args.output.display());
     Ok(())
 }
@@ -32,10 +34,67 @@ pub(crate) fn handle_bundle_decrypt(args: BundleDecryptArgs) -> CliResult<()> {
 mod tests {
     use super::*;
 
+    use seclusor_core::{Credential, SecretsFile};
+
     use crate::cli::*;
     use crate::error::CliError;
     use crate::io::{read_secrets_file, write_secrets_file};
     use crate::test_support::*;
+
+    #[test]
+    fn bundle_decrypt_cli_omits_recipients_on_disk() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("plain.json");
+        let bundle = dir.path().join("secrets.age");
+        let output = dir.path().join("out.json");
+        let identity_file = dir.path().join("identity.txt");
+        write_identity_file(&identity_file, TEST_IDENTITY);
+
+        let mut secrets = SecretsFile::new("demo");
+        secrets.projects[0].credentials.insert(
+            "API_KEY".to_string(),
+            Credential::with_value("secret", "plain-value"),
+        );
+        secrets
+            .establish_recipients(vec![fixture_recipient_string()])
+            .expect("establish");
+        write_secrets_file(&input, &secrets, true).expect("write");
+        // Bundle encrypt from plaintext file without recipients in JSON is fine;
+        // re-load and encrypt with metadata established interior via re-establish path:
+        let ct = seclusor_codec::encrypt_bundle(
+            &secrets,
+            std::slice::from_ref(&fixture_identity().to_public()),
+        )
+        .expect("encrypt");
+        std::fs::write(&bundle, ct).expect("write bundle");
+
+        // Working copy after decrypt_bundle keeps recipients.
+        let working = seclusor_codec::decrypt_bundle_from_file(
+            &bundle,
+            std::slice::from_ref(&fixture_identity()),
+        )
+        .expect("decrypt working");
+        assert!(working.recipients.is_some());
+
+        handle_bundle_decrypt(BundleDecryptArgs {
+            input: bundle,
+            output: output.clone(),
+            identities: IdentityArgs {
+                identity_files: vec![identity_file],
+                identity_public_key: None,
+            },
+            passphrase: PassphraseArgs::default(),
+        })
+        .expect("cli decrypt");
+
+        let on_disk = read_secrets_file(&output).expect("read");
+        assert!(on_disk.recipients.is_none());
+        assert_eq!(
+            on_disk.projects[0].credentials["API_KEY"].value.as_deref(),
+            Some("plain-value")
+        );
+        seclusor_core::validate::validate_strict(&on_disk).expect("at-rest");
+    }
 
     #[test]
     fn handle_bundle_encrypt_bare_string_credential_has_helpful_error() {
