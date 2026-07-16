@@ -10,7 +10,7 @@
 
 .PHONY: all help bootstrap bootstrap-prereqs bootstrap-release-tools bootstrap-format-tools bootstrap-rust-tools bootstrap-force tools check check-all test fmt fmt-check lint build build-release clean
 .PHONY: ffi-header build-ffi go-bindings-sync go-bindings-ci go-build go-test go-test-committed ts-build ts-test embed-verify
-.PHONY: precommit prepush pr-final repo-status deny deny-all audit miri msrv
+.PHONY: precommit prepush pr-final repo-status deny deny-all audit ci-security miri msrv
 .PHONY: check-windows check-windows-msvc check-windows-gnu
 .PHONY: install dogfood-cli
 .PHONY: version version-patch version-minor version-major version-set version-sync version-check
