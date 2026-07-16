@@ -1,37 +1,34 @@
 # App Note 04: Encrypted Write Operations
 
-**Status**: DRAFT (SC-019 Slice 4 design illustration — not final; not embedded)  
+**Status**: DRAFT (design-lock illustration — not embedded until content ACK)  
 **Audience**: Operators, DevSecOps, library consumers of write-side CLI  
-**Depends on**: SC-018 read-side patterns (App Note 02); ADR-0012 recipients metadata  
-**Channel**: `#brief-sc-019` design lock — see OOB
-`planning/seclusor/SC-019-slice4-init-and-docs-design.md`
+**Depends on**: App Note 02 (encrypted read); ADR-0012 recipients metadata
 
-> **Do not treat this draft as shipped operator guidance.** Content and residual
-> wording land only after multi-seat design lock and Slice 4 implementation.
+> Draft for multi-seat design lock. Do not treat as shipped operator guidance
+> until published with the Slice 4 implementation.
 
 ---
 
 ## 1. Why encrypting writes
 
-SC-019 closes the plaintext-on-disk window for **mutating** secrets documents
-that are already bundle or inline ciphertext. Prefer in-place encrypting
-commands over decrypt → edit → re-encrypt when the document is already under
-seclusor management.
+Prefer in-place encrypting commands over decrypt → edit → re-encrypt when a
+secrets document is already under seclusor management as bundle or
+inline-encrypted JSON. That closes the plaintext-on-disk window for mutations.
 
-**Read-side** patterns remain in [App Note 02](02-runtime-deployment-patterns.md).
+**Read-side** patterns: [App Note 02](02-runtime-deployment-patterns.md).
 
 ---
 
-## 2. Command map (target after Slice 4)
+## 2. Command map
 
 | Command | Plaintext | Inline encrypted | Bundle encrypted |
 |---------|-----------|------------------|------------------|
 | `secrets set` (value/ref) | mutate | Full decrypt; encrypt only changed values; recipients rules | Full decrypt→mutate→re-encrypt |
-| `secrets set --description` only | mutate | Structural-only (no identity) | Encrypting write (identity + recipients) |
+| `secrets set --description` only | mutate | Structural-only (no identity) | Encrypting write |
 | `secrets unset` | mutate | Structural-only (no identity) | Encrypting write |
 | `secrets import-env` | mutate | Full encrypting write | Full encrypting write |
-| `secrets rekey` | n/a | Normalize all fields + recipients metadata | Same |
-| `secrets init` | skeleton JSON | **Slice 4:** `--codec inline` + recipients | **Slice 4:** `--codec bundle` + recipients |
+| `secrets rekey` | Encrypt values + establish recipients (preserve credentials) | Normalize all fields + recipients | Same |
+| `secrets init` | Fresh skeleton JSON | **Not via empty init** — create by encrypting a value (`set` / `import-env` / `rekey`) | **Create-only** empty skeleton: `--codec bundle` + explicit recipients on an **absent** path |
 
 Recipient **set changes** never ride on `set` / `import-env` — use **`rekey`**.
 
@@ -42,22 +39,20 @@ Recipient **set changes** never ride on `set` / `import-env` — use **`rekey`**
 Prefer non-argv channels for secret material:
 
 ```bash
-# stdin
 printf '%s' "$SECRET" | seclusor secrets set \
   --file secrets.age --identity-file id.txt \
   --key API_KEY --value-stdin --recipient age1...
 
-# file / env
 seclusor secrets set --value-file ./secret.txt ...
 seclusor secrets set --value-env MY_SECRET ...
 ```
 
-Legacy `--value <str>` remains but **warns on stderr** and must not be the
+Legacy `--value <str>` remains but **warns on stderr** and is not the
 documented safe path.
 
 ---
 
-## 4. Recipients and establishment (summary)
+## 4. Recipients and establishment
 
 Encrypting writes resolve recipients as:
 
@@ -65,51 +60,73 @@ Encrypting writes resolve recipients as:
 2. Document `recipients` metadata (schema v1.1.0), else  
 3. Fail closed  
 
-Establishment (first write that may persist `recipients` + rewrite
-`schema_version` to v1.1.0) follows the **coverage rule**:
-
-- **Bundle:** always whole-document re-encrypt → establishment OK  
-- **Inline:** only if the write covers every encrypted field (else refuse → `rekey`)
+Establishment (persist `recipients` + rewrite `schema_version` to v1.1.0)
+follows the coverage rule: bundle always OK; inline only if the write covers
+every encrypted field (else refuse → `rekey`).
 
 Stanza-count divergence on encrypting writes: **fail closed** (name `rekey`).
 Read/inspect paths may **warn** only.
 
-### Honest residuals (must ship in final note)
+### Schema invariant: recipients ⇒ no plaintext credential values
 
-| Residual | Meaning |
-|----------|---------|
-| Inline `recipients` unauthenticated | Field is plaintext JSON; integrity = git + tripwires, not age authentication |
-| Same-count member-swap | Replacing one recipient while keeping stanza count equal is **not** detected by count tripwire |
-| Value channels | Operator-chosen sources (`--value-file`, env, stdin, legacy argv) have documented exposure; seclusor must not re-persist plaintext to its own temps/logs |
-| age `Identity` | Upstream does not zeroize secret scalar on drop — minimize lifetime; do not claim guaranteed erasure |
-| Scrypt data bundles | Write paths refuse; **SC-011** owns data-passphrase CLI UX |
-| Windows atomicity | `ReplaceFileW`; crash atomicity not guaranteed (documented platform residual) |
+When top-level `recipients` is present, the document must not carry any
+**direct plaintext** credential values (refs and `sec:age:v1:` values are fine).
+Validation fails closed on **read and write** (including parse and FFI). This is
+a deliberate fail-secure upgrade against plaintext-downgrade tampering. It does
+**not** detect equal-count recipient membership swap (see residuals).
+
+Malformed recipients+plaintext documents will not load until repaired or
+removed; `rekey` may not open them.
 
 ---
 
-## 5. Proposed encrypted init (design lock)
+## 5. Encrypted init (bundle create-only)
 
 ```bash
-# Plaintext (unchanged)
+# Plaintext skeleton (unchanged)
 seclusor secrets init --file secrets.json --project myapp
 
-# Inline encrypted skeleton (proposed)
-seclusor secrets init --file secrets.json --codec inline \
-  --recipient age1... --project myapp
-
-# Bundle encrypted skeleton (proposed)
+# Empty encrypted bundle (create-only; path must not exist)
 seclusor secrets init --file secrets.age --codec bundle \
   --recipient age1... --project myapp
 ```
 
-**Refuse:** `--force` against an existing **encrypted** target (init is not
-repair/rekey). Remove the file or use encrypting write / rekey workflows.
+Rules:
 
-Identity is **not** required for init (encrypt-only create).
+- **`--codec bundle` only** for encrypted init; requires at least one
+  **explicit** recipient channel (ambient `SECLUSOR_RECIPIENTS` alone is not
+  enough).  
+- Target path must be **absent**. Existing files: use `rekey` to encrypt
+  existing credentials, or remove the file for a fresh empty encrypted skeleton.  
+- **No** `--force --codec`. Plaintext `--force` remains empty-skeleton reset only.  
+- Recipient flags without `--codec` are refused.  
+- X25519 recipients only — no identity, passphrase, or scrypt on init
+  (data-passphrase UX is a separate surface).  
+- Fresh Unix files: owner-only **0600**. Windows fresh-file ACL parity is not
+  guaranteed (directory guidance applies).  
+- stdout = path; establishment notice on stderr.
+
+Inline encrypted documents: plaintext `init` then `set`/`import-env` with
+recipients, or `rekey` from plaintext.
 
 ---
 
-## 6. Compatibility
+## 6. Honest residuals
+
+| Residual | Meaning |
+|----------|---------|
+| Inline `recipients` unauthenticated | Plaintext JSON field; integrity = git + tripwires, not age authentication |
+| Same-count member-swap | Replacing one recipient at equal stanza count is **not** detected by count tripwire (distinct from the recipients+plaintext validation upgrade) |
+| Operator value channels | `--value-file` / env / stdin / legacy argv are operator-chosen sources with documented exposure |
+| import-env in-memory buffer | Import path may hold env values in owned `String` pairs that are not zeroized on drop — deferred zeroizing value newtype; not the same as operator-channel exposure |
+| age `Identity` | Upstream does not zeroize secret scalar on drop — minimize lifetime |
+| Scrypt data bundles | Write paths refuse; data-passphrase CLI UX is owned elsewhere |
+| Windows atomicity | `ReplaceFileW`; crash atomicity not guaranteed |
+| Windows fresh-file ACL | Owner-only parity not guaranteed on create (Unix 0600 is) |
+
+---
+
+## 7. Compatibility
 
 Documents that carry top-level `recipients` use schema **v1.1.0**. Pre-SC-019
 binaries with `deny_unknown_fields` **fail closed** on those documents (safe
@@ -117,12 +134,8 @@ direction). Documents without `recipients` remain readable on older binaries.
 
 ---
 
-## 7. Related
+## 8. Related
 
 - ADR-0012 — recipients metadata schema v1.1.0  
 - App Note 02 — encrypted read / runtime patterns  
 - Guides: key-management (rekey), identity-and-recipients, codecs  
-- OOB design lock: `planning/seclusor/SC-019-slice4-init-and-docs-design.md`  
-- **Crucible:** Slice 4 does **not** emit `contract: data-artifact/v0` or
-  `process-run/v0` on secrets files; full adopt/defer disposition is in the
-  OOB design lock (stance alignment only).
