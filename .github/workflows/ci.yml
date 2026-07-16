@@ -50,8 +50,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # cargo-deny is pre-baked in the runner image; ensure cargo-audit too.
-          command -v cargo-audit >/dev/null 2>&1 || cargo install cargo-audit --locked
+          # cargo-deny is pre-baked and runnable in the runner image. The pre-baked
+          # cargo-audit is linked against a newer glibc than the image provides and
+          # fails to load, so rebuild it in-container when it cannot actually run
+          # (--force overrides the broken same-version binary on PATH).
+          cargo-audit --version >/dev/null 2>&1 || cargo install cargo-audit --locked --force
           make ci-security
       - name: Go bindings tests
         shell: bash
