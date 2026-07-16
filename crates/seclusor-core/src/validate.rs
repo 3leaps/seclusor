@@ -22,25 +22,66 @@ pub fn is_valid_credential_key(key: &str) -> bool {
         .all(|&b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
 }
 
-/// Validate a secrets file, collecting all validation errors.
-///
-/// Returns an empty vec if the file is valid.
-pub fn validate(sf: &SecretsFile) -> Vec<SeclusorError> {
-    let mut errors = Vec::new();
-
-    validate_schema_version(sf, &mut errors);
-    validate_projects(sf, &mut errors);
-
-    errors
+/// Options for domain validation.
+#[derive(Debug, Clone, Copy)]
+struct ValidateOpts {
+    /// When true and `recipients` is present, refuse direct plaintext credential
+    /// values. This is the **JSON-at-rest** policy (inline/plaintext files and
+    /// FFI JSON). Decrypted **bundle** working copies always hold plaintext
+    /// values inside the outer age envelope — use [`validate_structure`] there.
+    recipients_plaintext_policy: bool,
 }
 
-/// Validate and return the first error, if any.
+/// Full domain validation for secrets as stored or exchanged as **JSON at rest**
+/// (inline/plaintext files, CLI plaintext writes, FFI JSON loads).
+///
+/// Includes the recipients ⇒ no-plaintext-value policy when metadata is present.
+pub fn validate(sf: &SecretsFile) -> Vec<SeclusorError> {
+    validate_with(
+        sf,
+        ValidateOpts {
+            recipients_plaintext_policy: true,
+        },
+    )
+}
+
+/// Structural validation only (schema, recipients field shape, projects/keys).
+///
+/// Use for **decrypted bundle working copies** where credential values are
+/// intentionally plaintext inside the outer age ciphertext.
+pub fn validate_structure(sf: &SecretsFile) -> Vec<SeclusorError> {
+    validate_with(
+        sf,
+        ValidateOpts {
+            recipients_plaintext_policy: false,
+        },
+    )
+}
+
+/// Validate and return the first error, if any (JSON-at-rest policy).
 pub fn validate_strict(sf: &SecretsFile) -> crate::error::Result<()> {
-    let errors = validate(sf);
+    first_error(validate(sf))
+}
+
+/// Structural-only strict validation (bundle working copies).
+pub fn validate_structure_strict(sf: &SecretsFile) -> crate::error::Result<()> {
+    first_error(validate_structure(sf))
+}
+
+fn first_error(errors: Vec<SeclusorError>) -> crate::error::Result<()> {
     if let Some(err) = errors.into_iter().next() {
         return Err(err);
     }
     Ok(())
+}
+
+fn validate_with(sf: &SecretsFile, opts: ValidateOpts) -> Vec<SeclusorError> {
+    let mut errors = Vec::new();
+
+    validate_schema_version(sf, &mut errors, opts);
+    validate_projects(sf, &mut errors);
+
+    errors
 }
 
 /// Normalize optional description input for storage.
@@ -87,7 +128,7 @@ pub fn validate_docstring_description(desc: &str) -> crate::error::Result<()> {
     Ok(())
 }
 
-fn validate_schema_version(sf: &SecretsFile, errors: &mut Vec<SeclusorError>) {
+fn validate_schema_version(sf: &SecretsFile, errors: &mut Vec<SeclusorError>, opts: ValidateOpts) {
     if sf.schema_version.trim() != sf.schema_version {
         errors.push(SeclusorError::Validation(
             "schema_version must not contain leading/trailing whitespace".to_string(),
@@ -108,11 +149,37 @@ fn validate_schema_version(sf: &SecretsFile, errors: &mut Vec<SeclusorError>) {
 
     if let Some(recipients) = sf.recipients.as_ref() {
         validate_recipients_field(recipients, errors);
+        // JSON-at-rest only: recipients ⇒ no direct plaintext credential values.
+        // Decrypted bundle interiors intentionally hold plaintext values.
+        if opts.recipients_plaintext_policy {
+            validate_recipients_no_plaintext_values(sf, errors);
+        }
     }
 
     if let Some(description) = sf.description.as_deref() {
         if let Err(err) = validate_docstring_description(description) {
             errors.push(SeclusorError::Validation(format!("description {}", err)));
+        }
+    }
+}
+
+/// When `recipients` is present, every credential `value` must be inline
+/// ciphertext (`sec:age:v1:…`) or absent (ref-only). Never include the value body
+/// in the error message.
+fn validate_recipients_no_plaintext_values(sf: &SecretsFile, errors: &mut Vec<SeclusorError>) {
+    for project in &sf.projects {
+        for (key, cred) in &project.credentials {
+            let Some(value) = cred.value.as_ref() else {
+                continue;
+            };
+            if !value.starts_with(INLINE_CIPHERTEXT_PREFIX) {
+                errors.push(SeclusorError::Validation(format!(
+                    "project {:?} credential {:?} has a plaintext value while \
+                     recipients metadata is present; encrypt values or remove \
+                     recipients (document fails closed on read and write)",
+                    project.project_slug, key
+                )));
+            }
         }
     }
 }
@@ -503,6 +570,8 @@ mod tests {
     #[test]
     fn recipients_require_v1_1_0() {
         let mut sf = valid_file();
+        // Empty credentials so plaintext invariant does not fire first.
+        sf.projects[0].credentials.clear();
         sf.recipients = Some(vec![
             "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq".to_string(),
         ]);
@@ -519,6 +588,7 @@ mod tests {
     fn recipients_must_be_sorted_unique_and_shaped() {
         let mut sf = valid_file();
         sf.schema_version = "v1.1.0".to_string();
+        sf.projects[0].credentials.clear();
         sf.recipients = Some(vec![
             "age1bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
             "age1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
@@ -541,6 +611,74 @@ mod tests {
         assert!(errors
             .iter()
             .any(|e| e.to_string().contains("not a valid age recipient")));
+    }
+
+    #[test]
+    fn recipients_present_refuses_plaintext_credential_values() {
+        let mut sf = valid_file();
+        sf.schema_version = "v1.1.0".to_string();
+        sf.recipients = Some(vec![
+            "age1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        ]);
+        // valid_file has plaintext API_KEY value.
+        let errors = validate(&sf);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.to_string().contains("plaintext value")
+                    && e.to_string().contains("API_KEY")
+                    && !e.to_string().contains("sk-123")),
+            "expected plaintext+recipients error without value body, got {errors:?}"
+        );
+        assert!(validate_strict(&sf).is_err());
+    }
+
+    #[test]
+    fn recipients_present_allows_ciphertext_and_refs() {
+        let mut sf = valid_file();
+        sf.schema_version = "v1.1.0".to_string();
+        sf.recipients = Some(vec![
+            "age1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        ]);
+        sf.projects[0].credentials.insert(
+            "API_KEY".to_string(),
+            Credential::with_value("secret", "sec:age:v1:not-real-but-prefixed"),
+        );
+        sf.projects[0].credentials.insert(
+            "DSN".to_string(),
+            Credential::with_ref("dsn", "vault://path"),
+        );
+        assert!(
+            validate(&sf).is_empty(),
+            "ciphertext + ref should pass: {:?}",
+            validate(&sf)
+        );
+    }
+
+    #[test]
+    fn no_recipients_still_allows_plaintext_values() {
+        let sf = valid_file();
+        assert!(validate(&sf).is_empty());
+    }
+
+    #[test]
+    fn structure_validate_allows_recipients_with_plaintext_for_bundle_working_copy() {
+        // Decrypted bundle interiors hold plaintext values + recipients.
+        let mut sf = valid_file();
+        sf.schema_version = "v1.1.0".to_string();
+        sf.recipients = Some(vec![
+            "age1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        ]);
+        assert!(
+            !validate(&sf).is_empty(),
+            "JSON-at-rest policy must still refuse"
+        );
+        assert!(
+            validate_structure(&sf).is_empty(),
+            "working-copy structure validate must allow: {:?}",
+            validate_structure(&sf)
+        );
+        validate_structure_strict(&sf).expect("working strict ok");
     }
 
     #[test]

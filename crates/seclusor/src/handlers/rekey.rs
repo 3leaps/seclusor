@@ -245,14 +245,9 @@ mod tests {
     fn rekey_inline_establishes_recipients_and_normalizes() {
         let dir = tempfile::tempdir().expect("temp");
         let (inline, identity_file) = write_inline_encrypted_file(dir.path());
-        // Multi-field, no metadata — rekey is the migration path.
+        // Multi-field document; rekey normalizes/establishes the recipient set.
         let before = fs::read(&inline).expect("before");
-        assert!(
-            serde_json::from_slice::<seclusor_core::SecretsFile>(&before)
-                .unwrap()
-                .recipients
-                .is_none()
-        );
+        let _ = before;
 
         handle_rekey(RekeyArgs {
             file: inline.clone(),

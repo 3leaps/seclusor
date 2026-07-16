@@ -15,16 +15,17 @@ use std::collections::BTreeMap;
 
 use crate::atomic_write::{atomic_write_ciphertext, AtomicWriteOptions};
 use crate::cli::{
-    EnvFormatArg, ExportEnvArgs, GetArgs, ImportEnvArgs, InitArgs, ListArgs, SetArgs, UnsetArgs,
-    ValidateArgs,
+    EnvFormatArg, ExportEnvArgs, GetArgs, ImportEnvArgs, InitArgs, ListArgs, SetArgs,
+    StorageCodecArg, UnsetArgs, ValidateArgs,
 };
 use crate::env_support::resolve_export_env_vars;
 use crate::error::{CliError, CliResult};
 use crate::handlers::encrypted_write::{
     apply_establishment, commit_bundle_mutation, commit_inline_ciphertext_document,
     emit_establishment_notice, ensure_inline_stanza_count_matches,
-    inline_establishment_coverage_ok, load_inline_full_for_write, refuse_scrypt_bundle_write,
-    resolve_set_material, resolve_write_recipients, SetMaterial, ValueChannelArgs,
+    inline_establishment_coverage_ok, load_inline_full_for_write, recipient_channels_present,
+    recipient_strings, refuse_scrypt_bundle_write, resolve_set_material, resolve_write_recipients,
+    SetMaterial, ValueChannelArgs,
 };
 use crate::io::{
     probe_write_target, read_file_with_limit, read_runtime_document_file,
@@ -32,10 +33,43 @@ use crate::io::{
     WriteTargetProbe,
 };
 use crate::lenient::{handle_unset_lenient_bytes, should_use_lenient_unset};
-use crate::resolve::resolve_identities;
+use crate::resolve::{resolve_identities, resolve_recipients};
 use crate::REDACTED_OUTPUT;
 
 pub(crate) fn handle_init(args: InitArgs) -> CliResult<()> {
+    // Design lock: never combine --force with --codec (create-only encrypted path).
+    if args.force && args.codec.is_some() {
+        return Err(CliError::Message(
+            "cannot combine --force with --codec; encrypted init is create-only \
+             (target path must not exist). To encrypt existing credentials use \
+             `seclusor secrets rekey`; to replace with an empty encrypted skeleton, \
+             remove the file first"
+                .to_string(),
+        ));
+    }
+
+    // Recipient channels without --codec are never silently ignored.
+    if recipient_channels_present(&args.recipients) && args.codec.is_none() {
+        return Err(CliError::Message(
+            "recipient flags require --codec bundle on init (or omit recipients for \
+             plaintext init)"
+                .to_string(),
+        ));
+    }
+
+    match args.codec {
+        None => handle_init_plaintext(args),
+        Some(StorageCodecArg::Bundle) => handle_init_bundle(args),
+        Some(StorageCodecArg::Inline) => Err(CliError::Message(
+            "inline encrypted documents are created by encrypting a value — run \
+             `seclusor secrets init` then `set` with --recipient…, or `rekey`; \
+             use --codec bundle for an empty encrypted document"
+                .to_string(),
+        )),
+    }
+}
+
+fn handle_init_plaintext(args: InitArgs) -> CliResult<()> {
     if args.file.exists() {
         if !args.force {
             return Err(CliError::Message(format!(
@@ -43,7 +77,7 @@ pub(crate) fn handle_init(args: InitArgs) -> CliResult<()> {
                 args.file.display()
             )));
         }
-        // Refuse overwriting a positively identified encrypted target.
+        // Refuse overwriting a positively identified encrypted target (Slice 0).
         match probe_write_target(&args.file)? {
             WriteTargetProbe::Encrypted { source, .. } => {
                 return Err(refuse_encrypted_write(&args.file, source));
@@ -57,6 +91,52 @@ pub(crate) fn handle_init(args: InitArgs) -> CliResult<()> {
     secrets.description = normalize_description(args.description.as_deref());
     validate_strict(&secrets)?;
     write_secrets_file(&args.file, &secrets, !args.force)?;
+    println!("{}", args.file.display());
+    Ok(())
+}
+
+/// Encrypted init: create-only empty **bundle** skeleton (design lock A1/A2).
+fn handle_init_bundle(args: InitArgs) -> CliResult<()> {
+    // Existence wins — no classify/mutate of an existing path.
+    if args.file.exists() {
+        return Err(CliError::Message(format!(
+            "encrypted init is create-only: {} already exists. To encrypt an \
+             existing document use `seclusor secrets rekey`; to reset to an empty \
+             encrypted skeleton, remove the file first",
+            args.file.display()
+        )));
+    }
+
+    // Explicit RecipientArgs only — ambient SECLUSOR_RECIPIENTS alone is insufficient.
+    if !recipient_channels_present(&args.recipients) {
+        return Err(CliError::Message(
+            "encrypted init requires at least one explicit --recipient, \
+             --recipient-file, or --recipient-env-var (ambient SECLUSOR_RECIPIENTS \
+             alone is not enough)"
+                .to_string(),
+        ));
+    }
+
+    let recipients = resolve_recipients(&args.recipients)?;
+    let as_strings = recipient_strings(&recipients);
+
+    let mut secrets = SecretsFile::new(&args.project);
+    secrets.env_prefix = args.env_prefix;
+    secrets.description = normalize_description(args.description.as_deref());
+    apply_establishment(&mut secrets, &as_strings)?;
+    validate_strict(&secrets)?;
+
+    let ciphertext = seclusor_codec::encrypt_bundle(&secrets, &recipients)?;
+
+    atomic_write_ciphertext(
+        &args.file,
+        &ciphertext,
+        AtomicWriteOptions {
+            expected_prior_bytes: None,
+            create_new: true,
+        },
+    )?;
+    emit_establishment_notice(&as_strings);
     println!("{}", args.file.display());
     Ok(())
 }
@@ -156,13 +236,12 @@ fn handle_set_inline_encrypted(mut args: SetArgs, prior_bytes: &[u8]) -> CliResu
                 args.create_project,
             )?;
 
-            let options = SetInlineValueOptions {
-                create_if_missing: true,
-                credential_type: &args.credential_type,
-                description: match args.description.as_deref() {
-                    Some(d) => DescriptionAction::Replace(Some(d)),
-                    None => DescriptionAction::Preserve,
-                },
+            let mut options = SetInlineValueOptions::default();
+            options.create_if_missing = true;
+            options.credential_type = &args.credential_type;
+            options.description = match args.description.as_deref() {
+                Some(d) => DescriptionAction::Replace(Some(d)),
+                None => DescriptionAction::Preserve,
             };
             let plain = material
                 .value_str()
@@ -696,14 +775,13 @@ fn emit_structural_only_write_status(command: &str, source: DocumentSource) {
 pub(crate) fn handle_validate(args: ValidateArgs) -> CliResult<()> {
     let identities = resolve_identities(&args.identities, &args.passphrase, false)?;
     let resolved = read_runtime_document_file(&args.file, &identities)?;
-    // resolve_runtime_document already runs validate_strict (via deserialize /
-    // decrypt paths) and structural-only shape checks when applicable.
-    validate_strict(&resolved.secrets)?;
-
-    // Machine-readable mode distinguishability: structural-only must never
-    // look like full cryptographic validation. Both exit 0 on success.
+    // resolve_runtime_document already validates appropriately. Re-check with
+    // the mode-correct policy: Full loads may be decrypted working copies
+    // (plaintext values + recipients) — structure only. Structural-only keeps
+    // ciphertext JSON-at-rest and uses full validate.
     match resolved.mode {
         seclusor_codec::LoadMode::StructuralOnly => {
+            validate_strict(&resolved.secrets)?;
             // Encoding/shape only — not authenticity or decryptability.
             println!("structural-only valid");
             eprintln!(
@@ -714,6 +792,7 @@ pub(crate) fn handle_validate(args: ValidateArgs) -> CliResult<()> {
             );
         }
         seclusor_codec::LoadMode::Full => {
+            seclusor_core::validate::validate_structure_strict(&resolved.secrets)?;
             println!("valid");
         }
     }
@@ -935,17 +1014,17 @@ fn handle_import_env_inline(args: ImportEnvArgs, prior_bytes: &[u8]) -> CliResul
             .as_deref()
             .ok_or_else(|| CliError::Message(format!("imported credential {key} has no value")))?;
         // import-env replaces description with None across codecs (parity).
+        let mut options = SetInlineValueOptions::default();
+        options.create_if_missing = true;
+        options.credential_type = &args.credential_type;
+        options.description = DescriptionAction::Replace(None);
         let result = set_inline_value(
             &working,
             &project_slug,
             key,
             plaintext,
             &resolved.recipients,
-            SetInlineValueOptions {
-                create_if_missing: true,
-                credential_type: &args.credential_type,
-                description: DescriptionAction::Replace(None),
-            },
+            options,
         )?;
         working = result.secrets;
         count += 1;
@@ -2269,7 +2348,24 @@ mod tests {
     #[test]
     fn set_inline_encrypted_without_recipients_refuses_and_leaves_file_unchanged() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let (inline, identity_file) = write_inline_encrypted_file(dir.path());
+        // Ciphertext without document recipients metadata (pre-establishment form).
+        let inline = dir.path().join("legacy-inline.json");
+        let identity_file = dir.path().join("id.txt");
+        write_identity_file(&identity_file, TEST_IDENTITY);
+        let mut secrets = fixture_secrets();
+        let r = fixture_identity().to_public();
+        for (_k, cred) in secrets.projects[0].credentials.iter_mut() {
+            if let Some(v) = cred.value.take() {
+                let ct =
+                    seclusor_crypto::encrypt_inline_value(v.as_bytes(), std::slice::from_ref(&r))
+                        .expect("encrypt");
+                cred.value = Some(ct);
+            }
+        }
+        // Explicitly no recipients metadata.
+        secrets.recipients = None;
+        secrets.schema_version = "v1.0.0".into();
+        write_secrets_file(&inline, &secrets, true).expect("write");
         let before = fs::read(&inline).expect("read before");
 
         let err = handle_set(SetArgs {
@@ -2420,10 +2516,273 @@ mod tests {
             env_prefix: None,
             description: None,
             force: true,
+            codec: None,
+            recipients: RecipientArgs {
+                recipients: vec![],
+                recipient_file: None,
+                recipient_env_var: None,
+            },
         })
         .expect_err("init --force must refuse encrypted target");
         assert_encrypted_write_refused(&init_err, "inline");
         assert_bytes_unchanged(&inline, &before);
+    }
+
+    fn empty_recipient_args() -> RecipientArgs {
+        RecipientArgs {
+            recipients: vec![],
+            recipient_file: None,
+            recipient_env_var: None,
+        }
+    }
+
+    #[test]
+    fn init_bundle_create_only_roundtrip() {
+        let dir = tempfile::tempdir().expect("temp");
+        let out = dir.path().join("fresh.age");
+        let id = dir.path().join("id.txt");
+        write_identity_file(&id, TEST_IDENTITY);
+        let recipient = fixture_recipient_string();
+
+        handle_init(InitArgs {
+            file: out.clone(),
+            project: "myapp".into(),
+            env_prefix: Some("APP_".into()),
+            description: Some("demo".into()),
+            force: false,
+            codec: Some(crate::cli::StorageCodecArg::Bundle),
+            recipients: RecipientArgs {
+                recipients: vec![recipient.clone()],
+                recipient_file: None,
+                recipient_env_var: None,
+            },
+        })
+        .expect("bundle init");
+
+        assert!(out.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&out).expect("meta").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "fresh bundle must be 0600");
+        }
+
+        let identities = seclusor_keyring::load_identity_file_auto(&id, None).expect("id");
+        let secrets = seclusor_codec::decrypt_bundle(&fs::read(&out).expect("read"), &identities)
+            .expect("decrypt");
+        assert_eq!(secrets.schema_version, "v1.1.0");
+        assert_eq!(
+            secrets.recipients.as_deref(),
+            Some(std::slice::from_ref(&recipient))
+        );
+        assert_eq!(secrets.projects[0].project_slug, "myapp");
+        assert_eq!(secrets.env_prefix.as_deref(), Some("APP_"));
+        assert_eq!(secrets.description.as_deref(), Some("demo"));
+        assert!(secrets.projects[0].credentials.is_empty());
+    }
+
+    #[test]
+    fn init_bundle_refuses_existing_path_without_mutate() {
+        let dir = tempfile::tempdir().expect("temp");
+        let path = dir.path().join("exists.json");
+        fs::write(&path, b"prior").expect("write");
+        let before = fs::read(&path).expect("before");
+        let names = list_sibling_names(dir.path());
+
+        let err = handle_init(InitArgs {
+            file: path.clone(),
+            project: "default".into(),
+            env_prefix: None,
+            description: None,
+            force: false,
+            codec: Some(crate::cli::StorageCodecArg::Bundle),
+            recipients: RecipientArgs {
+                recipients: vec![fixture_recipient_string()],
+                recipient_file: None,
+                recipient_env_var: None,
+            },
+        })
+        .expect_err("existing path");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("create-only") || msg.contains("rekey"),
+            "{msg}"
+        );
+        assert_eq!(fs::read(&path).expect("after"), before);
+        assert_eq!(list_sibling_names(dir.path()), names);
+    }
+
+    #[test]
+    fn init_codec_inline_refuses() {
+        let dir = tempfile::tempdir().expect("temp");
+        let path = dir.path().join("nope.json");
+        let names = list_sibling_names(dir.path());
+        let err = handle_init(InitArgs {
+            file: path.clone(),
+            project: "default".into(),
+            env_prefix: None,
+            description: None,
+            force: false,
+            codec: Some(crate::cli::StorageCodecArg::Inline),
+            recipients: RecipientArgs {
+                recipients: vec![fixture_recipient_string()],
+                recipient_file: None,
+                recipient_env_var: None,
+            },
+        })
+        .expect_err("inline codec");
+        let msg = err.to_string().to_lowercase();
+        assert!(msg.contains("inline"), "{msg}");
+        assert!(!path.exists());
+        assert_eq!(list_sibling_names(dir.path()), names);
+    }
+
+    #[test]
+    fn init_force_plus_codec_refuses() {
+        let dir = tempfile::tempdir().expect("temp");
+        let path = dir.path().join("x.age");
+        let err = handle_init(InitArgs {
+            file: path.clone(),
+            project: "default".into(),
+            env_prefix: None,
+            description: None,
+            force: true,
+            codec: Some(crate::cli::StorageCodecArg::Bundle),
+            recipients: RecipientArgs {
+                recipients: vec![fixture_recipient_string()],
+                recipient_file: None,
+                recipient_env_var: None,
+            },
+        })
+        .expect_err("force+codec");
+        assert!(err.to_string().contains("--force"), "{err}");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn init_recipients_without_codec_refuses() {
+        let dir = tempfile::tempdir().expect("temp");
+        let path = dir.path().join("plain.json");
+        let err = handle_init(InitArgs {
+            file: path.clone(),
+            project: "default".into(),
+            env_prefix: None,
+            description: None,
+            force: false,
+            codec: None,
+            recipients: RecipientArgs {
+                recipients: vec![fixture_recipient_string()],
+                recipient_file: None,
+                recipient_env_var: None,
+            },
+        })
+        .expect_err("recipients need codec");
+        assert!(err.to_string().contains("recipient"), "{err}");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn init_bundle_requires_explicit_recipients_not_ambient_alone() {
+        let dir = tempfile::tempdir().expect("temp");
+        let path = dir.path().join("ambient.age");
+        let var = "SECLUSOR_RECIPIENTS";
+        // Isolate: set ambient only; no explicit channel on InitArgs.
+        std::env::set_var(var, fixture_recipient_string());
+        let err = handle_init(InitArgs {
+            file: path.clone(),
+            project: "default".into(),
+            env_prefix: None,
+            description: None,
+            force: false,
+            codec: Some(crate::cli::StorageCodecArg::Bundle),
+            recipients: empty_recipient_args(),
+        })
+        .expect_err("ambient alone insufficient");
+        std::env::remove_var(var);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("explicit") || msg.contains("recipient"),
+            "{msg}"
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn init_bundle_missing_recipients_refuses() {
+        let dir = tempfile::tempdir().expect("temp");
+        let path = dir.path().join("norec.age");
+        std::env::remove_var("SECLUSOR_RECIPIENTS");
+        let err = handle_init(InitArgs {
+            file: path.clone(),
+            project: "default".into(),
+            env_prefix: None,
+            description: None,
+            force: false,
+            codec: Some(crate::cli::StorageCodecArg::Bundle),
+            recipients: empty_recipient_args(),
+        })
+        .expect_err("no recipients");
+        assert!(!path.exists());
+        assert!(err.to_string().contains("recipient"), "{err}");
+    }
+
+    #[test]
+    fn a1_recipients_empty_credentials_set_refuses_plaintext_persist() {
+        // End-to-end A1 regression: hand-built v1.1.0 + recipients + empty
+        // credentials classifies as plaintext; set must not store plaintext.
+        let dir = tempfile::tempdir().expect("temp");
+        let path = dir.path().join("trap.json");
+        let mut secrets = SecretsFile::new("demo");
+        secrets
+            .establish_recipients(vec![fixture_recipient_string()])
+            .expect("establish");
+        write_secrets_file(&path, &secrets, true).expect("write trap");
+        let before = fs::read(&path).expect("before");
+        let names = list_sibling_names(dir.path());
+
+        let err = handle_set(SetArgs {
+            file: path.clone(),
+            project: Some("demo".into()),
+            key: "API_KEY".into(),
+            credential_type: "secret".into(),
+            value: Some("must-not-persist-plaintext".into()),
+            reference: None,
+            description: None,
+            create_project: false,
+            value_stdin: false,
+            value_file: None,
+            value_env: None,
+            recipients: empty_recipient_args(),
+            identities: IdentityArgs {
+                identity_files: vec![],
+                identity_public_key: None,
+            },
+            passphrase: PassphraseArgs::default(),
+        })
+        .expect_err("must refuse plaintext value with recipients");
+
+        let msg = err.to_string();
+        assert!(!msg.contains("must-not-persist-plaintext"), "{msg}");
+        assert_eq!(fs::read(&path).expect("after"), before);
+        assert_eq!(list_sibling_names(dir.path()), names);
+    }
+
+    #[test]
+    fn init_cli_rejects_passphrase_flags_as_unsupported() {
+        // C7 freeze: init has no passphrase surface; clap rejects unknown flags.
+        use crate::cli::Cli;
+        use clap::Parser;
+        let parsed = Cli::try_parse_from([
+            "seclusor",
+            "secrets",
+            "init",
+            "--codec",
+            "bundle",
+            "--recipient",
+            &fixture_recipient_string(),
+            "--passphrase",
+        ]);
+        assert!(parsed.is_err(), "init must not accept --passphrase");
     }
 
     #[test]

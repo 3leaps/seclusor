@@ -1,6 +1,6 @@
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use seclusor_codec::{decrypt_bundle_from_file, encrypt_bundle_to_file};
+use seclusor_codec::{decrypt_bundle_from_file, encrypt_bundle_to_file, serialize_plaintext_at_rest};
 use seclusor_core::constants::MAX_SECRETS_DOC_BYTES;
 use seclusor_core::crud::{get_credential, list_credential_keys};
 use seclusor_core::env::{export_env, EnvExportOptions};
@@ -197,7 +197,7 @@ pub fn decrypt_bundle(
         load_identity_file(&identity_file_path).map_err(|e| Error::from_reason(e.to_string()))?;
     let secrets = decrypt_bundle_from_file(&input_cipher_path, &identities)
         .map_err(|e| Error::from_reason(e.to_string()))?;
-    let bytes = serde_json::to_vec_pretty(&secrets)
-        .map_err(|e| Error::from_reason(format!("failed to encode output JSON: {e}")))?;
+    // Persistence boundary: project to JSON-at-rest plaintext (no recipients).
+    let bytes = serialize_plaintext_at_rest(&secrets).map_err(|e| Error::from_reason(e.to_string()))?;
     std::fs::write(output_json_path, bytes).map_err(|e| Error::from_reason(e.to_string()))
 }
