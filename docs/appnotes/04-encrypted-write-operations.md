@@ -122,4 +122,7 @@ direction). Documents without `recipients` remain readable on older binaries.
 - ADR-0012 — recipients metadata schema v1.1.0  
 - App Note 02 — encrypted read / runtime patterns  
 - Guides: key-management (rekey), identity-and-recipients, codecs  
-- OOB design lock: `planning/seclusor/SC-019-slice4-init-and-docs-design.md`
+- OOB design lock: `planning/seclusor/SC-019-slice4-init-and-docs-design.md`  
+- **Crucible:** Slice 4 does **not** emit `contract: data-artifact/v0` or
+  `process-run/v0` on secrets files; full adopt/defer disposition is in the
+  OOB design lock (stance alignment only).
