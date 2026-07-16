@@ -226,8 +226,19 @@ fn resolve_passphrase_for_protected(
     passphrase_args: &PassphraseArgs,
 ) -> CliResult<Option<SecretString>> {
     let mut pp = resolve_passphrase(passphrase_args, false)?;
-    // Auto-prompt if no explicit passphrase channel and terminal available
+    // Auto-prompt only when no explicit channel and stdin is a TTY.
+    // Never call rpassword without an isatty check — on some Windows runners
+    // read_password can block indefinitely instead of returning an error.
     if pp.is_none() {
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
+            return Err(CliError::Message(
+                "identity file is passphrase-protected but no interactive \
+                 terminal is available. Provide --passphrase-env, \
+                 --passphrase-file, or --passphrase-stdin."
+                    .to_string(),
+            ));
+        }
         eprint!("Passphrase: ");
         match rpassword::read_password().map(SecretString::from) {
             Ok(val) if !val.expose_secret().is_empty() => {

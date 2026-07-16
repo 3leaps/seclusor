@@ -633,6 +633,11 @@ mod tests {
         let before = fs::read(&inline).expect("before");
         let names = list_sibling_names(dir.path());
 
+        // Use an unset passphrase-env so the refuse path is non-interactive.
+        // PassphraseArgs::default() can auto-prompt on a TTY; Windows CI hung
+        // for hours waiting on rpassword when that path was taken.
+        let unset_var = "SECLUSOR_TEST_REKEY_PP_UNSET";
+        std::env::remove_var(unset_var);
         let err = handle_rekey(RekeyArgs {
             file: inline.clone(),
             output: None,
@@ -645,7 +650,12 @@ mod tests {
                 identity_files: vec![protected],
                 identity_public_key: None,
             },
-            passphrase: PassphraseArgs::default(),
+            passphrase: PassphraseArgs {
+                passphrase: false,
+                passphrase_env: Some(unset_var.to_string()),
+                passphrase_file: None,
+                passphrase_stdin: false,
+            },
         })
         .expect_err("missing passphrase");
         let msg = err.to_string();
