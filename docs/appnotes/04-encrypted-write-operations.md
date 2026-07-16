@@ -1,7 +1,7 @@
 # App Note 04: Encrypted Write Operations
 
-**Status**: Active  
-**Audience**: Operators, DevSecOps, library consumers of write-side CLI  
+**Status**: Active
+**Audience**: Operators, DevSecOps, library consumers of write-side CLI
 **Depends on**: App Note 02 (encrypted read); ADR-0012 recipients metadata
 
 ---
@@ -18,14 +18,14 @@ inline-encrypted JSON. That closes the plaintext-on-disk window for mutations.
 
 ## 2. Command map
 
-| Command | Plaintext | Inline encrypted | Bundle encrypted |
-|---------|-----------|------------------|------------------|
-| `secrets set` (value/ref) | mutate | Full decrypt; encrypt only changed values; recipients rules | Full decrypt→mutate→re-encrypt |
-| `secrets set --description` only | mutate | Structural-only (no identity) | Encrypting write |
-| `secrets unset` | mutate | Structural-only (no identity) | Encrypting write |
-| `secrets import-env` | mutate | Full encrypting write | Full encrypting write |
-| `secrets rekey` | Encrypt values + establish recipients (preserve credentials) | Normalize all fields + recipients | Same |
-| `secrets init` | Fresh skeleton JSON | **Not via empty init** — create by encrypting a value (`set` / `import-env` / `rekey`) | **Create-only** empty skeleton: `--codec bundle` + explicit recipients on an **absent** path |
+| Command                          | Plaintext                                                    | Inline encrypted                                                                       | Bundle encrypted                                                                             |
+| -------------------------------- | ------------------------------------------------------------ | -------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `secrets set` (value/ref)        | mutate                                                       | Full decrypt; encrypt only changed values; recipients rules                            | Full decrypt→mutate→re-encrypt                                                               |
+| `secrets set --description` only | mutate                                                       | Structural-only (no identity)                                                          | Encrypting write                                                                             |
+| `secrets unset`                  | mutate                                                       | Structural-only (no identity)                                                          | Encrypting write                                                                             |
+| `secrets import-env`             | mutate                                                       | Full encrypting write                                                                  | Full encrypting write                                                                        |
+| `secrets rekey`                  | Encrypt values + establish recipients (preserve credentials) | Normalize all fields + recipients                                                      | Same                                                                                         |
+| `secrets init`                   | Fresh skeleton JSON                                          | **Not via empty init** — create by encrypting a value (`set` / `import-env` / `rekey`) | **Create-only** empty skeleton: `--codec bundle` + explicit recipients on an **absent** path |
 
 Recipient **set changes** never ride on `set` / `import-env` — use **`rekey`**.
 
@@ -53,9 +53,9 @@ documented safe path.
 
 Encrypting writes resolve recipients as:
 
-1. Explicit `--recipient` / `--recipient-file` / `--recipient-env-var`, else  
-2. Document `recipients` metadata (schema v1.1.0), else  
-3. Fail closed  
+1. Explicit `--recipient` / `--recipient-file` / `--recipient-env-var`, else
+2. Document `recipients` metadata (schema v1.1.0), else
+3. Fail closed
 
 Establishment (persist `recipients` + rewrite `schema_version` to v1.1.0)
 follows the coverage rule: bundle always OK; inline only if the write covers
@@ -74,7 +74,7 @@ is a deliberate fail-secure upgrade against plaintext-downgrade tampering. It
 does **not** detect equal-count recipient membership swap (see residuals).
 
 **Bundle note:** After decrypting an age **bundle**, credential values are
-plaintext JSON *inside* the outer ciphertext by design. Structure-only
+plaintext JSON _inside_ the outer ciphertext by design. Structure-only
 validation applies to that working copy; confidentiality is the outer age
 layer, not per-value `sec:age:v1:` markers.
 
@@ -98,15 +98,15 @@ Rules:
 
 - **`--codec bundle` only** for encrypted init; requires at least one
   **explicit** recipient channel (ambient `SECLUSOR_RECIPIENTS` alone is not
-  enough).  
+  enough).
 - Target path must be **absent**. Existing files: use `rekey` to encrypt
-  existing credentials, or remove the file for a fresh empty encrypted skeleton.  
-- **No** `--force --codec`. Plaintext `--force` remains empty-skeleton reset only.  
-- Recipient flags without `--codec` are refused.  
+  existing credentials, or remove the file for a fresh empty encrypted skeleton.
+- **No** `--force --codec`. Plaintext `--force` remains empty-skeleton reset only.
+- Recipient flags without `--codec` are refused.
 - X25519 recipients only — no identity, passphrase, or scrypt on init
-  (data-passphrase UX is a separate surface).  
+  (data-passphrase UX is a separate surface).
 - Fresh Unix files: owner-only **0600**. Windows fresh-file ACL parity is not
-  guaranteed (directory guidance applies).  
+  guaranteed (directory guidance applies).
 - stdout = path; establishment notice on stderr.
 
 Inline encrypted documents: plaintext `init` then `set`/`import-env` with
@@ -116,16 +116,16 @@ recipients, or `rekey` from plaintext.
 
 ## 6. Honest residuals
 
-| Residual | Meaning |
-|----------|---------|
-| Inline `recipients` unauthenticated | Plaintext JSON field; integrity = git + tripwires, not age authentication |
-| Same-count member-swap | Replacing one recipient at equal stanza count is **not** detected by count tripwire (distinct from the recipients+plaintext validation upgrade) |
-| Operator value channels | `--value-file` / env / stdin / legacy argv are operator-chosen sources with documented exposure |
-| import-env in-memory buffer | Import path may hold env values in owned `String` pairs that are not zeroized on drop — deferred zeroizing value newtype; not the same as operator-channel exposure |
-| age `Identity` | Upstream does not zeroize secret scalar on drop — minimize lifetime |
-| Scrypt data bundles | Write paths refuse; data-passphrase CLI UX is owned elsewhere |
-| Windows atomicity | `ReplaceFileW`; crash atomicity not guaranteed |
-| Windows fresh-file ACL | Owner-only parity not guaranteed on create (Unix 0600 is) |
+| Residual                            | Meaning                                                                                                                                                             |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Inline `recipients` unauthenticated | Plaintext JSON field; integrity = git + tripwires, not age authentication                                                                                           |
+| Same-count member-swap              | Replacing one recipient at equal stanza count is **not** detected by count tripwire (distinct from the recipients+plaintext validation upgrade)                     |
+| Operator value channels             | `--value-file` / env / stdin / legacy argv are operator-chosen sources with documented exposure                                                                     |
+| import-env in-memory buffer         | Import path may hold env values in owned `String` pairs that are not zeroized on drop — deferred zeroizing value newtype; not the same as operator-channel exposure |
+| age `Identity`                      | Upstream does not zeroize secret scalar on drop — minimize lifetime                                                                                                 |
+| Scrypt data bundles                 | Write paths refuse; data-passphrase CLI UX is owned elsewhere                                                                                                       |
+| Windows atomicity                   | `ReplaceFileW`; crash atomicity not guaranteed                                                                                                                      |
+| Windows fresh-file ACL              | Owner-only parity not guaranteed on create (Unix 0600 is)                                                                                                           |
 
 ---
 
@@ -139,6 +139,6 @@ direction). Documents without `recipients` remain readable on older binaries.
 
 ## 8. Related
 
-- ADR-0012 — recipients metadata schema v1.1.0  
-- App Note 02 — encrypted read / runtime patterns  
-- Guides: key-management (rekey), identity-and-recipients, codecs  
+- ADR-0012 — recipients metadata schema v1.1.0
+- App Note 02 — encrypted read / runtime patterns
+- Guides: key-management (rekey), identity-and-recipients, codecs
