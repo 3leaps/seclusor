@@ -464,6 +464,21 @@ audit: ## Run cargo-audit security scan
 	fi
 	@echo "[ok] cargo-audit passed"
 
+# Advisory backstop for the deny.toml RUSTSEC-2026-0173 exception. Deliberately
+# kept OUT of `make ci` (which stays offline-safe) because advisory checks fetch
+# the RustSec DB over the network. CI enforces this as a dedicated step so a new,
+# unacknowledged advisory cannot hide behind the single-ID deny.toml ignore.
+# cargo-audit does not read deny.toml, so the --ignore ID below MUST match the
+# single-ID ignore in deny.toml (SSOT); drop both together per that removal
+# condition (revisit by v0.2.1 or 2026-10-13).
+ci-security: ## Run advisory + audit gates (network required; enforced in CI)
+	@echo "Running advisory + audit gates..."
+	@command -v cargo-deny >/dev/null 2>&1 || { echo "[!!] cargo-deny not found (run 'make bootstrap')"; exit 1; }
+	@command -v cargo-audit >/dev/null 2>&1 || { echo "[!!] cargo-audit not found (run 'make bootstrap')"; exit 1; }
+	cargo-deny check advisories
+	cargo-audit audit --deny warnings --ignore RUSTSEC-2026-0173
+	@echo "[ok] advisory + audit gates passed"
+
 # -----------------------------------------------------------------------------
 # Build
 # -----------------------------------------------------------------------------

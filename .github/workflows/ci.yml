@@ -46,6 +46,13 @@ jobs:
         run: |
           set -euo pipefail
           make ci
+      - name: Security advisories (deny advisories + cargo-audit)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # cargo-deny is pre-baked in the runner image; ensure cargo-audit too.
+          command -v cargo-audit >/dev/null 2>&1 || cargo install cargo-audit --locked
+          make ci-security
       - name: Go bindings tests
         shell: bash
         run: |
