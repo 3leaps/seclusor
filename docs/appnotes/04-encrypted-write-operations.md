@@ -1,11 +1,8 @@
 # App Note 04: Encrypted Write Operations
 
-**Status**: DRAFT (design-lock illustration — not embedded until content ACK)  
+**Status**: Active  
 **Audience**: Operators, DevSecOps, library consumers of write-side CLI  
 **Depends on**: App Note 02 (encrypted read); ADR-0012 recipients metadata
-
-> Draft for multi-seat design lock. Do not treat as shipped operator guidance
-> until published with the Slice 4 implementation.
 
 ---
 
@@ -67,16 +64,22 @@ every encrypted field (else refuse → `rekey`).
 Stanza-count divergence on encrypting writes: **fail closed** (name `rekey`).
 Read/inspect paths may **warn** only.
 
-### Schema invariant: recipients ⇒ no plaintext credential values
+### Schema invariant: recipients ⇒ no plaintext credential values (JSON at rest)
 
-When top-level `recipients` is present, the document must not carry any
-**direct plaintext** credential values (refs and `sec:age:v1:` values are fine).
-Validation fails closed on **read and write** (including parse and FFI). This is
-a deliberate fail-secure upgrade against plaintext-downgrade tampering. It does
-**not** detect equal-count recipient membership swap (see residuals).
+When top-level `recipients` is present on a **JSON** secrets document (plaintext
+or inline-encrypted file), the document must not carry any **direct plaintext**
+credential values (refs and `sec:age:v1:` values are fine). Validation fails
+closed on **read and write** for that JSON form (including parse and FFI). This
+is a deliberate fail-secure upgrade against plaintext-downgrade tampering. It
+does **not** detect equal-count recipient membership swap (see residuals).
 
-Malformed recipients+plaintext documents will not load until repaired or
-removed; `rekey` may not open them.
+**Bundle note:** After decrypting an age **bundle**, credential values are
+plaintext JSON *inside* the outer ciphertext by design. Structure-only
+validation applies to that working copy; confidentiality is the outer age
+layer, not per-value `sec:age:v1:` markers.
+
+Malformed recipients+plaintext **JSON** documents will not load until repaired
+or removed; `rekey` may not open them until fixed.
 
 ---
 

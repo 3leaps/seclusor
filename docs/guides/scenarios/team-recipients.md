@@ -101,8 +101,8 @@ seclusor secrets bundle encrypt \
 rm secrets.json
 ```
 
-> **Note**: A CLI `rekey` subcommand that performs this without exposing
-> plaintext to disk is planned (SC-009). The library-level rekey API
+> **Note**: Use `seclusor secrets rekey` to rewrite recipients without staging
+> plaintext on disk. The library-level rekey API
 > (`seclusor-keyring`) is available now.
 
 ## 6. Adding a new member

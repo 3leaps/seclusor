@@ -24,6 +24,22 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
   decrypt only)
 - Classified runtime document load API in `seclusor-codec` (`ResolvedDocument`,
   source/mode tokens)
+- Encrypting write path for `secrets set` / `import-env` (inline + bundle) with
+  non-argv value channels (`--value-stdin` / `--value-file` / `--value-env`)
+- Structural-only inline `unset` and description-only edits (no identity)
+- `secrets rekey` for full-document recipient rewrite (including plaintext →
+  encrypted transform)
+- Schema **v1.1.0** optional top-level `recipients` metadata (ADR-0012);
+  establishing writes rewrite `schema_version` and emit stderr notice
+- `secrets init --codec bundle` create-only empty encrypted skeleton (explicit
+  recipients required; no empty inline init; no `--force --codec`)
+- Public `seclusor-codec` mutation API: `set_inline_value`, `unset_inline_value`,
+  `set_inline_description`, `reencrypt_all_inline`, `mutate_bundle`,
+  `SetInlineValueOptions`, `DescriptionAction`, related result types
+- Public `seclusor-crypto` stanza helpers: `count_x25519_recipient_stanzas`,
+  `count_inline_x25519_recipient_stanzas`
+- Atomic ciphertext writer with CAS (Unix property-tested; Windows `ReplaceFileW`)
+- App Note 04: encrypted write operations and residual honesty
 
 ### Changed
 
@@ -31,6 +47,20 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 - Nested inline ciphertext inside a decrypted bundle is rejected (fail closed)
 - Documentation for encrypted-read flows, identity discovery, and passphrase-env
   automation tradeoffs (App Note 02 and CLI guides)
+- When `recipients` is present, JSON-at-rest documents must not carry direct
+  plaintext credential values (fail closed on read and write via
+  `seclusor_core::validate`; legacy docs without `recipients` keep mixed-value
+  leniency). Decrypted bundle working copies use structure-only validation
+- `SetInlineValueOptions` is `#[non_exhaustive]`; construct via
+  `Default::default()` then field assignment from external crates
+- Controlling-console preflight for interactive passphrase prompts (matches
+  rpassword `/dev/tty` / `CONIN$`)
+
+### Compatibility
+
+- Documents carrying top-level `recipients` use schema v1.1.0. Pre-SC-019
+  binaries with `deny_unknown_fields` **fail closed** on those documents (safe
+  direction). Documents without `recipients` remain valid on older binaries.
 
 ## [0.1.6] - 2026-04-03
 

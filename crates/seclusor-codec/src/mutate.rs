@@ -16,12 +16,12 @@
 //!   pieces a full-document rekey command can compose without a second surface.
 
 use seclusor_core::constants::{INLINE_CIPHERTEXT_PREFIX, MAX_BUNDLE_CIPHERTEXT_BYTES};
-use seclusor_core::validate::validate_strict;
+use seclusor_core::validate::{validate_strict, validate_structure_strict};
 use seclusor_core::{Credential, SecretsFile};
 use seclusor_crypto::{Identity, Recipient};
 use zeroize::Zeroizing;
 
-use crate::{deserialize_json, serialize_canonical_json, CodecError, Result};
+use crate::{serialize_canonical_json, CodecError, Result};
 
 /// Result of an inline-document mutation that yields ciphertext-stable JSON.
 #[derive(Debug, Clone, PartialEq)]
@@ -92,7 +92,14 @@ pub enum DescriptionAction<'a> {
 }
 
 /// Options for [`set_inline_value`].
+///
+/// Marked `#[non_exhaustive]` so additive fields can land without a major bump.
+/// External crates must construct via [`Default`] then assign public fields
+/// (or a future constructor) — not
+/// `SetInlineValueOptions { field: …, ..Default::default() }` FRU from outside
+/// this crate.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct SetInlineValueOptions<'a> {
     /// When true, insert the credential if missing.
     pub create_if_missing: bool,
@@ -339,12 +346,14 @@ where
     }
 
     let plaintext = Zeroizing::new(seclusor_crypto::decrypt(ciphertext, identities)?);
-    let mut secrets = deserialize_json(plaintext.as_slice())?;
+    // Bundle interior: structure-only policy (plaintext values expected).
+    let mut secrets = crate::deserialize_bundle_interior(plaintext.as_slice())?;
     // plaintext buffer drops at end of scope; secrets holds residual Strings.
     drop(plaintext);
 
     mutate(&mut secrets)?;
-    validate_strict(&secrets)?;
+    // Structure only: working copy values are plaintext inside the outer age envelope.
+    validate_structure_strict(&secrets)?;
 
     let out_plain = Zeroizing::new(serialize_canonical_json(&secrets)?);
     // Drop secrets before encrypt so the residual lives as briefly as possible
@@ -741,7 +750,9 @@ mod tests {
 
     #[test]
     fn establish_recipients_rewrites_schema() {
+        // Empty credentials: recipients+plaintext values fail validate (Slice 4).
         let mut secrets = plain_secrets();
+        secrets.projects[0].credentials.clear();
         let recipient = fixture_recipient().to_string();
         secrets
             .establish_recipients(vec![recipient.clone()])
@@ -757,6 +768,7 @@ mod tests {
     #[test]
     fn establish_recipients_normalizes_and_rejects_invalid() {
         let mut secrets = plain_secrets();
+        secrets.projects[0].credentials.clear();
         let r1 = fixture_recipient().to_string();
         // Unsorted + duplicate + whitespace should normalize.
         secrets
@@ -777,11 +789,12 @@ mod tests {
     fn v1_1_0_document_accepted_by_deserialize() {
         let recipient = fixture_recipient().to_string();
         let mut secrets = plain_secrets();
+        secrets.projects[0].credentials.clear();
         secrets
             .establish_recipients(vec![recipient])
             .expect("establish");
         let json = serde_json::to_vec(&secrets).expect("serialize");
-        let loaded = deserialize_json(&json).expect("v1.1.0 must load");
+        let loaded = crate::deserialize_json(&json).expect("v1.1.0 must load");
         assert_eq!(loaded.schema_version, SCHEMA_VERSION_V1_1_0);
         assert!(loaded.recipients.is_some());
     }

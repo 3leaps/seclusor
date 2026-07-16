@@ -12,7 +12,7 @@ use seclusor_core::constants::{
     INLINE_CIPHERTEXT_PREFIX, MAX_BUNDLE_CIPHERTEXT_BYTES, MAX_SECRETS_DOC_BYTES,
 };
 use seclusor_core::error::sanitize_serde_json_error_message;
-use seclusor_core::validate::validate_strict;
+use seclusor_core::validate::{validate_strict, validate_structure_strict};
 use seclusor_core::{SeclusorError, SecretsFile};
 use seclusor_crypto::{CryptoError, Identity, Recipient};
 use thiserror::Error;
@@ -217,8 +217,12 @@ impl From<serde_json::Error> for CodecError {
 }
 
 /// Serialize a secrets file into canonical JSON bytes for bundle payloads.
+///
+/// Uses **structure-only** validation: decrypted bundle working copies hold
+/// plaintext credential values with optional `recipients` metadata — the
+/// JSON-at-rest recipients⇒ciphertext policy does not apply inside age.
 pub fn serialize_canonical_json(secrets: &SecretsFile) -> Result<Vec<u8>> {
-    validate_strict(secrets)?;
+    validate_structure_strict(secrets)?;
     let mut writer = BoundedJsonWriter::new(MAX_SECRETS_DOC_BYTES);
     match serde_json::to_writer(&mut writer, secrets) {
         Ok(()) => Ok(writer.into_inner()),
@@ -261,9 +265,20 @@ pub fn encrypt_bundle(secrets: &SecretsFile, recipients: &[Recipient]) -> Result
 }
 
 /// Decrypt bundle ciphertext into a secrets document.
+///
+/// Interior JSON is validated structurally only (values are plaintext by design
+/// inside the outer age envelope).
 pub fn decrypt_bundle(ciphertext: &[u8], identities: &[Identity]) -> Result<SecretsFile> {
     let plaintext = seclusor_crypto::decrypt(ciphertext, identities)?;
-    deserialize_json(&plaintext)
+    deserialize_bundle_interior(&plaintext)
+}
+
+/// Decrypt passphrase-mode / X25519 bundle interior (structure-only validation).
+pub(crate) fn deserialize_bundle_interior(input: &[u8]) -> Result<SecretsFile> {
+    ensure_document_size(input.len())?;
+    let secrets: SecretsFile = serde_json::from_slice(input)?;
+    validate_structure_strict(&secrets)?;
+    Ok(secrets)
 }
 
 /// Encrypt an entire secrets document with passphrase mode.
@@ -277,7 +292,7 @@ pub fn encrypt_bundle_with_passphrase(secrets: &SecretsFile, passphrase: &str) -
 /// Decrypt passphrase-encrypted bundle ciphertext into a secrets document.
 pub fn decrypt_bundle_with_passphrase(ciphertext: &[u8], passphrase: &str) -> Result<SecretsFile> {
     let plaintext = seclusor_crypto::decrypt_with_passphrase(ciphertext, passphrase)?;
-    deserialize_json(&plaintext)
+    deserialize_bundle_interior(&plaintext)
 }
 
 /// Encrypt plaintext values into inline `sec:age:v1:` values.
@@ -348,7 +363,9 @@ pub fn decrypt_inline(secrets: &SecretsFile, identities: &[Identity]) -> Result<
         }
     }
 
-    validate_strict(&out)?;
+    // After decrypt, values are plaintext in memory; recipients metadata may be
+    // present. JSON-at-rest policy does not apply to this working representation.
+    validate_structure_strict(&out)?;
     Ok(out)
 }
 
@@ -389,7 +406,7 @@ pub fn decrypt_inline_with_passphrase(
         }
     }
 
-    validate_strict(&out)?;
+    validate_structure_strict(&out)?;
     Ok(out)
 }
 
@@ -951,7 +968,9 @@ mod tests {
     #[test]
     fn resolve_runtime_document_accepts_v1_1_0_with_recipients() {
         // Read loaders must accept schema v1.1.0 documents with optional recipients.
+        // Empty credentials: recipients + plaintext values fail closed (Slice 4).
         let mut secrets = fixture_secrets();
+        secrets.projects[0].credentials.clear();
         let recipient = fixture_recipient().to_string();
         secrets
             .establish_recipients(vec![recipient])

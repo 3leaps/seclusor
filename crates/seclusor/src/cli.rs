@@ -208,8 +208,23 @@ pub(crate) struct InitArgs {
     pub(crate) env_prefix: Option<String>,
     #[arg(long, help = "Project description")]
     pub(crate) description: Option<String>,
-    #[arg(long, default_value_t = false, help = "Overwrite existing file")]
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Overwrite an existing plaintext secrets file with an empty skeleton \
+                (never combined with --codec)"
+    )]
     pub(crate) force: bool,
+    #[arg(
+        long,
+        value_enum,
+        help = "Create an encrypted secrets document. Only 'bundle' is supported \
+                (create-only; path must not exist). Inline encrypted documents are \
+                created by encrypting a value via set/import-env/rekey"
+    )]
+    pub(crate) codec: Option<StorageCodecArg>,
+    #[command(flatten)]
+    pub(crate) recipients: RecipientArgs,
 }
 
 #[derive(Debug, Parser, Clone)]

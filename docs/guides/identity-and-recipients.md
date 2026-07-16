@@ -233,7 +233,7 @@ seclusor secrets bundle encrypt \
 
 Both Alice and Bob can decrypt `secrets.age` with their respective identity
 files. To change who can decrypt, re-encrypt with a different recipient set
-(rekeying — available as a library API, CLI command planned).
+(rekeying — `seclusor secrets rekey`, and library APIs).
 
 ## Common workflows
 
