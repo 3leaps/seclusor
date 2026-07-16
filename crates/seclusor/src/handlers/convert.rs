@@ -108,5 +108,59 @@ mod tests {
 
         let roundtrip = read_secrets_file(&reconverted).expect("read reconverted");
         assert!(roundtrip.has_inline_ciphertext());
+        assert_eq!(
+            roundtrip.recipients.as_deref(),
+            Some(std::slice::from_ref(&fixture_recipient_string())),
+            "conversion rewrites recipients metadata to the target set"
+        );
+    }
+
+    #[test]
+    fn convert_recipients_bearing_bundle_to_inline_via_cli() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let bundle = dir.path().join("secrets.age");
+        let inline_out = dir.path().join("out.json");
+        let identity_file = dir.path().join("identity.txt");
+        write_identity_file(&identity_file, TEST_IDENTITY);
+
+        let mut secrets = SecretsFile::new("demo");
+        secrets.projects[0].credentials.insert(
+            "API_KEY".to_string(),
+            Credential::with_value("secret", "plain-value"),
+        );
+        secrets
+            .establish_recipients(vec![fixture_recipient_string()])
+            .expect("establish");
+        let ct = seclusor_codec::encrypt_bundle(
+            &secrets,
+            std::slice::from_ref(&fixture_identity().to_public()),
+        )
+        .expect("encrypt bundle");
+        fs::write(&bundle, ct).expect("write bundle");
+
+        handle_convert(ConvertArgs {
+            input: bundle,
+            output: inline_out.clone(),
+            from: StorageCodecArg::Bundle,
+            to: StorageCodecArg::Inline,
+            recipients: RecipientArgs {
+                recipients: vec![fixture_recipient_string()],
+                recipient_file: None,
+                recipient_env_var: None,
+            },
+            identities: IdentityArgs {
+                identity_files: vec![identity_file],
+                identity_public_key: None,
+            },
+            passphrase: PassphraseArgs::default(),
+        })
+        .expect("bundle->inline with recipients metadata");
+
+        let out = read_secrets_file(&inline_out).expect("read");
+        assert!(out.has_inline_ciphertext());
+        assert_eq!(
+            out.recipients.as_deref(),
+            Some(std::slice::from_ref(&fixture_recipient_string()))
+        );
     }
 }

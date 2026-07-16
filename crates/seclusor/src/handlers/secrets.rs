@@ -2348,7 +2348,24 @@ mod tests {
     #[test]
     fn set_inline_encrypted_without_recipients_refuses_and_leaves_file_unchanged() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let (inline, identity_file) = write_inline_encrypted_file(dir.path());
+        // Ciphertext without document recipients metadata (pre-establishment form).
+        let inline = dir.path().join("legacy-inline.json");
+        let identity_file = dir.path().join("id.txt");
+        write_identity_file(&identity_file, TEST_IDENTITY);
+        let mut secrets = fixture_secrets();
+        let r = fixture_identity().to_public();
+        for (_k, cred) in secrets.projects[0].credentials.iter_mut() {
+            if let Some(v) = cred.value.take() {
+                let ct =
+                    seclusor_crypto::encrypt_inline_value(v.as_bytes(), std::slice::from_ref(&r))
+                        .expect("encrypt");
+                cred.value = Some(ct);
+            }
+        }
+        // Explicitly no recipients metadata.
+        secrets.recipients = None;
+        secrets.schema_version = "v1.0.0".into();
+        write_secrets_file(&inline, &secrets, true).expect("write");
         let before = fs::read(&inline).expect("read before");
 
         let err = handle_set(SetArgs {

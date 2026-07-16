@@ -131,9 +131,10 @@ recipients, or `rekey` from plaintext.
 
 ## 7. Compatibility
 
-Documents that carry top-level `recipients` use schema **v1.1.0**. Pre-SC-019
-binaries with `deny_unknown_fields` **fail closed** on those documents (safe
-direction). Documents without `recipients` remain readable on older binaries.
+Documents that carry top-level `recipients` use schema **v1.1.0**. Older
+binaries that predate schema v1.1.0 recipients support and use
+`deny_unknown_fields` **fail closed** on those documents (safe direction).
+Documents without `recipients` remain readable on older binaries.
 
 ---
 

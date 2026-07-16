@@ -296,8 +296,16 @@ pub fn decrypt_bundle_with_passphrase(ciphertext: &[u8], passphrase: &str) -> Re
 }
 
 /// Encrypt plaintext values into inline `sec:age:v1:` values.
+///
+/// Input may be a structure-validated **working copy** (for example a decrypted
+/// bundle with plaintext credential values and optional `recipients` metadata).
+/// The encrypted output is validated with the JSON-at-rest policy, and document
+/// `recipients` metadata is rewritten to match the encryption target set so
+/// metadata stays truthful to the ciphertext recipients.
 pub fn encrypt_inline(secrets: &SecretsFile, recipients: &[Recipient]) -> Result<SecretsFile> {
-    validate_strict(secrets)?;
+    ensure_nonempty_recipients(recipients)?;
+    // Accept decrypted-bundle / plaintext working copies (structure only).
+    validate_structure_strict(secrets)?;
 
     let mut out = secrets.clone();
     for project in &mut out.projects {
@@ -326,8 +334,30 @@ pub fn encrypt_inline(secrets: &SecretsFile, recipients: &[Recipient]) -> Result
         }
     }
 
+    // Metadata must match the set actually used to encrypt values.
+    apply_target_recipients_metadata(&mut out, recipients)?;
+    // JSON-at-rest: recipients present ⇒ ciphertext values only.
     validate_strict(&out)?;
     Ok(out)
+}
+
+fn ensure_nonempty_recipients(recipients: &[Recipient]) -> Result<()> {
+    if recipients.is_empty() {
+        return Err(CodecError::EmptyRecipientSet);
+    }
+    Ok(())
+}
+
+/// Rewrite document `recipients` (+ schema v1.1.0) to the target encryption set.
+fn apply_target_recipients_metadata(
+    secrets: &mut SecretsFile,
+    recipients: &[Recipient],
+) -> Result<()> {
+    let as_strings: Vec<String> = recipients.iter().map(|r| r.to_string()).collect();
+    secrets
+        .establish_recipients(as_strings)
+        .map_err(CodecError::from)?;
+    Ok(())
 }
 
 /// Decrypt inline `sec:age:v1:` values.
@@ -363,9 +393,11 @@ pub fn decrypt_inline(secrets: &SecretsFile, identities: &[Identity]) -> Result<
         }
     }
 
-    // After decrypt, values are plaintext in memory; recipients metadata may be
-    // present. JSON-at-rest policy does not apply to this working representation.
-    validate_structure_strict(&out)?;
+    // Plaintext output is JSON-at-rest when written to disk: drop recipients so
+    // the at-rest policy (recipients ⇒ ciphertext values) remains consistent.
+    // Callers that re-encrypt (convert/rekey) re-establish the target set.
+    out.recipients = None;
+    validate_strict(&out)?;
     Ok(out)
 }
 
@@ -406,7 +438,8 @@ pub fn decrypt_inline_with_passphrase(
         }
     }
 
-    validate_structure_strict(&out)?;
+    out.recipients = None;
+    validate_strict(&out)?;
     Ok(out)
 }
 
@@ -431,12 +464,17 @@ pub fn convert_bundle_to_inline_with_passphrase(
 }
 
 /// Convert inline document to bundle ciphertext.
+///
+/// After decrypt, document `recipients` is rewritten to the target encryption
+/// set so bundle interior metadata matches the outer age recipients.
 pub fn convert_inline_to_bundle(
     inline: &SecretsFile,
     identities: &[Identity],
     recipients: &[Recipient],
 ) -> Result<Vec<u8>> {
-    let plaintext = decrypt_inline(inline, identities)?;
+    ensure_nonempty_recipients(recipients)?;
+    let mut plaintext = decrypt_inline(inline, identities)?;
+    apply_target_recipients_metadata(&mut plaintext, recipients)?;
     encrypt_bundle(&plaintext, recipients)
 }
 
@@ -446,7 +484,9 @@ pub fn convert_inline_to_bundle_with_passphrase(
     decrypt_passphrase: &str,
     recipients: &[Recipient],
 ) -> Result<Vec<u8>> {
-    let plaintext = decrypt_inline_with_passphrase(inline, decrypt_passphrase)?;
+    ensure_nonempty_recipients(recipients)?;
+    let mut plaintext = decrypt_inline_with_passphrase(inline, decrypt_passphrase)?;
+    apply_target_recipients_metadata(&mut plaintext, recipients)?;
     encrypt_bundle(&plaintext, recipients)
 }
 
@@ -871,7 +911,10 @@ mod tests {
         assert!(inline.has_inline_ciphertext());
 
         let decrypted = decrypt_inline(&inline, &[identity]).expect("decrypt should succeed");
-        assert_eq!(decrypted, secrets);
+        // Encrypt establishes recipients (v1.1.0); decrypt clears them for plaintext at-rest.
+        assert_eq!(decrypted.projects, secrets.projects);
+        assert_eq!(decrypted.env_prefix, secrets.env_prefix);
+        assert!(decrypted.recipients.is_none());
     }
 
     #[test]
@@ -1371,7 +1414,75 @@ mod tests {
         let final_plain =
             decrypt_bundle(&bundle_again, std::slice::from_ref(&identity)).expect("final decrypt");
 
-        assert_eq!(final_plain, secrets);
+        // Conversion establishes recipients to the target set (schema v1.1.0).
+        assert_eq!(final_plain.projects, secrets.projects);
+        assert_eq!(
+            final_plain.recipients.as_deref(),
+            Some(std::slice::from_ref(&recipient.to_string()))
+        );
+        assert_eq!(
+            final_plain.schema_version,
+            seclusor_core::constants::SCHEMA_VERSION_V1_1_0
+        );
+    }
+
+    #[test]
+    fn convert_recipients_bearing_bundle_to_inline_succeeds_and_rewrites_metadata() {
+        // Regression: populated bundle with recipients decrypts to a structure-only
+        // working copy and must still convert via encrypt_inline (JSON-at-rest policy
+        // is enforced on output, not on decrypted input).
+        let mut secrets = fixture_secrets();
+        let identity = fixture_identity();
+        let source_recipient = identity.to_public();
+        let target_identity = Identity::generate();
+        let target_recipient = target_identity.to_public();
+
+        secrets
+            .establish_recipients(vec![source_recipient.to_string()])
+            .expect("establish source recipients");
+        let bundle = encrypt_bundle(&secrets, std::slice::from_ref(&source_recipient))
+            .expect("bundle encrypt");
+
+        let inline = convert_bundle_to_inline(
+            &bundle,
+            std::slice::from_ref(&identity),
+            std::slice::from_ref(&target_recipient),
+        )
+        .expect("recipients-bearing bundle->inline");
+
+        assert!(inline.has_inline_ciphertext());
+        assert_eq!(
+            inline.recipients.as_deref(),
+            Some(std::slice::from_ref(&target_recipient.to_string())),
+            "inline recipients metadata must match conversion target set"
+        );
+        assert_eq!(
+            inline.schema_version,
+            seclusor_core::constants::SCHEMA_VERSION_V1_1_0
+        );
+        assert_ne!(
+            inline.recipients.as_ref().unwrap().as_slice(),
+            &[source_recipient.to_string()]
+        );
+
+        // Reciprocal: inline→bundle rewrites interior metadata to the (same) target set.
+        let bundle_again = convert_inline_to_bundle(
+            &inline,
+            std::slice::from_ref(&target_identity),
+            std::slice::from_ref(&target_recipient),
+        )
+        .expect("inline->bundle with target identity");
+        let interior =
+            decrypt_bundle(&bundle_again, std::slice::from_ref(&target_identity)).expect("decrypt");
+        assert_eq!(
+            interior.recipients.as_deref(),
+            Some(std::slice::from_ref(&target_recipient.to_string())),
+            "bundle interior recipients must match conversion target set"
+        );
+        assert_eq!(
+            interior.projects[0].credentials.len(),
+            secrets.projects[0].credentials.len()
+        );
     }
 
     #[test]

@@ -79,6 +79,13 @@ mod tests {
         .expect("inline decrypt");
 
         let loaded = read_secrets_file(&output).expect("read output");
-        assert_eq!(loaded, secrets);
+        // Encrypt establishes recipients metadata (v1.1.0); decrypt clears it for
+        // plaintext JSON-at-rest, leaving schema v1.1.0 without recipients.
+        assert_eq!(loaded.projects, secrets.projects);
+        assert!(loaded.recipients.is_none());
+        assert_eq!(
+            loaded.projects[0].credentials["API_KEY"].value.as_deref(),
+            Some("plain-value")
+        );
     }
 }
