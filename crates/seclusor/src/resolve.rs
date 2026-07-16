@@ -49,6 +49,70 @@ pub(crate) fn resolve_recipients(args: &RecipientArgs) -> CliResult<Vec<Recipien
     Ok(recipients)
 }
 
+/// True when `rpassword` can open a controlling console.
+///
+/// rpassword 7.x does **not** read stdin: it opens `/dev/tty` (Unix) or
+/// `CONIN$` (Windows). Checking `stdin().is_terminal()` is therefore wrong —
+/// it refuses valid interactive use with redirected stdin (pipeline input)
+/// while a controlling TTY remains available for the passphrase prompt.
+///
+/// Preflight here mirrors the device rpassword opens so we fail closed before
+/// calling `read_password`, which can block indefinitely on some Windows
+/// noninteractive runners instead of returning an error.
+fn interactive_console_available() -> bool {
+    #[cfg(unix)]
+    {
+        use std::io::IsTerminal;
+        match std::fs::File::open("/dev/tty") {
+            Ok(f) => f.is_terminal(),
+            Err(_) => false,
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::io::IsTerminal;
+        // Match rpassword's CreateFileA("CONIN$") + GetConsoleMode path.
+        // IsTerminal on Windows uses GetConsoleMode under the hood.
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("CONIN$")
+        {
+            Ok(f) => f.is_terminal(),
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
+const NO_INTERACTIVE_TERMINAL_MSG: &str =
+    "no interactive terminal available for passphrase prompt. \
+     Provide --passphrase-env, --passphrase-file, or --passphrase-stdin.";
+
+const PROTECTED_NO_TERMINAL_MSG: &str = "identity file is passphrase-protected but no interactive \
+     terminal is available. Provide --passphrase-env, \
+     --passphrase-file, or --passphrase-stdin.";
+
+/// Prompt on the controlling console via rpassword, after a device preflight.
+fn prompt_passphrase_interactive(prompt: &str, no_console_msg: &str) -> CliResult<SecretString> {
+    if !interactive_console_available() {
+        return Err(CliError::Message(no_console_msg.to_string()));
+    }
+    eprint!("{prompt}");
+    let pp = SecretString::from(
+        rpassword::read_password().map_err(|_| CliError::Message(no_console_msg.to_string()))?,
+    );
+    if pp.expose_secret().is_empty() {
+        return Err(CliError::Message(
+            "passphrase must not be empty".to_string(),
+        ));
+    }
+    Ok(pp)
+}
+
 /// Resolve a passphrase from the configured input channel.
 ///
 /// Returns `None` if no passphrase flags are set. When `confirm` is true
@@ -63,24 +127,14 @@ pub(crate) fn resolve_passphrase(
         } else {
             "Passphrase: "
         };
-        eprint!("{prompt}");
-        let pp = SecretString::from(rpassword::read_password().map_err(|_| {
-            CliError::Message(
-                "no interactive terminal available for passphrase prompt. \
-                 Provide --passphrase-env, --passphrase-file, or --passphrase-stdin."
-                    .to_string(),
-            )
-        })?);
-        if pp.expose_secret().is_empty() {
-            return Err(CliError::Message(
-                "passphrase must not be empty".to_string(),
-            ));
-        }
+        let pp = prompt_passphrase_interactive(prompt, NO_INTERACTIVE_TERMINAL_MSG)?;
         if confirm {
-            eprint!("Confirm passphrase: ");
-            let pp2 = SecretString::from(rpassword::read_password().map_err(|_| {
-                CliError::Message("failed to read passphrase confirmation".to_string())
-            })?);
+            // Confirmation uses the same console preflight; surface a distinct
+            // message if the second read fails closed.
+            let pp2 = prompt_passphrase_interactive(
+                "Confirm passphrase: ",
+                "failed to read passphrase confirmation",
+            )?;
             if pp.expose_secret() != pp2.expose_secret() {
                 return Err(CliError::Message("passphrases do not match".to_string()));
             }
@@ -221,43 +275,18 @@ pub(crate) fn resolve_identities(
     Ok(identities)
 }
 
-/// Resolve passphrase for a protected identity, with TTY auto-prompt fallback.
+/// Resolve passphrase for a protected identity, with controlling-console auto-prompt.
 fn resolve_passphrase_for_protected(
     passphrase_args: &PassphraseArgs,
 ) -> CliResult<Option<SecretString>> {
     let mut pp = resolve_passphrase(passphrase_args, false)?;
-    // Auto-prompt only when no explicit channel and stdin is a TTY.
-    // Never call rpassword without an isatty check — on some Windows runners
-    // read_password can block indefinitely instead of returning an error.
+    // Auto-prompt when no explicit channel and a controlling console is available
+    // (same device rpassword opens — not stdin isatty).
     if pp.is_none() {
-        use std::io::IsTerminal;
-        if !std::io::stdin().is_terminal() {
-            return Err(CliError::Message(
-                "identity file is passphrase-protected but no interactive \
-                 terminal is available. Provide --passphrase-env, \
-                 --passphrase-file, or --passphrase-stdin."
-                    .to_string(),
-            ));
-        }
-        eprint!("Passphrase: ");
-        match rpassword::read_password().map(SecretString::from) {
-            Ok(val) if !val.expose_secret().is_empty() => {
-                pp = Some(val);
-            }
-            Ok(_) => {
-                return Err(CliError::Message(
-                    "passphrase must not be empty".to_string(),
-                ));
-            }
-            Err(_) => {
-                return Err(CliError::Message(
-                    "identity file is passphrase-protected but no interactive \
-                     terminal is available. Provide --passphrase-env, \
-                     --passphrase-file, or --passphrase-stdin."
-                        .to_string(),
-                ));
-            }
-        }
+        pp = Some(prompt_passphrase_interactive(
+            "Passphrase: ",
+            PROTECTED_NO_TERMINAL_MSG,
+        )?);
     }
     Ok(pp)
 }

@@ -633,9 +633,9 @@ mod tests {
         let before = fs::read(&inline).expect("before");
         let names = list_sibling_names(dir.path());
 
-        // Use an unset passphrase-env so the refuse path is non-interactive.
-        // PassphraseArgs::default() can auto-prompt on a TTY; Windows CI hung
-        // for hours waiting on rpassword when that path was taken.
+        // Unset passphrase-env: non-interactive refuse without rpassword.
+        // (Auto-prompt / --passphrase still require a controlling console; this
+        // test pins the explicit missing-channel path used by CI/scripts.)
         let unset_var = "SECLUSOR_TEST_REKEY_PP_UNSET";
         std::env::remove_var(unset_var);
         let err = handle_rekey(RekeyArgs {
