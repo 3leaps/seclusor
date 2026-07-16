@@ -179,6 +179,45 @@ pub fn is_scrypt_ciphertext(ciphertext: &[u8]) -> Result<bool> {
     Ok(decryptor.is_scrypt())
 }
 
+/// Count X25519 recipient stanzas in an age ciphertext header.
+///
+/// Accepts binary and ASCII-armored age files. Used as a tripwire against
+/// document `recipients` metadata (one X25519 stanza per recipient). Does not
+/// prove which public keys were used — only the stanza count.
+///
+/// Scrypt-only files return `0` X25519 stanzas (callers should refuse those
+/// via [`is_scrypt_ciphertext`] before treating count as canonical).
+pub fn count_x25519_recipient_stanzas(ciphertext: &[u8]) -> Result<usize> {
+    // Normalize armored → binary stream for a single scan path.
+    let mut normalized = Vec::new();
+    {
+        let mut reader = age::armor::ArmoredReader::new(ciphertext);
+        reader
+            .read_to_end(&mut normalized)
+            .map_err(|_| CryptoError::InvalidCiphertext)?;
+    }
+    // Age v1 headers list recipient stanzas as ASCII lines beginning with "-> TAG ".
+    // X25519 is the only recipient type seclusor writes for data documents.
+    // Scan bytes (payload after --- is binary and not UTF-8).
+    let mut count = 0usize;
+    for line in normalized.split(|&b| b == b'\n') {
+        if line.starts_with(b"-> X25519 ") || line == b"-> X25519" {
+            count = count.saturating_add(1);
+        }
+        // Header ends at the MAC line; stop so payload bytes cannot inflate count.
+        if line.starts_with(b"---") {
+            break;
+        }
+    }
+    Ok(count)
+}
+
+/// Count X25519 stanzas in a `sec:age:v1:<base64>` inline ciphertext value.
+pub fn count_inline_x25519_recipient_stanzas(inline_ciphertext: &str) -> Result<usize> {
+    let raw = decode_inline_ciphertext(inline_ciphertext)?;
+    count_x25519_recipient_stanzas(&raw)
+}
+
 /// Decrypt ciphertext with identities specified as string values.
 pub fn decrypt_with_identity_strings<I, S>(ciphertext: &[u8], identities: I) -> Result<Vec<u8>>
 where
@@ -525,6 +564,22 @@ mod tests {
         assert!(
             is_scrypt_ciphertext(&ct).expect("classify armored scrypt"),
             "armored scrypt must be detected (not InvalidCiphertext)"
+        );
+    }
+
+    #[test]
+    fn count_x25519_stanzas_matches_recipient_set() {
+        let r1 = parsed_recipient();
+        let id2 = age::x25519::Identity::generate();
+        let r2 = id2.to_public();
+        let one = encrypt(b"one", std::slice::from_ref(&r1)).expect("encrypt one");
+        assert_eq!(count_x25519_recipient_stanzas(&one).expect("count"), 1);
+        let two = encrypt(b"two", &[r1.clone(), r2.clone()]).expect("encrypt two");
+        assert_eq!(count_x25519_recipient_stanzas(&two).expect("count"), 2);
+        let inline = encrypt_inline_value(b"inline", &[r1, r2]).expect("inline");
+        assert_eq!(
+            count_inline_x25519_recipient_stanzas(&inline).expect("inline count"),
+            2
         );
     }
 

@@ -3,8 +3,12 @@ pub(crate) mod blob;
 pub(crate) mod bundle;
 pub(crate) mod convert;
 pub(crate) mod docs;
+pub(crate) mod encrypted_write;
 pub(crate) mod inline;
 pub(crate) mod keys;
+#[cfg(test)]
+mod packaging_matrix;
+pub(crate) mod rekey;
 pub(crate) mod run;
 pub(crate) mod secrets;
 
@@ -21,6 +25,7 @@ pub(crate) fn handle_secrets_command(command: SecretsSubcommand) -> CliResult<()
         SecretsSubcommand::Validate(args) => secrets::handle_validate(args),
         SecretsSubcommand::ExportEnv(args) => secrets::handle_export_env(args),
         SecretsSubcommand::ImportEnv(args) => secrets::handle_import_env(args),
+        SecretsSubcommand::Rekey(args) => rekey::handle_rekey(args),
         SecretsSubcommand::Run(args) => run::handle_run(args),
         SecretsSubcommand::Bundle(args) => bundle::handle_bundle_command(args.command),
         SecretsSubcommand::Inline(args) => inline::handle_inline_command(args.command),

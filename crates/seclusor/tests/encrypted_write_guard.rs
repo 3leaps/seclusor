@@ -127,13 +127,14 @@ fn list_dir_names(dir: &Path) -> Vec<String> {
     names
 }
 
-fn assert_refusal(
+/// Refuse without mutating the target: empty stdout, no value/ciphertext leak,
+/// byte-identical file, no sibling temps.
+fn assert_policy_refusal(
     output: &std::process::Output,
     path: &Path,
     before: &[u8],
     dir: &Path,
     names_before: &[String],
-    expected_source: &str,
 ) {
     assert!(
         !output.status.success(),
@@ -147,6 +148,31 @@ fn assert_refusal(
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
+    // Error output must not include plaintext or ciphertext content.
+    assert!(!stderr.contains("sk-123"));
+    assert!(!stderr.contains("sec:age:v1:"));
+    assert!(!stderr.contains("age-encryption.org"));
+    assert!(!stderr.contains("injected"));
+
+    let after = fs::read(path).expect("re-read target");
+    assert_eq!(after, before, "target must remain byte-identical");
+    assert_eq!(
+        list_dir_names(dir),
+        names_before,
+        "refusal must not create sibling/temp artifacts"
+    );
+}
+
+fn assert_legacy_encrypted_unsupported(
+    output: &std::process::Output,
+    path: &Path,
+    before: &[u8],
+    dir: &Path,
+    names_before: &[String],
+    expected_source: &str,
+) {
+    assert_policy_refusal(output, path, before, dir, names_before);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("refusing to write into encrypted secrets file"),
         "stderr={stderr}"
@@ -159,135 +185,71 @@ fn assert_refusal(
         stderr.contains("not available in this version"),
         "stderr={stderr}"
     );
-    // Error output must not include plaintext or ciphertext content.
-    assert!(!stderr.contains("sk-123"));
-    assert!(!stderr.contains("sec:age:v1:"));
-    assert!(!stderr.contains("age-encryption.org"));
-
-    let after = fs::read(path).expect("re-read target");
-    assert_eq!(after, before, "target must remain byte-identical");
-    assert_eq!(
-        list_dir_names(dir),
-        names_before,
-        "refusal must not create sibling/temp artifacts"
-    );
 }
 
-/// Encrypting / unsupported write entry points that must still refuse on encrypted targets.
-fn refuse_encrypting_matrix_for_target(path: &Path, dir: &Path, expected_source: &str) {
+/// Encrypting writes without identity/recipients (or unsupported init) must refuse
+/// without mutating the target.
+fn refuse_incomplete_encrypting_matrix(path: &Path, dir: &Path, expected_source: &str) {
     let before = fs::read(path).expect("read before");
     let names_before = list_dir_names(dir);
     let path_s = path.to_str().expect("utf8 path");
 
-    let mut cases: Vec<(&str, Vec<&str>)> = vec![
-        (
-            "set --value",
-            vec![
-                "secrets",
-                "set",
-                "--file",
-                path_s,
-                "--project",
-                "demo",
-                "--key",
-                "API_KEY",
-                "--value",
-                "injected",
-            ],
-        ),
-        (
-            "set --ref",
-            vec![
-                "secrets",
-                "set",
-                "--file",
-                path_s,
-                "--project",
-                "demo",
-                "--key",
-                "API_KEY",
-                "--ref",
-                "vault://injected",
-            ],
-        ),
-        (
-            "import-env",
-            vec![
-                "secrets",
-                "import-env",
-                "--file",
-                path_s,
-                "--project",
-                "demo",
-                "--prefix",
-                "APP_",
-            ],
-        ),
-        (
-            "init --force",
-            vec![
-                "secrets",
-                "init",
-                "--file",
-                path_s,
-                "--project",
-                "other",
-                "--force",
-            ],
-        ),
-    ];
+    // set --value without recipients (and without identity for bundle).
+    let set_out = run_seclusor(&[
+        "secrets",
+        "set",
+        "--file",
+        path_s,
+        "--project",
+        "demo",
+        "--key",
+        "API_KEY",
+        "--value",
+        "injected",
+    ]);
+    assert_policy_refusal(&set_out, path, &before, dir, &names_before);
+    let set_err = String::from_utf8_lossy(&set_out.stderr);
+    assert!(
+        set_err.contains("recipient")
+            || set_err.contains("identity")
+            || set_err.contains("rekey")
+            || set_err.contains("ciphertext")
+            || set_err.contains("decrypt"),
+        "stderr={set_err}"
+    );
 
-    // Bundle (and marker-only) unset remains refuse; inline unset is supported.
-    if expected_source == "bundle" {
-        cases.push((
-            "unset",
-            vec![
-                "secrets",
-                "unset",
-                "--file",
-                path_s,
-                "--project",
-                "demo",
-                "--key",
-                "API_KEY",
-            ],
-        ));
-        cases.push((
-            "set description-only",
-            vec![
-                "secrets",
-                "set",
-                "--file",
-                path_s,
-                "--project",
-                "demo",
-                "--key",
-                "API_KEY",
-                "--description",
-                "nope",
-            ],
-        ));
-    }
-
-    for (label, args) in cases {
-        let output = run_seclusor(&args);
-        assert_refusal(&output, path, &before, dir, &names_before, expected_source);
-        let _ = label;
-    }
+    // init --force remains the legacy EncryptedWriteUnsupported surface.
+    let init_out = run_seclusor(&[
+        "secrets",
+        "init",
+        "--file",
+        path_s,
+        "--project",
+        "other",
+        "--force",
+    ]);
+    assert_legacy_encrypted_unsupported(
+        &init_out,
+        path,
+        &before,
+        dir,
+        &names_before,
+        expected_source,
+    );
 }
 
 #[test]
 fn process_refuses_encrypting_writes_on_valid_inline() {
     let dir = tempfile::tempdir().expect("tempdir");
     let inline = prepare_inline_encrypted(dir.path());
-    refuse_encrypting_matrix_for_target(&inline, dir.path(), "inline");
+    refuse_incomplete_encrypting_matrix(&inline, dir.path(), "inline");
 }
 
 #[test]
 fn process_refuses_binary_bundle_for_all_write_entry_points() {
     let dir = tempfile::tempdir().expect("tempdir");
     let bundle = prepare_binary_bundle(dir.path());
-    refuse_encrypting_matrix_for_target(&bundle, dir.path(), "bundle");
+    refuse_incomplete_encrypting_matrix(&bundle, dir.path(), "bundle");
 }
 
 #[test]
@@ -299,7 +261,198 @@ fn process_refuses_armored_bundle_marker_for_all_write_entry_points() {
         b"-----BEGIN AGE ENCRYPTED FILE-----\nnot-a-real-payload\n",
     )
     .expect("write armored");
-    refuse_encrypting_matrix_for_target(&path, dir.path(), "bundle");
+    refuse_incomplete_encrypting_matrix(&path, dir.path(), "bundle");
+}
+
+#[test]
+fn process_set_inline_with_recipient_covers_single_field_doc() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("one.json");
+    fs::write(
+        &input,
+        r#"{
+  "schema_version": "v1.0.0",
+  "projects": [{
+    "project_slug": "demo",
+    "credentials": {
+      "API_KEY": { "type": "secret", "value": "sk-old" }
+    }
+  }]
+}"#,
+    )
+    .expect("write");
+    let identity = dir.path().join("identity.txt");
+    let gen = run_seclusor(&[
+        "keys",
+        "age",
+        "identity",
+        "generate",
+        "--output",
+        identity.to_str().unwrap(),
+    ]);
+    assert!(gen.status.success());
+    let recipient = String::from_utf8(gen.stdout).unwrap();
+    let recipient = recipient.trim();
+    let inline = dir.path().join("inline.json");
+    let enc = run_seclusor(&[
+        "secrets",
+        "inline",
+        "encrypt",
+        "--input",
+        input.to_str().unwrap(),
+        "--output",
+        inline.to_str().unwrap(),
+        "--recipient",
+        recipient,
+    ]);
+    assert!(
+        enc.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&enc.stderr)
+    );
+
+    let set = Command::new(seclusor_bin())
+        .args([
+            "secrets",
+            "set",
+            "--file",
+            inline.to_str().unwrap(),
+            "--project",
+            "demo",
+            "--key",
+            "API_KEY",
+            "--value-env",
+            "SECLUSOR_TEST_SET_VALUE",
+            "--recipient",
+            recipient,
+            "--identity-file",
+            identity.to_str().unwrap(),
+        ])
+        .env("SECLUSOR_TEST_SET_VALUE", "fresh-secret")
+        .output()
+        .expect("run set");
+    assert!(
+        set.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&set.stdout), "ok\n");
+    let after: serde_json::Value =
+        serde_json::from_slice(&fs::read(&inline).unwrap()).expect("parse");
+    assert_eq!(after["schema_version"], "v1.1.0");
+    assert!(after["recipients"].is_array());
+    let ct = after["projects"][0]["credentials"]["API_KEY"]["value"]
+        .as_str()
+        .unwrap();
+    assert!(ct.starts_with("sec:age:v1:"));
+}
+
+#[test]
+fn process_import_env_inline_encrypted_happy_and_mismatch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("one.json");
+    fs::write(
+        &input,
+        r#"{
+  "schema_version": "v1.0.0",
+  "env_prefix": "APP_",
+  "projects": [{
+    "project_slug": "demo",
+    "credentials": {
+      "TOKEN": { "type": "secret", "value": "old" }
+    }
+  }]
+}"#,
+    )
+    .expect("write");
+    let identity = dir.path().join("identity.txt");
+    let gen = run_seclusor(&[
+        "keys",
+        "age",
+        "identity",
+        "generate",
+        "--output",
+        identity.to_str().unwrap(),
+    ]);
+    assert!(gen.status.success());
+    let recipient = String::from_utf8(gen.stdout).unwrap();
+    let recipient = recipient.trim();
+    let inline = dir.path().join("inline.json");
+    let enc = run_seclusor(&[
+        "secrets",
+        "inline",
+        "encrypt",
+        "--input",
+        input.to_str().unwrap(),
+        "--output",
+        inline.to_str().unwrap(),
+        "--recipient",
+        recipient,
+    ]);
+    assert!(
+        enc.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&enc.stderr)
+    );
+
+    let dotenv = dir.path().join("import.env");
+    fs::write(&dotenv, "APP_TOKEN=from-process\n").expect("dotenv");
+    let import = run_seclusor(&[
+        "secrets",
+        "import-env",
+        "--file",
+        inline.to_str().unwrap(),
+        "--project",
+        "demo",
+        "--prefix",
+        "APP_",
+        "--dotenv-file",
+        dotenv.to_str().unwrap(),
+        "--recipient",
+        recipient,
+        "--identity-file",
+        identity.to_str().unwrap(),
+    ]);
+    assert!(
+        import.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&import.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&import.stdout).trim(), "1");
+
+    // Mismatch recipients refuse without mutating.
+    let before = fs::read(&inline).expect("before");
+    let other_id = dir.path().join("other.txt");
+    let gen2 = run_seclusor(&[
+        "keys",
+        "age",
+        "identity",
+        "generate",
+        "--output",
+        other_id.to_str().unwrap(),
+    ]);
+    assert!(gen2.status.success());
+    let other_r = String::from_utf8(gen2.stdout).unwrap();
+    let other_r = other_r.trim();
+    let bad = run_seclusor(&[
+        "secrets",
+        "import-env",
+        "--file",
+        inline.to_str().unwrap(),
+        "--project",
+        "demo",
+        "--prefix",
+        "APP_",
+        "--dotenv-file",
+        dotenv.to_str().unwrap(),
+        "--recipient",
+        other_r,
+        "--identity-file",
+        identity.to_str().unwrap(),
+    ]);
+    assert!(!bad.status.success());
+    assert_eq!(fs::read(&inline).expect("after"), before);
+    assert!(String::from_utf8_lossy(&bad.stdout).is_empty());
 }
 
 #[test]
@@ -901,7 +1054,12 @@ fn process_plaintext_set_stdout_ok() {
     ]);
     assert!(output.status.success());
     assert_eq!(String::from_utf8_lossy(&output.stdout), "ok\n");
-    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Legacy --value emits a stderr warning; stdout stays pure.
+    assert!(
+        stderr.is_empty() || stderr.contains("prefer --value-stdin"),
+        "stderr={stderr}"
+    );
 }
 
 #[test]
