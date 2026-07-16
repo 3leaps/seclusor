@@ -9,10 +9,18 @@ all-features = true
 [advisories]
 db-path = "target/advisory-dbs"
 db-urls = ["https://github.com/RustSec/advisory-db"]
-# Transitive via age → i18n-embed-fl; no maintained upgrade path until age moves off
-# proc-macro-error2. Track upstream; drop ignore when the graph no longer pulls it.
+# RUSTSEC-2026-0173 (proc-macro-error2 unmaintained). Added 2026-07-16.
+# Compile-time-only proc macro reached transitively via age → i18n-embed-fl; it is
+# not linked into the shipped runtime binary (verified: `cargo tree -i
+# proc-macro-error2` has i18n-embed-fl as its sole parent). Unmaintained flag, not a
+# known vulnerability, with no safe upgrade path (age 0.12 still resolves it).
+# Removal condition: drop this ignore as soon as the age → i18n-embed-fl stack stops
+# resolving proc-macro-error2. Revisit by the v0.2.1 train or 2026-10-13, whichever
+# comes first. This is the ONLY permitted advisory ignore — a new advisory must not
+# hide behind it, which is why CI runs `cargo audit --deny warnings --ignore
+# RUSTSEC-2026-0173` alongside `cargo deny check advisories`.
 ignore = [
-  { id = "RUSTSEC-2026-0173", reason = "unmaintained transitive (age/i18n-embed-fl); no safe upgrade" },
+  { id = "RUSTSEC-2026-0173", reason = "unmaintained compile-time-only transitive (age → i18n-embed-fl); no safe upgrade; revisit by v0.2.1 or 2026-10-13" },
 ]
 
 [licenses]
