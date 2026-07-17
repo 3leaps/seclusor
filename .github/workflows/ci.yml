@@ -46,6 +46,16 @@ jobs:
         run: |
           set -euo pipefail
           make ci
+      - name: Security advisories (deny advisories + cargo-audit)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # cargo-deny is pre-baked and runnable in the runner image. The pre-baked
+          # cargo-audit is linked against a newer glibc than the image provides and
+          # fails to load, so rebuild it in-container when it cannot actually run
+          # (--force overrides the broken same-version binary on PATH).
+          cargo-audit --version >/dev/null 2>&1 || cargo install cargo-audit --locked --force
+          make ci-security
       - name: Go bindings tests
         shell: bash
         run: |

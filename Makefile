@@ -10,7 +10,7 @@
 
 .PHONY: all help bootstrap bootstrap-prereqs bootstrap-release-tools bootstrap-format-tools bootstrap-rust-tools bootstrap-force tools check check-all test fmt fmt-check lint build build-release clean
 .PHONY: ffi-header build-ffi go-bindings-sync go-bindings-ci go-build go-test go-test-committed ts-build ts-test embed-verify
-.PHONY: precommit prepush pr-final repo-status deny deny-all audit miri msrv
+.PHONY: precommit prepush pr-final repo-status deny deny-all audit ci-security miri msrv
 .PHONY: check-windows check-windows-msvc check-windows-gnu
 .PHONY: install dogfood-cli
 .PHONY: version version-patch version-minor version-major version-set version-sync version-check
@@ -463,6 +463,21 @@ audit: ## Run cargo-audit security scan
 		exit 1; \
 	fi
 	@echo "[ok] cargo-audit passed"
+
+# Advisory backstop for the deny.toml RUSTSEC-2026-0173 exception. Deliberately
+# kept OUT of `make ci` (which stays offline-safe) because advisory checks fetch
+# the RustSec DB over the network. CI enforces this as a dedicated step so a new,
+# unacknowledged advisory cannot hide behind the single-ID deny.toml ignore.
+# cargo-audit does not read deny.toml, so the --ignore ID below MUST match the
+# single-ID ignore in deny.toml (SSOT); drop both together per that removal
+# condition (revisit by v0.2.1 or 2026-10-13).
+ci-security: ## Run advisory + audit gates (network required; enforced in CI)
+	@echo "Running advisory + audit gates..."
+	@command -v cargo-deny >/dev/null 2>&1 || { echo "[!!] cargo-deny not found (run 'make bootstrap')"; exit 1; }
+	@command -v cargo-audit >/dev/null 2>&1 || { echo "[!!] cargo-audit not found (run 'make bootstrap')"; exit 1; }
+	cargo-deny check advisories
+	cargo-audit audit --deny warnings --ignore RUSTSEC-2026-0173
+	@echo "[ok] advisory + audit gates passed"
 
 # -----------------------------------------------------------------------------
 # Build
