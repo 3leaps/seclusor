@@ -46,15 +46,23 @@ jobs:
         run: |
           set -euo pipefail
           make ci
+      - name: Cache cargo-audit binary
+        uses: actions/cache@v4
+        with:
+          path: /opt/cargo/bin/cargo-audit
+          # Bump the image tag in this key whenever the runner image changes, so a
+          # cargo-audit compiled against a different glibc is never restored.
+          key: cargo-audit-0.22.2-goneat-tools-runner-glibc-v0.4.1
       - name: Security advisories (deny advisories + cargo-audit)
         shell: bash
         run: |
           set -euo pipefail
           # cargo-deny is pre-baked and runnable in the runner image. The pre-baked
           # cargo-audit is linked against a newer glibc than the image provides and
-          # fails to load, so rebuild it in-container when it cannot actually run
-          # (--force overrides the broken same-version binary on PATH).
-          cargo-audit --version >/dev/null 2>&1 || cargo install cargo-audit --locked --force
+          # cannot load, so build a pinned copy from source. The cache above keeps
+          # that build across runs, so we neither rely on the broken binary nor
+          # recompile every run (the compile only recurs on a cache miss).
+          cargo-audit --version >/dev/null 2>&1 || cargo install cargo-audit --version 0.22.2 --locked --force
           make ci-security
       - name: Go bindings tests
         shell: bash
