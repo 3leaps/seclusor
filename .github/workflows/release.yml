@@ -126,7 +126,8 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: |
           set -euo pipefail
-          cargo build --release --target "${{ matrix.target }}" -p seclusor
+          # artifact-callsite: release-cli
+          ./scripts/cargo-artifact-build.sh build --target "${{ matrix.target }}" -p seclusor
       - name: Stage release asset
         shell: bash
         run: |

@@ -5,10 +5,16 @@ const { execFileSync } = require("node:child_process");
 const rootDir = path.resolve(__dirname, "..");
 const manifestPath = path.join(rootDir, "native", "Cargo.toml");
 
-execFileSync("cargo", ["build", "--release", "--manifest-path", manifestPath], {
-	stdio: "inherit",
-	cwd: rootDir,
-});
+// --locked: the native Cargo.lock is tracked in-repo, so builds must use it
+// as-is and fail on drift rather than silently regenerating it.
+execFileSync(
+	"cargo",
+	["build", "--release", "--locked", "--manifest-path", manifestPath],
+	{
+		stdio: "inherit",
+		cwd: rootDir,
+	},
+);
 
 const targetDir = path.join(rootDir, "native", "target", "release");
 let libName;

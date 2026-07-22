@@ -98,6 +98,69 @@ git pull origin main
     (`make release-verify`).
 29. Public keys exported and attached (`make release-export-keys`).
 
+### Dependency-graph integrity
+
+seclusor implements crucible **EPR-0001** (_published artifacts carry a pinned,
+enforced, audited, parity-checked dependency graph_) for its binary surfaces. This
+repository adopts that principle via the gates below; it does not restate it. See
+`3leaps/crucible docs/decisions/EPR-0001-published-artifact-dependency-integrity.md`.
+
+**Standing rule — refresh all committed locks in one PR.** Every dependency change
+refreshes **both** committed lockfiles together, in the same PR, so they never
+drift and are reviewed as one set:
+
+- `Cargo.lock` (root workspace — CLI + FFI/Go surfaces)
+- `bindings/typescript/native/Cargo.lock` (the TS native addon — a separate Cargo
+  workspace)
+
+After any bump, regenerate both and confirm the security-critical shared crypto
+components (`age`, `x25519-dalek`, `zeroize`, and their curve/AEAD transitives)
+still resolve to identical upstream source versions across the two locks.
+
+**How the gates enforce it:**
+
+- **Pin** — both locks are committed (the native lock is no longer gitignored).
+- **Enforce** — every published-artifact build routes through the canonical
+  entrypoint `scripts/cargo-artifact-build.sh`, which injects `--locked`: the CLI
+  release assets (`release.yml`), the FFI/Go prebuilts (`go-bindings.yml`, incl.
+  `cargo zigbuild`), and the `build-release`/`build-ffi` make targets; the TS
+  `.node` (`build-native.js`) enforces `--locked` directly. So a committed lock the
+  build could silently ignore cannot exist. `scripts/check-locked-artifact-builds.py`
+  (a CI static guard, proven by `scripts/negative-control-locked-guard.sh`) refuses
+  any artifact build that bypasses the wrapper without `--locked`, and
+  `make negative-control-locks` drives the real entrypoints to prove a stale lock is
+  rejected. Because the FFI build is `--locked` against root, the Go prebuilts'
+  crypto graph equals root by enforcement, so root is the parity anchor for CLI + Go.
+  - _TS scope note:_ the addon `--locked` build currently runs in the Linux
+    `rust-quality` CI job only; the 5-platform `native-test` matrix does not enter
+    the separate TS-native workspace. Per-platform addon enforcement is a **forward
+    requirement gated on the TS publish workflow (D11B)**, which must build the addon
+    `--locked` per platform via `cargo-artifact-build.sh` with the static guard
+    covering the workflow YAML. This is not a v0.2.0 gap: the TS binding is
+    `private:true` and ships no per-platform artifact in the 0.2.0 cut, while the
+    CLI/Go release builds are `--locked` on every target.
+- **Audit** — `make ci-security` scans **both** locks (`cargo audit --file …`) with
+  the same single accepted advisory (RUSTSEC-2026-0173, decision of record
+  [SDR-0003](docs/decisions/SDR-0003-rustsec-2026-0173-advisory-acceptance.md)). It
+  runs on every PR (ci.yml) **and daily on a schedule** (`security-audit.yml`) so an
+  advisory disclosed against an unchanged pin is still caught.
+- **Parity** — `make parity-check` asserts, keyed by full `(name, version, source,
+checksum)` identity, that the crypto-roots closure resolves identically across
+  surfaces, under two declared policies in `ci/parity-manifest.toml`:
+  `[crypto_components]` is the **security gate** (EPR-0001 §4; divergence or a
+  component missing from a scoped surface → exit 2), and `[non_crypto_shared]` is a
+  separate **shared-graph lockstep** policy (a utility drift → exit 4, kept out of
+  the security verdict). Reconciliation is two-way (undeclared node → REFUSE exit 3;
+  declared-but-absent → FAIL) and declared roots are surface-scoped (a root on an
+  undeclared surface REFUSEs). Non-crypto subtrees (localization, embedding,
+  temp-file, platform shims) are declared out-of-scope. Regenerate the generated
+  tables with `make parity-manifest-regen` after any dependency change and review
+  the diff (the crypto/util boundary is a secrev gate).
+- **Prove, don't assume** — `make negative-control-locks` staleens each lock and
+  asserts the `--locked` build **fails**; `make negative-control-parity` proves the
+  parity check rejects a divergent, absent, or undeclared crypto graph. CI runs
+  both, so the gates are demonstrated, not merely configured.
+
 ## Publish Gate
 
 30. Draft release notes reflect final asset set (5 platform binaries +

@@ -60,7 +60,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo zigbuild --release --target "${{ matrix.target }}.${{ matrix.glibc }}" -p seclusor-ffi
+          # artifact-callsite: gobindings-ffi-linux
+          ./scripts/cargo-artifact-build.sh zigbuild --target "${{ matrix.target }}.${{ matrix.glibc }}" -p seclusor-ffi
       - name: Package FFI
         shell: bash
         run: |
@@ -111,8 +112,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --release --target x86_64-apple-darwin -p seclusor-ffi
-          cargo build --release --target aarch64-apple-darwin -p seclusor-ffi
+          # artifact-callsite: gobindings-ffi-darwin-amd64
+          ./scripts/cargo-artifact-build.sh build --target x86_64-apple-darwin -p seclusor-ffi
+          # artifact-callsite: gobindings-ffi-darwin-arm64
+          ./scripts/cargo-artifact-build.sh build --target aarch64-apple-darwin -p seclusor-ffi
       - name: Package FFI
         shell: bash
         run: |
@@ -153,7 +156,8 @@ jobs:
         shell: msys2 {0}
         run: |
           set -euo pipefail
-          cargo build --release --target x86_64-pc-windows-gnu -p seclusor-ffi
+          # artifact-callsite: gobindings-ffi-windows-gnu
+          ./scripts/cargo-artifact-build.sh build --target x86_64-pc-windows-gnu -p seclusor-ffi
       - name: Package FFI
         shell: bash
         run: |

@@ -64,6 +64,17 @@ jobs:
           # recompile every run (the compile only recurs on a cache miss).
           cargo-audit --version >/dev/null 2>&1 || cargo install cargo-audit --version 0.22.2 --locked --force
           make ci-security
+      - name: Lockfile enforcement (static guard + negative controls)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Static guard: every artifact-producing cargo/zigbuild invocation (incl.
+          # the cross-target release/go-bindings workflow paths) enforces --locked.
+          make check-locked-builds
+          # Prove the committed locks are load-bearing: a deliberately stale lock
+          # must make each real build entrypoint fail (EPR-0001 conformance). Runs
+          # here because it resolves the dependency graph (needs the registry index).
+          make negative-control-locks
       - name: Go bindings tests
         shell: bash
         run: |
@@ -165,3 +176,23 @@ jobs:
         with:
           name: sbom-cyclonedx
           path: "**/bom.json"
+  dependency-parity:
+    name: Crypto-graph parity
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Crypto-graph parity + negative controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Reads the committed lockfiles only (no build, no network). Asserts the
+          # security-critical crypto graph resolves to identical upstream source
+          # identities across surfaces, and proves the check rejects a divergent,
+          # absent, or undeclared graph.
+          make parity-check
+          make negative-control-parity
