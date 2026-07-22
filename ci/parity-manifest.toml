@@ -1,0 +1,565 @@
+# Cross-surface dependency-graph parity manifest (SC-TASK-006 AC-4).
+#
+# Two declared policies over the crypto-roots closure of each build surface,
+# enforced by `scripts/parity-check.py` (see `make parity-check`):
+#   - [crypto_components]  — security-critical crypto; identity parity is the
+#                            EPR-0001 §4 SECURITY gate (divergence => exit 2).
+#   - [non_crypto_shared]  — shared utilities reachable from the crypto roots;
+#                            kept in lockstep by repo policy but reported SEPARATELY
+#                            (drift => exit 4), so a utility bump never reads as a
+#                            security alarm and EPR-0001 §4 "security-critical" stays
+#                            legible for adopters.
+# Nodes neither declared nor under a declared out-of-scope root REFUSE (exit 3).
+#
+# Reviewed like a lockfile (secrev owns the crypto/util boundary). Identity is the
+# full (name, version, source, checksum) tuple. Regenerate the generated tables
+# with `make parity-manifest-regen` after any dependency change and review the diff.
+
+anchor = "root"
+
+# Surfaces whose graph equals root by enforcement (AC-2 --locked release build),
+# so they carry no separate lock here. Declared so coverage is explicit.
+inherits_root = ["cli", "go-ffi"]
+
+[surfaces]
+root = "Cargo.lock"
+ts-native = "bindings/typescript/native/Cargo.lock"
+
+# Crypto roots -> surfaces expected to link them. The in-scope set is DERIVED as the
+# identity closure of these roots per surface. `ed25519-dalek` (signing) is root-only:
+# the TS napi addon links seclusor-crypto with default features (signing off). When
+# D11B enables TS signing and ed25519-dalek enters the ts-native graph, the per-root
+# surface-entry check REFUSES until this scope is updated + reviewed.
+[roots]
+age = ["root", "ts-native"]
+ed25519-dalek = ["root"]
+
+# Declared out-of-scope subtree roots (fail-closed exemptions), each rationaled.
+# Non-crypto; they legitimately resolve differently between the full workspace lock
+# and the single-addon lock. The crypto RNG path (rand_core -> getrandom 0.2.17)
+# stays in scope; only the util getrandom 0.4.3 (via tempfile) is exempted.
+[out_of_scope_roots]
+i18n-embed = "localization runtime (fluent/langid); no crypto property; differs full-workspace vs single-addon"
+i18n-embed-fl = "localization proc-macro (fluent-syntax/intl/unic-langid + proc-macro-error2 per SDR-0003); compile-time, no crypto property"
+rust-embed = "compile-time asset embedding; pulls walkdir/winapi-util/windows-sys platform shim; no crypto property"
+tempfile = "temp-file utility; its getrandom 0.4.3 is unrelated to the crypto RNG (rand_core -> getrandom 0.2.17)"
+
+# === GENERATED BELOW (make parity-manifest-regen) ===
+
+[[crypto_components]]
+name = "aead"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d122413f284cf2d62fb1b7db97e02edb8cda96d769b16e443a4f6195e35662b0"
+surfaces = ["root", "ts-native"]
+
+[[crypto_components]]
+name = "age"
+version = "0.11.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "047a482d1843edf1ce76ada63183698144030fe1191bd5ddba6e41e164e0bc43"
+surfaces = ["root", "ts-native"]
+
+[[crypto_components]]
+name = "age-core"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2bf6a89c984ca9d850913ece2da39e1d200563b0a94b002b253beee4c5acf99"
+surfaces = ["root", "ts-native"]
+
+[[crypto_components]]
+name = "base64"
+version = "0.21.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d297deb1925b89f2ccc13d7635fa0714f12c87adce1c75356b39ca9b7178567"
+surfaces = ["root", "ts-native"]
+
+[[crypto_components]]
+name = "bech32"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d86b93f97252c47b41663388e6d155714a9d0c398b99f1005cbc5f978b29f445"
+surfaces = ["root", "ts-native"]
+
+[[crypto_components]]
+name = "block-buffer"
+version = "0.10.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
+surfaces = ["root", "ts-native"]
+
+[[crypto_components]]
+name = "chacha20"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3613f74bd2eac03dad61bd53dbe620703d4371614fe0bc3b9f04dd36fe4e818"
+surfaces = ["root", "ts-native"]
+
+[[crypto_components]]
+name = "chacha20poly1305"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10cd79432192d1c0f4e1a0fef9527696cc039165d729fb41b3f4f4f354c2dc35"
+surfaces = ["root", "ts-native"]
+
+[[crypto_components]]
+name = "cipher"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
+surfaces = ["root", "ts-native"]
+
+[[crypto_components]]
+name = "cookie-factory"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9885fa71e26b8ab7855e2ec7cae6e9b380edff76cd052e07c683a0319d51b3a2"
+surfaces = ["root", "ts-native"]
+
+[[crypto_components]]
+name = "cpufeatures"
+version = "0.2.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "59ed5838eebb26a2bb2e58f6d5b5316989ae9d08bab10e0e6d103e656d1b0280"
+surfaces = ["root", "ts-native"]
+
+[[crypto_components]]
+name = "crypto-common"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
+surfaces = ["root", "ts-native"]
+
+[[crypto_components]]
+name = "curve25519-dalek"
+version = "4.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97fb8b7c4503de7d6ae7b42ab72a5a59857b4c937ec27a3d4539dba95b5ab2be"
+surfaces = ["root", "ts-native"]
+
+[[crypto_components]]
+name = "curve25519-dalek-derive"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f46882e17999c6cc590af592290432be3bce0428cb0d5f8b6715e4dc7b383eb3"
+surfaces = ["root", "ts-native"]
+
+[[crypto_components]]
+name = "digest"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
+surfaces = ["root", "ts-native"]
+
+[[crypto_components]]
+name = "ed25519"
+version = "2.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "115531babc129696a58c64a4fef0a8bf9e9698629fb97e9e40767d235cfbcd53"
+surfaces = ["root"]
+
+[[crypto_components]]
+name = "ed25519-dalek"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
+surfaces = ["root"]
+
+[[crypto_components]]
+name = "fiat-crypto"
+version = "0.2.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
+surfaces = ["root", "ts-native"]
+
+[[crypto_components]]
+name = "generic-array"
+version = "0.14.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a"
+surfaces = ["root", "ts-native"]
+
+[[crypto_components]]
+name = "getrandom"
+version = "0.2.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
+surfaces = ["root", "ts-native"]
+
+[[crypto_components]]
+name = "hkdf"
+version = "0.12.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b5f8eb2ad728638ea2c7d47a21db23b7b58a72ed6a38256b8a1849f15fbbdf7"
+surfaces = ["root", "ts-native"]
+
+[[crypto_components]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+surfaces = ["root", "ts-native"]
+
+[[crypto_components]]
+name = "inout"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
+surfaces = ["root", "ts-native"]
+
+[[crypto_components]]
+name = "opaque-debug"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
+surfaces = ["root", "ts-native"]
+
+[[crypto_components]]
+name = "pbkdf2"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
+surfaces = ["root", "ts-native"]
+
+[[crypto_components]]
+name = "poly1305"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8159bd90725d2df49889a078b54f4f79e87f1f8a8444194cdca81d38f5393abf"
+surfaces = ["root", "ts-native"]
+
+[[crypto_components]]
+name = "ppv-lite86"
+version = "0.2.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
+surfaces = ["root", "ts-native"]
+
+[[crypto_components]]
+name = "rand"
+version = "0.8.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22f6172bdec972074665ed81ed53b71da00bfc44b65a753cfde883ec4c702a1a"
+surfaces = ["root", "ts-native"]
+
+[[crypto_components]]
+name = "rand_chacha"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6c10a63a0fa32252be49d21e7709d4d4baf8d231c2dbce1eaa8141b9b127d88"
+surfaces = ["root", "ts-native"]
+
+[[crypto_components]]
+name = "rand_core"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
+surfaces = ["root", "ts-native"]
+
+[[crypto_components]]
+name = "salsa20"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97a22f5af31f73a954c10289c93e8a50cc23d971e80ee446f1f6f7137a088213"
+surfaces = ["root", "ts-native"]
+
+[[crypto_components]]
+name = "scrypt"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0516a385866c09368f0b5bcd1caff3366aace790fcd46e2bb032697bb172fd1f"
+surfaces = ["root", "ts-native"]
+
+[[crypto_components]]
+name = "secrecy"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e891af845473308773346dc847b2c23ee78fe442e0472ac50e22a18a93d3ae5a"
+surfaces = ["root", "ts-native"]
+
+[[crypto_components]]
+name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
+surfaces = ["root", "ts-native"]
+
+[[crypto_components]]
+name = "signature"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
+surfaces = ["root"]
+
+[[crypto_components]]
+name = "subtle"
+version = "2.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+surfaces = ["root", "ts-native"]
+
+[[crypto_components]]
+name = "typenum"
+version = "1.20.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
+surfaces = ["root", "ts-native"]
+
+[[crypto_components]]
+name = "universal-hash"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc1de2c688dc15305988b563c3854064043356019f97a4b46276fe734c4f07ea"
+surfaces = ["root", "ts-native"]
+
+[[crypto_components]]
+name = "x25519-dalek"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7e468321c81fb07fa7f4c636c3972b9100f0346e5b6a9f2bd0603a52f7ed277"
+surfaces = ["root", "ts-native"]
+
+[[crypto_components]]
+name = "zeroize"
+version = "1.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
+surfaces = ["root", "ts-native"]
+
+[[crypto_components]]
+name = "zeroize_derive"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c50655cbb0fe3fc43170059e702f1ce5e19b84cec58dc87b037a09935c2f328"
+surfaces = ["root", "ts-native"]
+
+[[non_crypto_shared]]
+name = "cfg-if"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
+surfaces = ["root", "ts-native"]
+
+[[non_crypto_shared]]
+name = "futures"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b147ee9d1f6d097cef9ce628cd2ee62288d963e16fb287bd9286455b241382d"
+surfaces = ["root", "ts-native"]
+
+[[non_crypto_shared]]
+name = "futures-channel"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07bbe89c50d7a535e539b8c17bc0b49bdb77747034daa8087407d655f3f7cc1d"
+surfaces = ["root", "ts-native"]
+
+[[non_crypto_shared]]
+name = "futures-core"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e3450815272ef58cec6d564423f6e755e25379b217b0bc688e295ba24df6b1d"
+surfaces = ["root", "ts-native"]
+
+[[non_crypto_shared]]
+name = "futures-executor"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "baf29c38818342a3b26b5b923639e7b1f4a61fc5e76102d4b1981c6dc7a7579d"
+surfaces = ["root", "ts-native"]
+
+[[non_crypto_shared]]
+name = "futures-io"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cecba35d7ad927e23624b22ad55235f2239cfa44fd10428eecbeba6d6a717718"
+surfaces = ["root", "ts-native"]
+
+[[non_crypto_shared]]
+name = "futures-macro"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e835b70203e41293343137df5c0664546da5745f82ec9b84d40be8336958447b"
+surfaces = ["root", "ts-native"]
+
+[[non_crypto_shared]]
+name = "futures-sink"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c39754e157331b013978ec91992bde1ac089843443c49cbc7f46150b0fad0893"
+surfaces = ["root", "ts-native"]
+
+[[non_crypto_shared]]
+name = "futures-task"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "037711b3d59c33004d3856fbdc83b99d4ff37a24768fa1be9ce3538a1cde4393"
+surfaces = ["root", "ts-native"]
+
+[[non_crypto_shared]]
+name = "futures-util"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "389ca41296e6190b48053de0321d02a77f32f8a5d2461dd38762c0593805c6d6"
+surfaces = ["root", "ts-native"]
+
+[[non_crypto_shared]]
+name = "io_tee"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b3f7cef34251886990511df1c61443aa928499d598a9473929ab5a90a527304"
+surfaces = ["root", "ts-native"]
+
+[[non_crypto_shared]]
+name = "lazy_static"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
+surfaces = ["root", "ts-native"]
+
+[[non_crypto_shared]]
+name = "libc"
+version = "0.2.186"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+surfaces = ["root", "ts-native"]
+
+[[non_crypto_shared]]
+name = "memchr"
+version = "2.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+surfaces = ["root", "ts-native"]
+
+[[non_crypto_shared]]
+name = "minimal-lexical"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
+surfaces = ["root", "ts-native"]
+
+[[non_crypto_shared]]
+name = "nom"
+version = "7.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d273983c5a657a70a3e8f2a01329822f3b8c8172b73826411a55751e404a0a4a"
+surfaces = ["root", "ts-native"]
+
+[[non_crypto_shared]]
+name = "pin-project"
+version = "1.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2466b2336ed02bcdca6b294417127b90ec92038d1d5c4fbeac971a922e0e0924"
+surfaces = ["root", "ts-native"]
+
+[[non_crypto_shared]]
+name = "pin-project-internal"
+version = "1.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c96395f0a926bc13b1c17622aaddda1ecb55d49c8f1bf9777e4d877800a43f8b"
+surfaces = ["root", "ts-native"]
+
+[[non_crypto_shared]]
+name = "pin-project-lite"
+version = "0.2.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
+surfaces = ["root", "ts-native"]
+
+[[non_crypto_shared]]
+name = "proc-macro2"
+version = "1.0.106"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
+surfaces = ["root", "ts-native"]
+
+[[non_crypto_shared]]
+name = "quote"
+version = "1.0.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dfbc457d0c7a0759a614551b11a6409e5951f6c7537be1f1b7682b9ae9230368"
+surfaces = ["root", "ts-native"]
+
+[[non_crypto_shared]]
+name = "rustc_version"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
+surfaces = ["root", "ts-native"]
+
+[[non_crypto_shared]]
+name = "semver"
+version = "1.0.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
+surfaces = ["root", "ts-native"]
+
+[[non_crypto_shared]]
+name = "serde"
+version = "1.0.228"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
+surfaces = ["root", "ts-native"]
+
+[[non_crypto_shared]]
+name = "serde_core"
+version = "1.0.228"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41d385c7d4ca58e59fc732af25c3983b67ac852c1a25000afe1175de458b67ad"
+surfaces = ["root", "ts-native"]
+
+[[non_crypto_shared]]
+name = "serde_derive"
+version = "1.0.228"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d540f220d3187173da220f885ab66608367b6574e925011a9353e4badda91d79"
+surfaces = ["root", "ts-native"]
+
+[[non_crypto_shared]]
+name = "slab"
+version = "0.4.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
+surfaces = ["root", "ts-native"]
+
+[[non_crypto_shared]]
+name = "syn"
+version = "2.0.119"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "872831b642d1a07999a962a351ed35b955ea2cfc8f3862091e2a240a84f17297"
+surfaces = ["root", "ts-native"]
+
+[[non_crypto_shared]]
+name = "unicode-ident"
+version = "1.0.24"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+surfaces = ["root", "ts-native"]
+
+[[non_crypto_shared]]
+name = "version_check"
+version = "0.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+surfaces = ["root", "ts-native"]
+
+[[non_crypto_shared]]
+name = "wasi"
+version = "0.11.1+wasi-snapshot-preview1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
+surfaces = ["root", "ts-native"]
+
+[[non_crypto_shared]]
+name = "zerocopy"
+version = "0.8.54"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7cbbc0a705a0fd05cc3676525980d2bf5a9bc4adac6d6475209a7887cf59d19"
+surfaces = ["root", "ts-native"]
+
+[[non_crypto_shared]]
+name = "zerocopy-derive"
+version = "0.8.54"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2e817b7b52d0c7358d3246da9d69935ebb18116b2b102b4230dac079b4862f5"
+surfaces = ["root", "ts-native"]

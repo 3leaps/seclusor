@@ -17,6 +17,7 @@ This directory holds ADRs/SDRs/DDRs for the Rust rewrite.
 
 - `SDR-0001-server-unseal-and-key-management.md` (server mode deferred)
 - `SDR-0002-secret-input-channels-and-cli-arg-policy.md`
+- `SDR-0003-rustsec-2026-0173-advisory-acceptance.md` (single accepted advisory; EPR-0001 §3 record of decision)
 
 ## Accepted DDRs
 

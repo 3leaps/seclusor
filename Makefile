@@ -10,7 +10,7 @@
 
 .PHONY: all help bootstrap bootstrap-prereqs bootstrap-release-tools bootstrap-format-tools bootstrap-rust-tools bootstrap-force tools check check-all test fmt fmt-check lint build build-release clean
 .PHONY: ffi-header build-ffi go-bindings-sync go-bindings-ci go-build go-test go-test-committed ts-build ts-test embed-verify
-.PHONY: precommit prepush pr-final repo-status deny deny-all audit ci-security miri msrv
+.PHONY: precommit prepush pr-final repo-status deny deny-all audit ci-security check-locked-builds negative-control-locks parity-check parity-manifest-regen negative-control-parity miri msrv
 .PHONY: check-windows check-windows-msvc check-windows-gnu
 .PHONY: install dogfood-cli
 .PHONY: version version-patch version-minor version-major version-set version-sync version-check
@@ -359,13 +359,16 @@ test: ## Run test suite
 	$(CARGO) test --workspace --all-features
 	@echo "[ok] Tests passed"
 
+# goneat owns the ancillary text formats (see .goneat/assess.yaml); Rust is cargo
+# fmt and Python is out of goneat's scope. `--types` keeps goneat off .py so it never
+# requires ruff (which the CI tools runner does not provide).
 fmt: ## Format code (cargo fmt + goneat format)
 	@echo "Formatting Rust..."
 	$(CARGO) fmt --all
 	@GONEAT_BIN="$(GONEAT)"; \
 	if [ -n "$$GONEAT_BIN" ]; then \
 		echo "Formatting markdown, YAML, JSON..."; \
-		PATH="$(TOOL_PATH)" "$$GONEAT_BIN" format --quiet --fallback-sequential; \
+		PATH="$(TOOL_PATH)" "$$GONEAT_BIN" format --types go,yaml,json,markdown --quiet --fallback-sequential; \
 	else \
 		echo "[!!] goneat not found — run 'make bootstrap'"; \
 		exit 1; \
@@ -378,7 +381,7 @@ fmt-check: ## Check formatting without modifying
 	@GONEAT_BIN="$(GONEAT)"; \
 	if [ -n "$$GONEAT_BIN" ]; then \
 		echo "Checking markdown, YAML, JSON formatting..."; \
-		PATH="$(TOOL_PATH)" "$$GONEAT_BIN" format --check --quiet --fallback-sequential; \
+		PATH="$(TOOL_PATH)" "$$GONEAT_BIN" format --check --types go,yaml,json,markdown --quiet --fallback-sequential; \
 	else \
 		echo "[!!] goneat not found — run 'make bootstrap'"; \
 		exit 1; \
@@ -464,20 +467,47 @@ audit: ## Run cargo-audit security scan
 	fi
 	@echo "[ok] cargo-audit passed"
 
-# Advisory backstop for the deny.toml RUSTSEC-2026-0173 exception. Deliberately
-# kept OUT of `make ci` (which stays offline-safe) because advisory checks fetch
-# the RustSec DB over the network. CI enforces this as a dedicated step so a new,
-# unacknowledged advisory cannot hide behind the single-ID deny.toml ignore.
-# cargo-audit does not read deny.toml, so the --ignore ID below MUST match the
-# single-ID ignore in deny.toml (SSOT); drop both together per that removal
-# condition (revisit by v0.2.1 or 2026-10-13).
+# Advisory backstop for the RUSTSEC-2026-0173 exception (accepted per SDR-0003 —
+# the decision of record). Deliberately kept OUT of `make ci` (which stays
+# offline-safe) because advisory checks fetch the RustSec DB over the network. CI
+# enforces this as a dedicated step so a new, unacknowledged advisory cannot hide
+# behind the single-ID ignore. cargo-audit does not read deny.toml, so the --ignore
+# ID below MUST match the single-ID ignore in deny.toml; drop both together per the
+# SDR-0003 removal condition (revisit by v0.2.1 or 2026-10-13). Both committed locks
+# are scanned so the accepted disposition cannot silently widen or drift.
 ci-security: ## Run advisory + audit gates (network required; enforced in CI)
 	@echo "Running advisory + audit gates..."
 	@command -v cargo-deny >/dev/null 2>&1 || { echo "[!!] cargo-deny not found (run 'make bootstrap')"; exit 1; }
 	@command -v cargo-audit >/dev/null 2>&1 || { echo "[!!] cargo-audit not found (run 'make bootstrap')"; exit 1; }
 	cargo-deny check advisories
 	cargo-audit audit --deny warnings --ignore RUSTSEC-2026-0173
+	# The TS-native addon has its own tracked lockfile (independent crypto graph);
+	# scan it too so a new advisory there cannot ship unremarked.
+	cargo-audit audit --file bindings/typescript/native/Cargo.lock --deny warnings --ignore RUSTSEC-2026-0173
 	@echo "[ok] advisory + audit gates passed"
+
+check-locked-builds: ## Static guard: every artifact-producing cargo/zigbuild invocation enforces --locked (covers the workflow paths)
+	@echo "Guarding artifact build paths for --locked..."
+	python3 scripts/check-locked-artifact-builds.py
+	@echo "Proving the guard rejects bypasses..."
+	./scripts/negative-control-locked-guard.sh
+
+negative-control-locks: ## Prove the real build entrypoints fail on a stale lock (EPR-0001 conformance; resolves the graph, needs the registry index)
+	@echo "Running lockfile-enforcement negative controls..."
+	./scripts/negative-control-locks.sh
+	@echo "[ok] every published-artifact entrypoint enforces its committed lock"
+
+parity-check: ## Assert crypto-graph parity across build surfaces (EPR-0001 §4; reads locks only, no build/network)
+	@echo "Checking cross-surface crypto-graph parity..."
+	python3 scripts/parity-check.py --manifest ci/parity-manifest.toml
+
+parity-manifest-regen: ## Regenerate the declared crypto component set in ci/parity-manifest.toml (review the diff)
+	@echo "Regenerating crypto component set from the derivation..."
+	python3 scripts/parity-check.py --manifest ci/parity-manifest.toml --regen
+
+negative-control-parity: ## Prove the parity check rejects divergent/absent/undeclared crypto graphs (EPR-0002 §3/§4)
+	@echo "Running crypto-graph parity negative controls..."
+	./scripts/negative-control-parity.sh
 
 # -----------------------------------------------------------------------------
 # Build
@@ -490,7 +520,11 @@ build: embed-verify ## Build all crates (debug)
 
 build-release: ## Build all crates (release)
 	@echo "Building (release)..."
-	$(CARGO) build --workspace --release
+	# Routed through the canonical artifact-build entrypoint so --locked is
+	# structurally guaranteed for every published build (CLI -> homebrew/scoop);
+	# the release build cannot silently regenerate a graph the audit gate never saw.
+	# artifact-callsite: make-build-release
+	./scripts/cargo-artifact-build.sh build --workspace
 	@echo "[ok] Release build complete"
 
 ffi-header: ## Generate C header from seclusor-ffi
@@ -505,7 +539,12 @@ ffi-header: ## Generate C header from seclusor-ffi
 
 build-ffi: ffi-header ## Build FFI library artifacts
 	@echo "Building seclusor-ffi..."
-	$(CARGO) build --release -p seclusor-ffi
+	# Routed through the canonical artifact-build entrypoint (--locked). The FFI
+	# static/shared libs feed the tracked Go prebuilts, so the Go surface's crypto
+	# graph equals root by enforcement (not assumption), making root the parity
+	# anchor for the CLI and Go surfaces.
+	# artifact-callsite: make-build-ffi
+	./scripts/cargo-artifact-build.sh build -p seclusor-ffi
 	@echo "[ok] Built target/release/libseclusor_ffi.a and shared library variants"
 
 go-bindings-sync: build-ffi ## Sync FFI header + static lib into Go bindings

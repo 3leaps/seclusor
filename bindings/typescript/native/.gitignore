@@ -1,4 +1,3 @@
 # Native build artifacts
 target/
 *.node
-Cargo.lock
