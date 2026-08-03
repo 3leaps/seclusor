@@ -21,7 +21,7 @@ jobs:
     name: Advisory + audit sweep (scheduled)
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/fulmenhq/goneat-tools-runner-glibc:v0.4.1
+      image: ghcr.io/fulmenhq/goneat-tools-runner-glibc:v0.5.1
       options: --user root
     steps:
       - name: Checkout
@@ -35,13 +35,16 @@ jobs:
           # Bump the image tag in this key whenever the runner image changes, so a
           # cargo-audit compiled against a different glibc is never restored.
           # Keep in lockstep with the same key in ci.yml.
-          key: cargo-audit-0.22.2-goneat-tools-runner-glibc-v0.4.1
+          key: cargo-audit-0.22.2-goneat-tools-runner-glibc-v0.5.1
       - name: Advisory + audit gates (root + TS-native locks)
         shell: bash
         run: |
           set -euo pipefail
-          # The pre-baked cargo-audit is linked against a newer glibc than the image
-          # provides and cannot load, so build a pinned copy from source (cached
-          # across runs). Mirrors ci.yml.
-          cargo-audit --version >/dev/null 2>&1 || cargo install cargo-audit --version 0.22.2 --locked --force
+          # The runner carries cargo-audit, but its version is independent of this
+          # repository's reviewed pin. Install the exact version on a cache miss or
+          # whenever the image-provided binary differs. Mirrors ci.yml.
+          if [ "$(cargo-audit --version 2>/dev/null || true)" != "cargo-audit 0.22.2" ]; then
+            cargo install cargo-audit --version 0.22.2 --locked --force
+          fi
+          cargo-audit --version
           make ci-security

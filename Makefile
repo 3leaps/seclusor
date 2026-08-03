@@ -29,8 +29,8 @@ VERSION := $(shell cargo metadata --format-version 1 --no-deps 2>/dev/null | \
 
 BIN_DIR := $(CURDIR)/bin
 
-SFETCH_VERSION ?= v0.4.7
-GONEAT_VERSION ?= v0.5.10
+SFETCH_VERSION ?= v0.4.11
+GONEAT_VERSION ?= v0.5.16
 PRETTIER_VERSION ?= 3.8.3
 BIOME_VERSION ?= 2.4.15
 YAMLFMT_VERSION ?= v0.21.0
@@ -359,16 +359,17 @@ test: ## Run test suite
 	$(CARGO) test --workspace --all-features
 	@echo "[ok] Tests passed"
 
-# goneat owns the ancillary text formats (see .goneat/assess.yaml); Rust is cargo
-# fmt and Python is out of goneat's scope. `--types` keeps goneat off .py so it never
-# requires ruff (which the CI tools runner does not provide).
+# goneat owns ancillary formats (see .goneat/assess.yaml); Rust stays cargo fmt.
+# Python (.py gate scripts) is included: fulmen-toolbox goneat-tools-runner
+# v0.5.0+ ships ruff, and goneat >= v0.5.15 fails closed if a needed formatter
+# is missing. Pair GONEAT_VERSION with the CI image tag below.
 fmt: ## Format code (cargo fmt + goneat format)
 	@echo "Formatting Rust..."
 	$(CARGO) fmt --all
 	@GONEAT_BIN="$(GONEAT)"; \
 	if [ -n "$$GONEAT_BIN" ]; then \
-		echo "Formatting markdown, YAML, JSON..."; \
-		PATH="$(TOOL_PATH)" "$$GONEAT_BIN" format --types go,yaml,json,markdown --quiet --fallback-sequential; \
+		echo "Formatting markdown, YAML, JSON, Python..."; \
+		PATH="$(TOOL_PATH)" "$$GONEAT_BIN" format --quiet --fallback-sequential; \
 	else \
 		echo "[!!] goneat not found — run 'make bootstrap'"; \
 		exit 1; \
@@ -380,8 +381,8 @@ fmt-check: ## Check formatting without modifying
 	$(CARGO) fmt --all -- --check
 	@GONEAT_BIN="$(GONEAT)"; \
 	if [ -n "$$GONEAT_BIN" ]; then \
-		echo "Checking markdown, YAML, JSON formatting..."; \
-		PATH="$(TOOL_PATH)" "$$GONEAT_BIN" format --check --types go,yaml,json,markdown --quiet --fallback-sequential; \
+		echo "Checking markdown, YAML, JSON, Python formatting..."; \
+		PATH="$(TOOL_PATH)" "$$GONEAT_BIN" format --check --quiet --fallback-sequential; \
 	else \
 		echo "[!!] goneat not found — run 'make bootstrap'"; \
 		exit 1; \

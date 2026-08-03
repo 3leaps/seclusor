@@ -7,7 +7,8 @@
 - Node.js 20+ (for TypeScript bindings)
 - `cargo-deny` (`cargo install cargo-deny`)
 - `cargo-audit` (`cargo install cargo-audit`)
-- `goneat` v0.5.8+ (for formatting and linting)
+- `goneat` v0.5.16+ (for formatting and linting; CI bootstraps this pin into
+  fulmen-toolbox `goneat-tools-runner-glibc:v0.5.1`, which supplies ruff)
 - `cbindgen` (for FFI header generation)
 
 ## Building
@@ -56,7 +57,7 @@ The CI workflow runs on every push to `main` and every PR:
 | Gate              | Command                                                 | What it checks                  |
 | ----------------- | ------------------------------------------------------- | ------------------------------- |
 | Format            | `cargo fmt --all -- --check`                            | Rust formatting                 |
-| Format (non-Rust) | `goneat fmt --check`                                    | Markdown, YAML, JSON            |
+| Format (non-Rust) | `goneat fmt --check`                                    | Markdown, YAML, JSON, Python    |
 | Lint              | `cargo clippy --workspace --all-targets --all-features` | Rust lints                      |
 | Lint (non-Rust)   | `goneat assess --categories lint`                       | YAML, shell, workflows          |
 | Test              | `cargo test --workspace --all-features`                 | All Rust tests                  |
