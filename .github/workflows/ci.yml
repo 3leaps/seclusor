@@ -13,7 +13,7 @@ jobs:
     name: Rust Quality (Linux)
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/fulmenhq/goneat-tools-runner-glibc:v0.4.1
+      image: ghcr.io/fulmenhq/goneat-tools-runner-glibc:v0.5.1
       options: --user root
     steps:
       - name: Checkout
@@ -40,6 +40,7 @@ jobs:
           bin/yamlfmt -version
           bin/node/bin/prettier --version
           bin/node/bin/biome --version
+          ruff --version
           cargo-deny --version
       - name: CI checks
         shell: bash
@@ -52,17 +53,18 @@ jobs:
           path: /opt/cargo/bin/cargo-audit
           # Bump the image tag in this key whenever the runner image changes, so a
           # cargo-audit compiled against a different glibc is never restored.
-          key: cargo-audit-0.22.2-goneat-tools-runner-glibc-v0.4.1
+          key: cargo-audit-0.22.2-goneat-tools-runner-glibc-v0.5.1
       - name: Security advisories (deny advisories + cargo-audit)
         shell: bash
         run: |
           set -euo pipefail
-          # cargo-deny is pre-baked and runnable in the runner image. The pre-baked
-          # cargo-audit is linked against a newer glibc than the image provides and
-          # cannot load, so build a pinned copy from source. The cache above keeps
-          # that build across runs, so we neither rely on the broken binary nor
-          # recompile every run (the compile only recurs on a cache miss).
-          cargo-audit --version >/dev/null 2>&1 || cargo install cargo-audit --version 0.22.2 --locked --force
+          # The runner carries cargo-audit, but its version is independent of this
+          # repository's reviewed pin. Install the exact version on a cache miss or
+          # whenever the image-provided binary differs.
+          if [ "$(cargo-audit --version 2>/dev/null || true)" != "cargo-audit 0.22.2" ]; then
+            cargo install cargo-audit --version 0.22.2 --locked --force
+          fi
+          cargo-audit --version
           make ci-security
       - name: Lockfile enforcement (static guard + negative controls)
         shell: bash
