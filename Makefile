@@ -718,6 +718,25 @@ version-sync: ## Sync VERSION file to Cargo.toml and package.json
 		echo "Manual update required: set version = \"$$ver\" in Cargo.toml"; \
 	fi
 	@ver=$$(cat $(VERSION_FILE)); \
+	ts_manifest="$(TS_BINDINGS_DIR)/native/Cargo.toml"; \
+	if [ -f "$$ts_manifest" ]; then \
+		cargo set-version --manifest-path "$$ts_manifest" "$$ver"; \
+		sed -i.bak \
+			-e 's#^\(seclusor-core = { path = "[^"]*", version = "\)[^"]*#\1'"$$ver"'#' \
+			-e 's#^\(seclusor-crypto = { path = "[^"]*", version = "\)[^"]*#\1'"$$ver"'#' \
+			-e 's#^\(seclusor-codec = { path = "[^"]*", version = "\)[^"]*#\1'"$$ver"'#' \
+			-e 's#^\(seclusor-keyring = { path = "[^"]*", version = "\)[^"]*#\1'"$$ver"'#' \
+			"$$ts_manifest"; \
+		rm -f "$$ts_manifest.bak"; \
+		cargo update --manifest-path "$$ts_manifest" --offline \
+			-p seclusor-ts-napi \
+			-p seclusor-core \
+			-p seclusor-crypto \
+			-p seclusor-codec \
+			-p seclusor-keyring; \
+		echo "[ok] Synced $$ts_manifest to $$ver"; \
+	fi
+	@ver=$$(cat $(VERSION_FILE)); \
 	ts_root="$(TS_BINDINGS_DIR)"; \
 	if [ -f "$$ts_root/package.json" ]; then \
 		sed -i.bak 's/"version": "[^"]*"/"version": "'"$$ver"'"/' "$$ts_root/package.json"; \
@@ -733,6 +752,29 @@ version-check: ## Validate version consistency across files
 	if [ "$$file_ver" != "$$cargo_ver" ]; then \
 		echo "[!!] VERSION file ($$file_ver) != Cargo.toml ($$cargo_ver)"; \
 		exit 1; \
+	fi
+	@file_ver=$$(cat $(VERSION_FILE) | tr -d '[:space:]'); \
+	ts_manifest="$(TS_BINDINGS_DIR)/native/Cargo.toml"; \
+	if [ -f "$$ts_manifest" ]; then \
+		native_ver=$$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$$ts_manifest" | head -1); \
+		if [ "$$file_ver" != "$$native_ver" ]; then \
+			echo "[!!] VERSION file ($$file_ver) != $$ts_manifest ($$native_ver)"; \
+			exit 1; \
+		fi; \
+		if grep -E '^seclusor-(core|crypto|codec|keyring) = .*version = "' "$$ts_manifest" | \
+			grep -Fv "version = \"$$file_ver\"" >/dev/null; then \
+			echo "[!!] $$ts_manifest contains stale seclusor dependency versions"; \
+			exit 1; \
+		fi; \
+	fi
+	@file_ver=$$(cat $(VERSION_FILE) | tr -d '[:space:]'); \
+	ts_package="$(TS_BINDINGS_DIR)/package.json"; \
+	if [ -f "$$ts_package" ]; then \
+		ts_ver=$$(sed -n 's/^[[:space:]]*"version": "\([^"]*\)".*/\1/p' "$$ts_package" | head -1); \
+		if [ "$$file_ver" != "$$ts_ver" ]; then \
+			echo "[!!] VERSION file ($$file_ver) != $$ts_package ($$ts_ver)"; \
+			exit 1; \
+		fi; \
 	fi
 	@echo "[ok] Version consistent: $(VERSION)"
 

@@ -984,7 +984,7 @@ dependencies = [
 
 [[package]]
 name = "seclusor-codec"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "seclusor-core",
  "seclusor-crypto",
@@ -995,7 +995,7 @@ dependencies = [
 
 [[package]]
 name = "seclusor-core"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1004,7 +1004,7 @@ dependencies = [
 
 [[package]]
 name = "seclusor-crypto"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "age",
  "base64 0.22.1",
@@ -1015,7 +1015,7 @@ dependencies = [
 
 [[package]]
 name = "seclusor-keyring"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "age",
  "seclusor-core",
@@ -1026,7 +1026,7 @@ dependencies = [
 
 [[package]]
 name = "seclusor-ts-napi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "napi",
  "napi-build",

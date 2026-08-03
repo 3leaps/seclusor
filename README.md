@@ -9,7 +9,7 @@ Seclusor is a library-first Rust project that lets developers, DevSecOps enginee
 
 **Important**: While armored secrets _can_ be stored in git, this is not always advisable. See [App Note 01: Git Storage of Armored Secrets](docs/appnotes/01-git-armored-storage.md) for the risk continuum and guidance by sensitivity level.
 
-**Lifecycle Phase**: `alpha` | Current version: **v0.1.6** (inline runtime fix, workflow scenarios guide) | See [VERSION](VERSION) and [CHANGELOG.md](CHANGELOG.md)
+**Lifecycle Phase**: `alpha` | Current version: **v0.2.0** (encrypted document operations and asset signing) | See [VERSION](VERSION) and [CHANGELOG.md](CHANGELOG.md)
 
 ## The Problem
 
@@ -28,6 +28,8 @@ Seclusor fills the gap for teams that want local-first, library-native, git-comp
 
 - **Modern age encryption**: X25519 for team sharing and scrypt for passphrases. Strong defaults with size limits.
 - **Two storage codecs**: Bundle (opaque, safest) and inline (`sec:age:v1:`) for when you need readable structure. Convert between them easily.
+- **Encrypted document operations**: Read, validate, mutate, and rekey bundle
+  and inline documents without a plaintext-on-disk editing step.
 - **Asset signing**: Generate age-protected Ed25519 signing keys, sign arbitrary files, and verify detached `seclusor.signature.v1` envelopes by expected public key or fingerprint.
 - **Ed25519 primitives** (`seclusor-crypto/signing` feature): Generate keypairs, sign messages, and verify signatures. Available in Rust (v0.1.1) and Go (v0.1.2). Secret keys are zeroized on drop.
 - **Library-first design**: Rust consumers can use `seclusor-crypto`, `seclusor-sign`, `seclusor-codec`, and `seclusor-keyring` directly. Go currently exposes the lower-level Ed25519 primitives; asset-signing envelope bindings are deferred to a later binding pass.
@@ -39,21 +41,39 @@ Seclusor fills the gap for teams that want local-first, library-native, git-comp
 
 For guidance on storing armored files in git, see [App Note 01](docs/appnotes/01-git-armored-storage.md). For runtime patterns see [App Note 02](docs/appnotes/02-runtime-deployment-patterns.md).
 
+## Install
+
+After each GitHub release is published, package-manager formulas are updated:
+
+```bash
+# Homebrew
+brew install 3leaps/tap/seclusor
+
+# Scoop
+scoop bucket add 3leaps https://github.com/3leaps/scoop-bucket
+scoop install seclusor
+```
+
+Platform binaries, checksums, and detached signatures are published on the
+[GitHub Releases](https://github.com/3leaps/seclusor/releases) page. Prefer
+verifying release assets with an expected public key or fingerprint
+(`seclusor assets verify`).
+
 ## Quick Start
 
 ### As a Rust Library
 
 ```toml
 [dependencies]
-seclusor-crypto = "0.1"   # encrypt/decrypt with age
-seclusor-keyring = "0.1"  # identity generation, recipient management
-seclusor-core = "0.1"     # domain types, validation
+seclusor-crypto = "0.2"   # encrypt/decrypt with age
+seclusor-keyring = "0.2"  # identity generation, recipient management
+seclusor-core = "0.2"     # domain types, validation
 
 # Optional: add Ed25519 primitive sign/verify
-seclusor-crypto = { version = "0.1", features = ["signing"] }
+seclusor-crypto = { version = "0.2", features = ["signing"] }
 
 # Optional: add asset signature envelope support
-seclusor-sign = "0.1"
+seclusor-sign = "0.2"
 ```
 
 ```rust
@@ -110,13 +130,12 @@ seclusor keys age identity generate --output ~/.config/seclusor/identity.txt
 
 # 2. Create and armor a simple secrets file
 seclusor secrets init --output secrets.json --project myapp
-# Add credentials with `secrets set`; the JSON shape is an object like:
-# {"DB_PASSWORD":{"type":"secret","value":"..."}}
-seclusor secrets set \
+# Prefer non-argv value channels so secrets stay out of shell history
+printf '%s' 'example-db-password-9xK7mP2qR8vT' | seclusor secrets set \
   --file secrets.json \
   --project myapp \
   --key DB_PASSWORD \
-  --value "example-db-password-9xK7mP2qR8vT" \
+  --value-stdin \
   --description "primary application database password"
 seclusor secrets bundle encrypt --file secrets.json --output secrets.age --recipient age1...yourrecipient...
 
@@ -160,7 +179,7 @@ seclusor/
 │   ├── go/seclusor/           # Go CGo wrapper
 │   └── typescript/            # TypeScript NAPI-RS addon
 ├── schemas/
-│   └── seclusor/v1.0.0/       # JSON Schema for secrets documents
+│   └── seclusor/               # Versioned JSON Schemas (v1.0.0 and v1.1.0)
 └── docs/
     └── decisions/             # ADRs, SDRs, DDRs
 ```
@@ -198,9 +217,14 @@ seclusor secrets convert --input secrets-inline.json --output secrets.age --from
 
 ### Go
 
-The Go bindings (`bindings/go/seclusor`) use CGo over the `seclusor-ffi` static library and provide full access to secret document management, encryption, and keyring operations. Prebuilt static libraries for all supported platforms are committed to the repo and resolved at build time.
+The Go bindings (`bindings/go/seclusor`) use CGo over the `seclusor-ffi` static
+library. Prebuilt static libraries for all supported platforms are committed to
+the repo and resolved at build time.
 
-**Current Go surface**: encryption, secret document operations (`List`, `Get`, `ExportEnv`), bundle encrypt/decrypt, keyring management, and Ed25519 signing in v0.1.2.
+**Current Go surface**: plaintext and encrypted document loading, read-side
+secret document operations (`List`, `Get`, `ExportEnv`), bundle
+encrypt/decrypt, keyring management, and Ed25519 primitives. Encrypted mutation
+and asset-signing envelopes remain Rust/CLI surfaces in v0.2.0.
 
 ```go
 import "github.com/3leaps/seclusor/bindings/go/seclusor"
@@ -262,14 +286,17 @@ See [ADR-0011](docs/decisions/ADR-0011-ed25519-signing-in-seclusor-crypto.md), [
 
 ### Safety Defaults
 
-- Secrets never appear in CLI arguments or shell history
+- Prefer `--value-stdin`, `--value-file`, or `--value-env` for secret input;
+  legacy `--value` warns because argv may appear in shell history or process
+  listings
 - `get` redacts by default; `--reveal` required to see values
 - `get --show-description` prints description metadata only
 - `list --verbose` prints `KEY<TAB>description` without exposing values
 - `list` never shows values
-- Identity files require `0600` permissions on Unix
+- Identity files require `0600` permissions and current-user ownership on Unix
 - Key material is never written to the repository root (pathguard)
 - Data output goes to stdout, diagnostics to stderr (stdout purity)
+- Asset verification requires an expected public key or fingerprint by default
 
 See [SDR-0002](docs/decisions/SDR-0002-secret-input-channels-and-cli-arg-policy.md) for the secret input channel policy.
 
@@ -282,7 +309,8 @@ See [SDR-0002](docs/decisions/SDR-0002-secret-input-channels-and-cli-arg-policy.
 | Linux x64 (musl)    | `x86_64-unknown-linux-musl`  | Supported |
 | Linux arm64 (musl)  | `aarch64-unknown-linux-musl` | Supported |
 | macOS arm64         | `aarch64-apple-darwin`       | Supported |
-| Windows x64         | `x86_64-pc-windows-msvc`     | Future    |
+| Windows x64         | `x86_64-pc-windows-msvc`     | Supported |
+| Windows arm64       | `aarch64-pc-windows-msvc`    | Supported |
 
 ## Development
 
