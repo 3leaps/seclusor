@@ -17,11 +17,20 @@ Seclusor is a security-sensitive library and tool for managing encrypted secrets
 
 ## Key Rotation and Rekeying
 
-Rekeying allows you to change the recipient set on existing armored files
-without decrypting the plaintext values. Rekeying functions are available
-as a library API (`seclusor-keyring`); a CLI subcommand is planned.
+Rekeying changes the recipient set on existing bundle or inline-encrypted
+documents without writing a plaintext working copy to disk. Use
+`seclusor secrets rekey` from the CLI, or the rekeying APIs in
+`seclusor-keyring`. Ordinary `secrets set` / `import-env` preserve an
+established recipient set and refuse ambiguous membership changes.
 
-See `docs/guides/key-management.md` for the full rekeying workflow.
+Documents that establish top-level `recipients` metadata use schema v1.1.0.
+Older strict readers fail closed on those documents; documents without
+`recipients` remain compatible with older binaries.
+
+See `docs/guides/key-management.md` for the full rekeying workflow and
+[App Note 04](../appnotes/04-encrypted-write-operations.md) for write-path
+residuals (including inline metadata integrity and same-count membership
+limits).
 
 ## Identity Protection
 

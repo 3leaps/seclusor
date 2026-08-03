@@ -2,6 +2,35 @@
 
 **Content policy**: This file contains the most recent 3 releases (reverse chronological). Older releases are archived in `docs/releases/vX.Y.Z.md`.
 
+## v0.2.0 (August 2026)
+
+**Encrypted documents you can live in** — Inspect, mutate, and rekey bundle and
+inline secrets without a plaintext-on-disk edit cycle; sign release assets with
+fail-closed verification; publish from locked, audited dependency graphs.
+
+- Read and validate plaintext, inline-encrypted, and bundle documents through a
+  common auto-detected command path
+- Mutate encrypted documents with `set`, `unset`, and `import-env`; use `rekey`
+  as the explicit recipient-membership operation
+- Prefer `--value-stdin` / `--value-file` / `--value-env` for secret input
+  (legacy `--value` still works, with a warning)
+- Create detached `seclusor.signature.v1` asset signatures with age-protected
+  Ed25519 signing keys and expected-key verification by default
+- Optional schema v1.1.0 recipient metadata with fail-closed handling of
+  plaintext credential values—and fail-closed older strict readers
+- Locked dependency graphs for published CLI and Go artifacts, with scheduled
+  audits, parity checks, and negative controls
+
+**Upgrade cue**: if documents will carry `recipients` metadata, upgrade writers
+and readers together. Documents without `recipients` stay readable on older
+binaries.
+
+**Install** (after the GitHub release is published):
+`brew install 3leaps/tap/seclusor` ·
+`scoop bucket add 3leaps https://github.com/3leaps/scoop-bucket && scoop install seclusor`
+
+See `docs/releases/v0.2.0.md` for full notes and upgrade guidance.
+
 ## v0.1.6 (April 2026)
 
 **Inline runtime decryption fix and workflow scenarios guide** — Fixes a bug where inline-encrypted values were not decrypted at runtime, and adds comprehensive end-to-end workflow documentation.
@@ -21,16 +50,5 @@ See `docs/releases/v0.1.6.md` for full notes.
 - Atomic writes on blob decrypt; output created with 0600 permissions on Unix
 
 See `docs/releases/v0.1.5.md` for full notes.
-
-## v0.1.4 (April 2026)
-
-**Passphrase-protected identities, CLI documentation, and release infrastructure** — Adds SSH-key-style passphrase protection for age identities, completes CLI help text, and aligns release packaging with org conventions.
-
-- Passphrase-protected identity files with four input channels (SC-008)
-- Help text on all CLI arguments (SC-007 Part A)
-- Identity and recipients documentation guide (SC-007 Part B)
-- Homebrew and Scoop distribution; org-standard asset naming (DDR-0003)
-
-See `docs/releases/v0.1.4.md` for full notes.
 
 _(Older releases archived in `docs/releases/`. This file is kept short per project convention.)_
