@@ -88,7 +88,12 @@ git pull origin main
     - `seclusor-windows-amd64.exe`
     - `seclusor-windows-arm64.exe`
 24. Draft release contains `SHA256SUMS` and `SHA512SUMS`.
-25. SBOM artifact exists from CI (`bom.json` via CycloneDX).
+25. SBOM artifact exists from CI (`*.cdx.json` via CycloneDX).
+    To regenerate the artifact from an exact release tag, dispatch the SBOM-only
+    CI lane from the default branch:
+    ```bash
+    gh workflow run ci.yml --ref main -f source_ref=vX.Y.Z
+    ```
 
 ## Security and Integrity
 

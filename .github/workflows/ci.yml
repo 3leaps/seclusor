@@ -3,6 +3,12 @@ on:
   push:
     branches: ["main"]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Git ref to generate the SBOM from
+        required: true
+        type: string
 permissions:
   contents: read
 env:
@@ -10,6 +16,7 @@ env:
   RUSTFLAGS: "-Dwarnings"
 jobs:
   rust-quality:
+    if: github.event_name != 'workflow_dispatch'
     name: Rust Quality (Linux)
     runs-on: ubuntu-latest
     container:
@@ -94,6 +101,7 @@ jobs:
   # Platform matrix (5):
   #   Linux x64 / arm64, macOS arm64, Windows x64 / arm64
   native-test:
+    if: github.event_name != 'workflow_dispatch'
     name: Test (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -132,6 +140,7 @@ jobs:
           cargo clippy --workspace --all-targets --all-features --exclude seclusor-ffi -- -D warnings
           cargo test --workspace --all-features --exclude seclusor-ffi
   windows-cross-check:
+    if: github.event_name != 'workflow_dispatch'
     name: Cross-check (Windows)
     runs-on: ubuntu-latest
     strategy:
@@ -161,24 +170,30 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@1.94.0
       - name: Install cargo-cyclonedx
         shell: bash
         run: |
           set -euo pipefail
-          cargo install cargo-cyclonedx --locked
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
+          cargo cyclonedx --version
       - name: Generate SBOM
         shell: bash
         run: |
           set -euo pipefail
+          git rev-parse HEAD
           cargo cyclonedx --all --format json
       - name: Upload SBOM
         uses: actions/upload-artifact@v4.6.2
         with:
           name: sbom-cyclonedx
-          path: "**/bom.json"
+          path: "**/*.cdx.json"
+          if-no-files-found: error
   dependency-parity:
+    if: github.event_name != 'workflow_dispatch'
     name: Crypto-graph parity
     runs-on: ubuntu-latest
     steps:
