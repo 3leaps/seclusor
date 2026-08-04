@@ -30,7 +30,7 @@ if [ "$upload_all" = "--all" ]; then
             -o -name 'SHA256SUMS' -o -name 'SHA512SUMS' \
             -o -name 'SHA256SUMS.minisig' -o -name 'SHA512SUMS.minisig' \
             -o -name 'SHA256SUMS.asc' -o -name 'SHA512SUMS.asc' \
-            -o -name '*.pub' \
+            -o -name '*.pub' -o -name 'release-key.asc' \
             -o -name 'release-notes-*.md' \) |
             sort
     )
@@ -43,7 +43,7 @@ else
             \( -name 'SHA256SUMS' -o -name 'SHA512SUMS' \
             -o -name 'SHA256SUMS.minisig' -o -name 'SHA512SUMS.minisig' \
             -o -name 'SHA256SUMS.asc' -o -name 'SHA512SUMS.asc' \
-            -o -name '*.pub' \
+            -o -name '*.pub' -o -name 'release-key.asc' \
             -o -name 'release-notes-*.md' \) |
             sort
     )
