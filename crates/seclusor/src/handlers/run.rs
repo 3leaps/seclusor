@@ -5,12 +5,20 @@ use crate::cli::RunArgs;
 use crate::env_support::resolve_export_env_vars;
 use crate::error::{CliError, CliResult};
 use crate::io::read_runtime_secrets_file;
-use crate::resolve::resolve_identities_with_passphrase;
+use crate::resolve::{resolve_identities_with_passphrase, resolve_passphrase_for_guard};
 
 pub(crate) fn handle_run(args: RunArgs) -> CliResult<()> {
-    // Resolve once; retain passphrase only until the child env is verified.
-    let (identities, passphrase) =
+    // Resolve identities once. Unlock passphrase is retained when identities
+    // were protected; otherwise try guard-only resolve for `--passphrase-env`.
+    let (identities, unlock_passphrase) =
         resolve_identities_with_passphrase(&args.identities, &args.passphrase, false)?;
+    // Guard value-equality needs the passphrase whenever `--passphrase-env` is
+    // set — even if no identity was passphrase-protected. Unset env ⇒ None (no-op).
+    // Does not read stdin/file or prompt (see resolve_passphrase_for_guard).
+    let passphrase = match unlock_passphrase {
+        Some(pp) => Some(pp),
+        None => resolve_passphrase_for_guard(&args.passphrase),
+    };
     let secrets = read_runtime_secrets_file(&args.file, &identities)?;
     let env_vars = resolve_export_env_vars(
         &secrets,

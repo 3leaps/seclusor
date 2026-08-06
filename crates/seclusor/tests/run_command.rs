@@ -1130,3 +1130,137 @@ fn run_passphrase_exclusion_is_transitive_to_grandchild() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+// ---------------------------------------------------------------------------
+// Guard-only resolve regressions (unprotected estates + channel asymmetry)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn run_unprotected_passphrase_env_unset_is_noop() {
+    let _guard = PP_ENV_LOCK.lock().expect("pp env lock");
+    let (_dir, secrets) = temp_secrets_file();
+    let fixture_dir = tempfile::tempdir().expect("tempdir");
+    let fixture = compile_fixture(fixture_dir.path(), "run-unprot-unset");
+    let unset_var = format!("SECLUSOR_TEST_PP_UNSET_{}", std::process::id());
+    std::env::remove_var(&unset_var);
+    let output = Command::new(seclusor_bin())
+        .env("SECLUSOR_TEST_CAPTURE_KEYS", "APP_SIMPLE")
+        .args([
+            "secrets",
+            "run",
+            "--file",
+            secrets.to_str().unwrap(),
+            "--project",
+            "demo",
+            "--passphrase-env",
+            &unset_var,
+            "--allow",
+            "APP_SIMPLE",
+            fixture.to_str().unwrap(),
+            "dump",
+        ])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "unset passphrase-env on unprotected estate must be no-op: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload = parsed_stdout(&output);
+    assert_eq!(payload["env"]["APP_SIMPLE"], "sk-123abc");
+}
+
+#[test]
+fn run_unprotected_passphrase_env_still_value_checks_ambient_alias() {
+    let _guard = PP_ENV_LOCK.lock().expect("pp env lock");
+    let (_dir, secrets) = temp_secrets_file();
+    let fixture_dir = tempfile::tempdir().expect("tempdir");
+    let fixture = compile_fixture(fixture_dir.path(), "run-unprot-alias");
+    let pp_var = format!("SECLUSOR_TEST_PP_UNPROT_{}", std::process::id());
+    let alias = format!("SECLUSOR_TEST_PP_UNPROT_ALIAS_{}", std::process::id());
+    let secret = "unprot-guard-only-pp-not-real";
+    let prev_pp = std::env::var_os(&pp_var);
+    let prev_alias = std::env::var_os(&alias);
+    std::env::set_var(&pp_var, secret);
+    std::env::set_var(&alias, secret);
+    let output = Command::new(seclusor_bin())
+        .args([
+            "secrets",
+            "run",
+            "--file",
+            secrets.to_str().unwrap(),
+            "--project",
+            "demo",
+            "--passphrase-env",
+            &pp_var,
+            "--allow",
+            "APP_SIMPLE",
+            fixture.to_str().unwrap(),
+            "dump",
+        ])
+        .output()
+        .expect("run");
+    match prev_pp {
+        Some(v) => std::env::set_var(&pp_var, v),
+        None => std::env::remove_var(&pp_var),
+    }
+    match prev_alias {
+        Some(v) => std::env::set_var(&alias, v),
+        None => std::env::remove_var(&alias),
+    }
+    assert!(
+        !output.status.success(),
+        "guard-only resolve must value-check ambient: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&alias) || stderr.contains(&pp_var),
+        "must name a var: {stderr}"
+    );
+    assert!(!stderr.contains(secret));
+}
+
+#[cfg(unix)]
+#[test]
+fn run_unprotected_passphrase_stdin_does_not_consume_child_stdin() {
+    // All-unprotected estate: --passphrase-stdin must not read stdin so the
+    // child still receives it (secrev regression pin).
+    let _guard = PP_ENV_LOCK.lock().expect("pp env lock");
+    let (_dir, secrets) = temp_secrets_file();
+    let marker = "child-stdin-must-survive-unprotected-run";
+    let mut child = Command::new(seclusor_bin());
+    child
+        .args([
+            "secrets",
+            "run",
+            "--file",
+            secrets.to_str().unwrap(),
+            "--project",
+            "demo",
+            "--passphrase-stdin",
+            "--allow",
+            "APP_SIMPLE",
+            "cat",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut proc = child.spawn().expect("spawn");
+    use std::io::Write;
+    {
+        let mut stdin = proc.stdin.take().expect("stdin");
+        write!(stdin, "{marker}").expect("write child stdin");
+    }
+    let output = proc.wait_with_output().expect("wait");
+    assert!(
+        output.status.success(),
+        "unprotected + passphrase-stdin must not fail: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(marker),
+        "child must receive stdin intact; got {stdout:?}"
+    );
+}

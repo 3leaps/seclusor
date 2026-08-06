@@ -151,6 +151,13 @@ impl ChildEnv {
             }
         }
 
+        // Value-equality runs only when we have resolved passphrase material.
+        // When `passphrase` is `None` (no unlock + no guard-only `--passphrase-env`
+        // value): name exclusion is still unconditional and is the sole control —
+        // it removes excluded names from the snapshot. Aliasing under a different
+        // ambient name is an explicit residual of that path (008 non-goal to
+        // guess-scrub unrelated vars). Guard-only resolve is scoped to
+        // `--passphrase-env` only so stdin/file/interactive never run here.
         if let Some(pp) = passphrase {
             // Release-path hard check: empty rejection is load-bearing for value equality.
             if pp.expose_secret().is_empty() {
@@ -194,9 +201,12 @@ impl ChildEnv {
 pub(crate) fn env_names_equal(a: &str, b: &str) -> bool {
     #[cfg(windows)]
     {
-        // Windows environment variable names are case-insensitive. Use full
-        // Unicode case conversion so non-ASCII case pairs (e.g. É/é) match the
-        // platform model rather than ASCII-only folding.
+        // Deliberate fail-safe asymmetry (secrev + entarch, SC-TASK-008 item 4):
+        // `to_uppercase()` is full Unicode mapping and can **over**-match relative
+        // to Windows' 1:1 upcase table (e.g. ß/SS). Over-matching fails closed
+        // (spurious exclusion/refusal naming a variable) and never under-matches
+        // into a leak. Do **not** "correct" this toward platform-fidelity
+        // ASCII-only folding — that was the class that reopened the leak.
         a.to_uppercase() == b.to_uppercase()
     }
     #[cfg(not(windows))]
@@ -613,6 +623,46 @@ mod tests {
         let status = command.status().expect("spawn");
         std::env::remove_var(ambient);
         assert!(status.success(), "status={status}");
+    }
+
+    /// Name exclusion must hold **without** value-equality (passphrase: None).
+    /// Pins the fold independently of the value guard (entarch H1).
+    #[cfg(windows)]
+    #[test]
+    fn windows_non_ascii_name_exclusion_without_value_equality() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        // Ambient uses non-ASCII upper form; exclude lower form. Value is NOT
+        // the passphrase material (and passphrase is None) so only name fold
+        // can remove it — value-equality cannot false-green this cell.
+        let ambient = "MY_PP_É";
+        let exclude = "my_pp_é";
+        let ambient_value = "not-a-passphrase-just-a-marker";
+        std::env::set_var(ambient, ambient_value);
+        let excluded = ExcludedNames::from_names([exclude]);
+        let child = ChildEnv::build(
+            BasePolicy::InheritAmbient,
+            &[inj("SECLUSOR_TEST_CHILD_ENV_INJECT", "sentinel-present")],
+            &excluded,
+            None, // no value-equality path
+        )
+        .expect("build with passphrase None");
+        // Inspect frozen entries: excluded ambient name must be absent.
+        let keys: Vec<String> = child
+            .entries
+            .iter()
+            .filter_map(|(k, _)| k.to_str().map(str::to_owned))
+            .collect();
+        assert!(
+            !keys
+                .iter()
+                .any(|k| env_names_equal(k, ambient) || env_names_equal(k, exclude)),
+            "non-ASCII ambient must be name-excluded without value-eq; keys={keys:?}"
+        );
+        assert!(
+            keys.iter().any(|k| k == "SECLUSOR_TEST_CHILD_ENV_INJECT"),
+            "injected sentinel must remain"
+        );
+        std::env::remove_var(ambient);
     }
 
     #[cfg(not(windows))]

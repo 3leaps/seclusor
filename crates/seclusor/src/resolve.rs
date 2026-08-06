@@ -290,6 +290,30 @@ pub(crate) fn resolve_identities_with_passphrase(
     Ok((identities, passphrase))
 }
 
+/// Guard-only passphrase material for the child-env value-equality assertion.
+///
+/// **Scoped to `--passphrase-env` only.** Other channels are deliberately not
+/// resolved here:
+/// - `--passphrase-stdin` would consume the child's stdin on an all-unprotected estate
+/// - interactive would prompt when no unlock is needed
+/// - `--passphrase-file` is not required for the named-env exclusion contract
+///
+/// Failure semantics are **structural**: this function returns `Option`, not
+/// `Result`. An unset or empty environment variable yields `None` (no-op), never
+/// an error — distinct from [`resolve_passphrase`] / unlock paths, which hard-error
+/// when `--passphrase-env` is named but missing.
+///
+/// Callers that already unlocked a protected identity should prefer that
+/// `SecretString` and only fall back here when unlock produced `None`.
+pub(crate) fn resolve_passphrase_for_guard(args: &PassphraseArgs) -> Option<SecretString> {
+    let var_name = args.passphrase_env.as_ref()?;
+    match std::env::var(var_name) {
+        Ok(value) if !value.is_empty() => Some(SecretString::from(value)),
+        // Unset, empty, or non-Unicode: no guard material (not an error).
+        _ => None,
+    }
+}
+
 /// Resolve passphrase for a protected identity, with controlling-console auto-prompt.
 fn resolve_passphrase_for_protected(
     passphrase_args: &PassphraseArgs,
