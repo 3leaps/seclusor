@@ -218,6 +218,21 @@ pub(crate) fn resolve_identities(
     passphrase_args: &PassphraseArgs,
     required: bool,
 ) -> CliResult<Vec<Identity>> {
+    Ok(resolve_identities_with_passphrase(args, passphrase_args, required)?.0)
+}
+
+/// Resolve identities and retain the passphrase used to unlock them (if any).
+///
+/// Callers that spawn a credential-consuming child (currently `secrets run`)
+/// need the exact resolved passphrase for the child-env value-equality guard.
+/// Other handlers should use [`resolve_identities`], which drops it.
+///
+/// The passphrase is resolved at most once; do not re-read env/file/stdin.
+pub(crate) fn resolve_identities_with_passphrase(
+    args: &IdentityArgs,
+    passphrase_args: &PassphraseArgs,
+    required: bool,
+) -> CliResult<(Vec<Identity>, Option<SecretString>)> {
     // --identity-public-key and --identity-file conflict at clap parse time.
     if let Some(public_key) = &args.identity_public_key {
         let path = find_identity_path_by_public_key(public_key)?;
@@ -237,7 +252,7 @@ pub(crate) fn resolve_identities(
                     .to_string(),
             ));
         }
-        return Ok(identities);
+        return Ok((identities, passphrase));
     }
 
     // Per SC-008 settled decision 1: scan all identity files first,
@@ -272,7 +287,7 @@ pub(crate) fn resolve_identities(
         ));
     }
 
-    Ok(identities)
+    Ok((identities, passphrase))
 }
 
 /// Resolve passphrase for a protected identity, with controlling-console auto-prompt.

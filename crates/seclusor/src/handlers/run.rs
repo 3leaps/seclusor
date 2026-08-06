@@ -1,13 +1,16 @@
 use std::process::Command;
 
+use crate::child_env::{BasePolicy, ChildEnv, ExcludedNames};
 use crate::cli::RunArgs;
 use crate::env_support::resolve_export_env_vars;
 use crate::error::{CliError, CliResult};
 use crate::io::read_runtime_secrets_file;
-use crate::resolve::resolve_identities;
+use crate::resolve::resolve_identities_with_passphrase;
 
 pub(crate) fn handle_run(args: RunArgs) -> CliResult<()> {
-    let identities = resolve_identities(&args.identities, &args.passphrase, false)?;
+    // Resolve once; retain passphrase only until the child env is verified.
+    let (identities, passphrase) =
+        resolve_identities_with_passphrase(&args.identities, &args.passphrase, false)?;
     let secrets = read_runtime_secrets_file(&args.file, &identities)?;
     let env_vars = resolve_export_env_vars(
         &secrets,
@@ -18,12 +21,28 @@ pub(crate) fn handle_run(args: RunArgs) -> CliResult<()> {
         &args.deny,
     )?;
 
+    // Exclusion names come only from the explicit `--passphrase-env` channel.
+    let excluded = match &args.passphrase.passphrase_env {
+        Some(name) => ExcludedNames::from_names([name.clone()]),
+        None => ExcludedNames::none(),
+    };
+    let child_env = ChildEnv::build(
+        BasePolicy::InheritAmbient,
+        &env_vars,
+        &excluded,
+        passphrase.as_ref(),
+    )
+    .map_err(|e| CliError::Message(e.to_string()))?;
+    // Drop the resolved passphrase after env verification. Identities and
+    // injected credential values necessarily remain until spawn.
+    drop(passphrase);
+
+    // child-env-callsite: run-spawn
     let mut command = Command::new(&args.command[0]);
     command.args(&args.command[1..]);
-
-    for env in &env_vars {
-        command.env(&env.key, &env.value);
-    }
+    // Apply freezes the verified snapshot (env_clear + explicit sets); does not
+    // re-inherit a live ambient that could change after build.
+    child_env.apply(&mut command);
 
     let status = command.status()?;
     if !status.success() {

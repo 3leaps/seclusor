@@ -1,6 +1,7 @@
 use clap::Parser;
 
 mod atomic_write;
+mod child_env;
 mod cli;
 mod env_support;
 mod error;

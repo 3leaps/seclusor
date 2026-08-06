@@ -10,7 +10,7 @@
 
 .PHONY: all help bootstrap bootstrap-prereqs bootstrap-release-tools bootstrap-format-tools bootstrap-rust-tools bootstrap-force tools check check-all test fmt fmt-check lint build build-release clean
 .PHONY: ffi-header build-ffi go-bindings-sync go-bindings-ci go-build go-test go-test-committed ts-build ts-test embed-verify
-.PHONY: precommit prepush pr-final repo-status deny deny-all audit ci-security check-locked-builds negative-control-locks parity-check parity-manifest-regen negative-control-parity miri msrv
+.PHONY: precommit prepush pr-final repo-status deny deny-all audit ci-security check-locked-builds check-child-env negative-control-locks parity-check parity-manifest-regen negative-control-parity miri msrv
 .PHONY: check-windows check-windows-msvc check-windows-gnu
 .PHONY: install dogfood-cli
 .PHONY: version version-patch version-minor version-major version-set version-sync version-check
@@ -349,7 +349,7 @@ tools: ## Verify external tools are available
 # Quality Gates
 # -----------------------------------------------------------------------------
 
-check: fmt-check lint test deny ## Run all quality checks
+check: fmt-check lint test deny check-child-env ## Run all quality checks
 	@echo "[ok] All quality checks passed"
 
 check-all: check ## Back-compat alias for older docs/tools
@@ -492,6 +492,12 @@ check-locked-builds: ## Static guard: every artifact-producing cargo/zigbuild in
 	python3 scripts/check-locked-artifact-builds.py
 	@echo "Proving the guard rejects bypasses..."
 	./scripts/negative-control-locked-guard.sh
+
+check-child-env: ## Static guard: child env mutations only at ChildEnv chokepoint (008-A)
+	@echo "Guarding child-env chokepoint inventory..."
+	python3 scripts/check-child-env-chokepoint.py
+	@echo "Proving the child-env guard rejects bypasses..."
+	./scripts/negative-control-child-env-guard.sh
 
 negative-control-locks: ## Prove the real build entrypoints fail on a stale lock (EPR-0001 conformance; resolves the graph, needs the registry index)
 	@echo "Running lockfile-enforcement negative controls..."
@@ -782,7 +788,7 @@ version-check: ## Validate version consistency across files
 # CI/CD
 # -----------------------------------------------------------------------------
 
-ci: fmt-check lint test deny version-check ## Run exactly what CI runs
+ci: fmt-check lint test deny version-check check-child-env ## Run exactly what CI runs
 	@echo "[ok] CI checks passed"
 
 release-check: version-check ## Version consistency + package check

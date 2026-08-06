@@ -21,6 +21,7 @@ rpassword = "7"
 tempfile = "3"
 secrecy = "0.10"
 serde_json = { workspace = true }
+subtle = { workspace = true }
 thiserror = { workspace = true }
 zeroize = { workspace = true }
 
