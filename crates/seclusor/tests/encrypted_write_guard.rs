@@ -453,6 +453,218 @@ fn process_import_env_inline_encrypted_happy_and_mismatch() {
     assert!(!bad.status.success());
     assert_eq!(fs::read(&inline).expect("after"), before);
     assert!(String::from_utf8_lossy(&bad.stdout).is_empty());
+
+    let allowed = run_seclusor(&[
+        "secrets",
+        "import-env",
+        "--file",
+        inline.to_str().unwrap(),
+        "--project",
+        "demo",
+        "--prefix",
+        "APP_",
+        "--dotenv-file",
+        dotenv.to_str().unwrap(),
+        "--recipient",
+        other_r,
+        "--identity-file",
+        identity.to_str().unwrap(),
+        "--allow-recipient-mismatch",
+    ]);
+    assert!(
+        allowed.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&allowed.stdout), "1\n");
+    let allowed_stderr = String::from_utf8_lossy(&allowed.stderr);
+    assert!(allowed_stderr.contains("recipient set change accepted"));
+    assert!(allowed_stderr.contains(&format!("  +{other_r}")));
+    assert!(allowed_stderr.contains(&format!("  -{recipient}")));
+    assert!(!allowed_stderr.contains("AGE-SECRET"));
+    let rotated: seclusor_core::SecretsFile =
+        serde_json::from_slice(&fs::read(&inline).expect("read rotated inline"))
+            .expect("parse rotated inline");
+    assert_eq!(
+        rotated.recipients.as_deref(),
+        Some(std::slice::from_ref(&other_r.to_string()))
+    );
+
+    let bundle = dir.path().join("bundle.age");
+    let bundle_encrypt = run_seclusor(&[
+        "secrets",
+        "bundle",
+        "encrypt",
+        "--input",
+        input.to_str().unwrap(),
+        "--output",
+        bundle.to_str().unwrap(),
+        "--recipient",
+        recipient,
+    ]);
+    assert!(bundle_encrypt.status.success());
+    let bundle_before = fs::read(&bundle).expect("bundle before");
+    let bundle_names_before = list_dir_names(dir.path());
+    let bundle_refused = run_seclusor(&[
+        "secrets",
+        "import-env",
+        "--file",
+        bundle.to_str().unwrap(),
+        "--project",
+        "demo",
+        "--prefix",
+        "APP_",
+        "--dotenv-file",
+        dotenv.to_str().unwrap(),
+        "--recipient",
+        other_r,
+        "--identity-file",
+        identity.to_str().unwrap(),
+    ]);
+    assert_policy_refusal(
+        &bundle_refused,
+        &bundle,
+        &bundle_before,
+        dir.path(),
+        &bundle_names_before,
+    );
+
+    let bundle_allowed = run_seclusor(&[
+        "secrets",
+        "import-env",
+        "--file",
+        bundle.to_str().unwrap(),
+        "--project",
+        "demo",
+        "--prefix",
+        "APP_",
+        "--dotenv-file",
+        dotenv.to_str().unwrap(),
+        "--recipient",
+        other_r,
+        "--identity-file",
+        identity.to_str().unwrap(),
+        "--allow-recipient-mismatch",
+    ]);
+    assert!(
+        bundle_allowed.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&bundle_allowed.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&bundle_allowed.stdout), "1\n");
+    let bundle_stderr = String::from_utf8_lossy(&bundle_allowed.stderr);
+    assert!(bundle_stderr.contains("recipient set change accepted"));
+    assert!(bundle_stderr.contains(&format!("  +{other_r}")));
+    assert!(bundle_stderr.contains(&format!("  -{recipient}")));
+    assert!(!bundle_stderr.contains("AGE-SECRET"));
+
+    let decrypted = dir.path().join("bundle-decrypted.json");
+    let bundle_decrypt = run_seclusor(&[
+        "secrets",
+        "bundle",
+        "decrypt",
+        "--input",
+        bundle.to_str().unwrap(),
+        "--output",
+        decrypted.to_str().unwrap(),
+        "--identity-file",
+        other_id.to_str().unwrap(),
+    ]);
+    assert!(
+        bundle_decrypt.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&bundle_decrypt.stderr)
+    );
+}
+
+#[test]
+fn process_import_env_override_refuses_partial_inline_coverage() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let plaintext = dir.path().join("multi.json");
+    let inline = dir.path().join("multi-inline.json");
+    let identity = dir.path().join("identity.txt");
+    let other_identity = dir.path().join("other-identity.txt");
+    let dotenv = dir.path().join("import.env");
+    write_plaintext_fixture(&plaintext);
+    fs::write(&dotenv, "APP_API_KEY=rotated\n").expect("write dotenv");
+
+    let generated = run_seclusor(&[
+        "keys",
+        "age",
+        "identity",
+        "generate",
+        "--output",
+        identity.to_str().expect("utf8 identity"),
+    ]);
+    assert!(generated.status.success());
+    let recipient = String::from_utf8(generated.stdout).expect("utf8 recipient");
+
+    let other_generated = run_seclusor(&[
+        "keys",
+        "age",
+        "identity",
+        "generate",
+        "--output",
+        other_identity.to_str().expect("utf8 other identity"),
+    ]);
+    assert!(other_generated.status.success());
+    let other_recipient = String::from_utf8(other_generated.stdout).expect("utf8 other recipient");
+
+    let encrypted = run_seclusor(&[
+        "secrets",
+        "inline",
+        "encrypt",
+        "--input",
+        plaintext.to_str().expect("utf8 plaintext"),
+        "--output",
+        inline.to_str().expect("utf8 inline"),
+        "--recipient",
+        recipient.trim(),
+    ]);
+    assert!(encrypted.status.success());
+
+    let before = fs::read(&inline).expect("before");
+    let names_before = list_dir_names(dir.path());
+    let refused = run_seclusor(&[
+        "secrets",
+        "import-env",
+        "--file",
+        inline.to_str().expect("utf8 inline"),
+        "--project",
+        "demo",
+        "--prefix",
+        "APP_",
+        "--dotenv-file",
+        dotenv.to_str().expect("utf8 dotenv"),
+        "--recipient",
+        other_recipient.trim(),
+        "--identity-file",
+        identity.to_str().expect("utf8 identity"),
+        "--allow-recipient-mismatch",
+    ]);
+    assert_policy_refusal(&refused, &inline, &before, dir.path(), &names_before);
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("untouched inline ciphertext"));
+    assert!(stderr.contains(&format!("  +{}", other_recipient.trim())));
+    assert!(stderr.contains(&format!("  -{}", recipient.trim())));
+}
+
+#[test]
+fn process_recipient_mismatch_override_rejects_read_before_file_io() {
+    let output = run_seclusor(&[
+        "secrets",
+        "get",
+        "--file",
+        "definitely-missing-009-a.json",
+        "--key",
+        "ONLY",
+        "--allow-recipient-mismatch",
+    ]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("only valid for"));
+    assert!(!stderr.contains("No such file"));
 }
 
 #[test]
@@ -1170,4 +1382,334 @@ fn process_plaintext_import_env_prints_count() {
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout), "1\n");
     assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+}
+
+#[test]
+fn process_rekey_delta_guard_override_and_stale_recipient_refusal() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let plaintext = dir.path().join("plain.json");
+    let bundle = dir.path().join("secrets.age");
+    let old_identity = dir.path().join("old-identity.txt");
+    let new_identity = dir.path().join("new-identity.txt");
+    write_plaintext_fixture(&plaintext);
+
+    let old_generated = run_seclusor(&[
+        "keys",
+        "age",
+        "identity",
+        "generate",
+        "--output",
+        old_identity.to_str().expect("utf8 old identity"),
+    ]);
+    assert!(old_generated.status.success());
+    let old_recipient = String::from_utf8(old_generated.stdout).expect("utf8 old recipient");
+    let old_recipient = old_recipient.trim();
+
+    let new_generated = run_seclusor(&[
+        "keys",
+        "age",
+        "identity",
+        "generate",
+        "--output",
+        new_identity.to_str().expect("utf8 new identity"),
+    ]);
+    assert!(new_generated.status.success());
+    let new_recipient = String::from_utf8(new_generated.stdout).expect("utf8 new recipient");
+    let new_recipient = new_recipient.trim();
+
+    // Construct a legacy v1.0 bundle directly. Current `bundle encrypt`
+    // establishes metadata, so it cannot produce this migration fixture.
+    let legacy: seclusor_core::SecretsFile =
+        serde_json::from_slice(&fs::read(&plaintext).expect("read plaintext"))
+            .expect("parse plaintext");
+    let recipient = old_recipient
+        .parse::<seclusor_crypto::Recipient>()
+        .expect("parse old recipient");
+    let ciphertext =
+        seclusor_codec::encrypt_bundle(&legacy, &[recipient]).expect("encrypt legacy bundle");
+    fs::write(&bundle, ciphertext).expect("write legacy bundle");
+
+    // Establish v1.1.0 metadata on the legacy bundle. This is the explicit
+    // degradation case: no header-derived recipient inference is attempted.
+    let established = run_seclusor(&[
+        "secrets",
+        "rekey",
+        "--file",
+        bundle.to_str().expect("utf8 bundle"),
+        "--identity-file",
+        old_identity.to_str().expect("utf8 old identity"),
+        "--recipient",
+        old_recipient,
+    ]);
+    assert!(
+        established.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&established.stderr)
+    );
+    assert!(String::from_utf8_lossy(&established.stderr).contains("comparison was indeterminate"));
+
+    let before_refusal = fs::read(&bundle).expect("bundle before refusal");
+    let names_before = list_dir_names(dir.path());
+    let refused = run_seclusor(&[
+        "secrets",
+        "rekey",
+        "--file",
+        bundle.to_str().expect("utf8 bundle"),
+        "--identity-file",
+        old_identity.to_str().expect("utf8 old identity"),
+        "--recipient",
+        new_recipient,
+    ]);
+    assert_policy_refusal(
+        &refused,
+        &bundle,
+        &before_refusal,
+        dir.path(),
+        &names_before,
+    );
+    let refused_stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(refused_stderr.contains("--allow-recipient-mismatch"));
+    assert!(refused_stderr.contains(&format!("  +{new_recipient}")));
+    assert!(refused_stderr.contains(&format!("  -{old_recipient}")));
+
+    let allowed = run_seclusor(&[
+        "secrets",
+        "rekey",
+        "--file",
+        bundle.to_str().expect("utf8 bundle"),
+        "--identity-file",
+        old_identity.to_str().expect("utf8 old identity"),
+        "--recipient",
+        new_recipient,
+        "--allow-recipient-mismatch",
+    ]);
+    assert!(
+        allowed.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&allowed.stdout),
+        format!("{}\n", bundle.display())
+    );
+    let allowed_stderr = String::from_utf8_lossy(&allowed.stderr);
+    assert!(allowed_stderr.contains("recipient set change accepted"));
+    assert!(allowed_stderr.contains(&format!("  +{new_recipient}")));
+    assert!(allowed_stderr.contains(&format!("  -{old_recipient}")));
+    assert!(allowed_stderr.contains("none of the loaded identities"));
+
+    let same_set = run_seclusor(&[
+        "secrets",
+        "rekey",
+        "--file",
+        bundle.to_str().expect("utf8 bundle"),
+        "--identity-file",
+        new_identity.to_str().expect("utf8 new identity"),
+        "--recipient",
+        new_recipient,
+    ]);
+    assert!(
+        same_set.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&same_set.stderr)
+    );
+    let same_set_stderr = String::from_utf8_lossy(&same_set.stderr);
+    assert!(!same_set_stderr.contains("recipient set change accepted"));
+    assert!(!same_set_stderr.contains("comparison was indeterminate"));
+    assert!(!same_set_stderr.contains("none of the loaded identities"));
+
+    // Incident regression: a stale durable recipient file must not silently
+    // restore the retired recipient on the next write.
+    let stale_recipients = dir.path().join("recipients.txt");
+    fs::write(&stale_recipients, format!("{old_recipient}\n")).expect("write stale recipients");
+    let before_stale_set = fs::read(&bundle).expect("bundle before stale set");
+    let names_before_stale_set = list_dir_names(dir.path());
+    let stale_set = Command::new(seclusor_bin())
+        .args([
+            "secrets",
+            "set",
+            "--file",
+            bundle.to_str().expect("utf8 bundle"),
+            "--project",
+            "demo",
+            "--key",
+            "API_KEY",
+            "--value-env",
+            "SECLUSOR_TEST_ROTATED_VALUE",
+            "--identity-file",
+            new_identity.to_str().expect("utf8 new identity"),
+            "--recipient-file",
+            stale_recipients.to_str().expect("utf8 recipients"),
+        ])
+        .env("SECLUSOR_TEST_ROTATED_VALUE", "must-not-be-written")
+        .output()
+        .expect("run stale set");
+    assert_policy_refusal(
+        &stale_set,
+        &bundle,
+        &before_stale_set,
+        dir.path(),
+        &names_before_stale_set,
+    );
+    let stale_stderr = String::from_utf8_lossy(&stale_set.stderr);
+    assert!(stale_stderr.contains(&format!("  +{old_recipient}")));
+    assert!(stale_stderr.contains(&format!("  -{new_recipient}")));
+
+    let decrypted = dir.path().join("decrypted.json");
+    let new_decrypt = run_seclusor(&[
+        "secrets",
+        "bundle",
+        "decrypt",
+        "--input",
+        bundle.to_str().expect("utf8 bundle"),
+        "--output",
+        decrypted.to_str().expect("utf8 decrypted"),
+        "--identity-file",
+        new_identity.to_str().expect("utf8 new identity"),
+    ]);
+    assert!(new_decrypt.status.success());
+
+    let old_decrypt = run_seclusor(&[
+        "secrets",
+        "bundle",
+        "decrypt",
+        "--input",
+        bundle.to_str().expect("utf8 bundle"),
+        "--output",
+        dir.path()
+            .join("old-decrypt.json")
+            .to_str()
+            .expect("utf8 output"),
+        "--identity-file",
+        old_identity.to_str().expect("utf8 old identity"),
+    ]);
+    assert!(!old_decrypt.status.success());
+}
+
+#[test]
+fn process_set_inline_override_allows_full_coverage_one_to_two_rotation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let plaintext = dir.path().join("single.json");
+    let inline = dir.path().join("single-inline.json");
+    let old_identity = dir.path().join("old-identity.txt");
+    let new_identity = dir.path().join("new-identity.txt");
+    fs::write(
+        &plaintext,
+        r#"{
+  "schema_version": "v1.0.0",
+  "projects": [{
+    "project_slug": "demo",
+    "credentials": {
+      "ONLY": { "type": "secret", "value": "before" }
+    }
+  }]
+}"#,
+    )
+    .expect("write single fixture");
+
+    let old_generated = run_seclusor(&[
+        "keys",
+        "age",
+        "identity",
+        "generate",
+        "--output",
+        old_identity.to_str().expect("utf8 old identity"),
+    ]);
+    assert!(old_generated.status.success());
+    let old_recipient = String::from_utf8(old_generated.stdout).expect("utf8 old recipient");
+    let old_recipient = old_recipient.trim();
+
+    let new_generated = run_seclusor(&[
+        "keys",
+        "age",
+        "identity",
+        "generate",
+        "--output",
+        new_identity.to_str().expect("utf8 new identity"),
+    ]);
+    assert!(new_generated.status.success());
+    let new_recipient = String::from_utf8(new_generated.stdout).expect("utf8 new recipient");
+    let new_recipient = new_recipient.trim();
+
+    let encrypted = run_seclusor(&[
+        "secrets",
+        "inline",
+        "encrypt",
+        "--input",
+        plaintext.to_str().expect("utf8 plaintext"),
+        "--output",
+        inline.to_str().expect("utf8 inline"),
+        "--recipient",
+        old_recipient,
+    ]);
+    assert!(encrypted.status.success());
+
+    let rotated = Command::new(seclusor_bin())
+        .args([
+            "secrets",
+            "set",
+            "--file",
+            inline.to_str().expect("utf8 inline"),
+            "--project",
+            "demo",
+            "--key",
+            "ONLY",
+            "--value-env",
+            "SECLUSOR_TEST_ROTATED_VALUE",
+            "--identity-file",
+            old_identity.to_str().expect("utf8 old identity"),
+            "--recipient",
+            old_recipient,
+            "--recipient",
+            new_recipient,
+            "--allow-recipient-mismatch",
+        ])
+        .env("SECLUSOR_TEST_ROTATED_VALUE", "after")
+        .output()
+        .expect("run full-coverage inline rotation");
+    assert!(
+        rotated.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&rotated.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&rotated.stdout), "ok\n");
+    let stderr = String::from_utf8_lossy(&rotated.stderr);
+    assert!(stderr.contains("recipient set change accepted"));
+    assert!(stderr.contains(&format!("  +{new_recipient}")));
+    assert!(!stderr.contains("AGE-SECRET"));
+
+    let document: seclusor_core::SecretsFile =
+        serde_json::from_slice(&fs::read(&inline).expect("read inline")).expect("parse inline");
+    assert_eq!(document.recipients.as_ref().map(Vec::len), Some(2));
+    let value = document.projects[0].credentials["ONLY"]
+        .value
+        .as_deref()
+        .expect("ciphertext");
+    assert_eq!(
+        seclusor_crypto::count_inline_x25519_recipient_stanzas(value).expect("stanzas"),
+        2
+    );
+
+    for (identity, output_name) in [
+        (&old_identity, "old-decrypted.json"),
+        (&new_identity, "new-decrypted.json"),
+    ] {
+        let output = dir.path().join(output_name);
+        let decrypted = run_seclusor(&[
+            "secrets",
+            "inline",
+            "decrypt",
+            "--input",
+            inline.to_str().expect("utf8 inline"),
+            "--output",
+            output.to_str().expect("utf8 output"),
+            "--identity-file",
+            identity.to_str().expect("utf8 identity"),
+        ]);
+        assert!(
+            decrypted.status.success(),
+            "stderr={}",
+            String::from_utf8_lossy(&decrypted.stderr)
+        );
+    }
 }

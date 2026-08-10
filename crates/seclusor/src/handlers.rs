@@ -13,24 +13,76 @@ pub(crate) mod run;
 pub(crate) mod secrets;
 
 use crate::cli::{AssetsSubcommand, SecretsSubcommand};
-use crate::error::CliResult;
+use crate::error::{CliError, CliResult};
 
-pub(crate) fn handle_secrets_command(command: SecretsSubcommand) -> CliResult<()> {
+fn reject_recipient_mismatch_override(allow_recipient_mismatch: bool) -> CliResult<()> {
+    if allow_recipient_mismatch {
+        return Err(CliError::Message(
+            "--allow-recipient-mismatch is only valid for `set`, `import-env`, \
+             `rekey`, and `bundle encrypt`"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn handle_secrets_command(
+    command: SecretsSubcommand,
+    allow_recipient_mismatch: bool,
+) -> CliResult<()> {
     match command {
-        SecretsSubcommand::Init(args) => secrets::handle_init(args),
-        SecretsSubcommand::Set(args) => secrets::handle_set(args),
-        SecretsSubcommand::Get(args) => secrets::handle_get(args),
-        SecretsSubcommand::List(args) => secrets::handle_list(args),
-        SecretsSubcommand::Unset(args) => secrets::handle_unset(args),
-        SecretsSubcommand::Validate(args) => secrets::handle_validate(args),
-        SecretsSubcommand::ExportEnv(args) => secrets::handle_export_env(args),
-        SecretsSubcommand::ImportEnv(args) => secrets::handle_import_env(args),
-        SecretsSubcommand::Rekey(args) => rekey::handle_rekey(args),
-        SecretsSubcommand::Run(args) => run::handle_run(args),
-        SecretsSubcommand::Bundle(args) => bundle::handle_bundle_command(args.command),
-        SecretsSubcommand::Inline(args) => inline::handle_inline_command(args.command),
-        SecretsSubcommand::Blob(args) => blob::handle_blob_command(args.command),
-        SecretsSubcommand::Convert(args) => convert::handle_convert(args),
+        SecretsSubcommand::Init(args) => {
+            reject_recipient_mismatch_override(allow_recipient_mismatch)?;
+            secrets::handle_init(args)
+        }
+        SecretsSubcommand::Set(args) => {
+            secrets::handle_set_with_policy(args, allow_recipient_mismatch)
+        }
+        SecretsSubcommand::Get(args) => {
+            reject_recipient_mismatch_override(allow_recipient_mismatch)?;
+            secrets::handle_get(args)
+        }
+        SecretsSubcommand::List(args) => {
+            reject_recipient_mismatch_override(allow_recipient_mismatch)?;
+            secrets::handle_list(args)
+        }
+        SecretsSubcommand::Unset(args) => {
+            reject_recipient_mismatch_override(allow_recipient_mismatch)?;
+            secrets::handle_unset(args)
+        }
+        SecretsSubcommand::Validate(args) => {
+            reject_recipient_mismatch_override(allow_recipient_mismatch)?;
+            secrets::handle_validate(args)
+        }
+        SecretsSubcommand::ExportEnv(args) => {
+            reject_recipient_mismatch_override(allow_recipient_mismatch)?;
+            secrets::handle_export_env(args)
+        }
+        SecretsSubcommand::ImportEnv(args) => {
+            secrets::handle_import_env_with_policy(args, allow_recipient_mismatch)
+        }
+        SecretsSubcommand::Rekey(args) => {
+            rekey::handle_rekey_with_policy(args, allow_recipient_mismatch)
+        }
+        SecretsSubcommand::Run(args) => {
+            reject_recipient_mismatch_override(allow_recipient_mismatch)?;
+            run::handle_run(args)
+        }
+        SecretsSubcommand::Bundle(args) => {
+            bundle::handle_bundle_command_with_policy(args.command, allow_recipient_mismatch)
+        }
+        SecretsSubcommand::Inline(args) => {
+            reject_recipient_mismatch_override(allow_recipient_mismatch)?;
+            inline::handle_inline_command(args.command)
+        }
+        SecretsSubcommand::Blob(args) => {
+            reject_recipient_mismatch_override(allow_recipient_mismatch)?;
+            blob::handle_blob_command(args.command)
+        }
+        SecretsSubcommand::Convert(args) => {
+            reject_recipient_mismatch_override(allow_recipient_mismatch)?;
+            convert::handle_convert(args)
+        }
     }
 }
 
