@@ -84,15 +84,29 @@ Only one explicit channel may be set (Clap conflicts).
 ### `--passphrase-env` tradeoff (honest)
 
 `--passphrase-env VAR` avoids argv and shell-history leakage, but the passphrase
-**value** still lives in the parent process environment:
+**value** still lives in the **parent** process environment for the life of the
+`seclusor` invocation:
 
-- It is **inherited by child processes** unless cleared
-- Same-UID tools can often inspect it (`/proc/<pid>/environ`, debuggers, some CI
-  “dump env” steps)
-- Scope the variable to a single command and `unset VAR` immediately after
+- **`secrets run` excludes `VAR` from the child environment** (and refuses to
+  start if any remaining child env entry’s value equals the resolved passphrase,
+  including ambient aliases and store keys). The child environment is built
+  through a single chokepoint that **snapshots** ambient − excluded + injected
+  at construction time and applies it with `env_clear` + explicit sets — not an
+  allow/deny glob, and not live re-inheritance after verification.
+- Same-UID tools can still inspect the **parent** (`/proc/<pid>/environ` on
+  Linux, debuggers, some CI “dump env” steps). Exclusion on the child does **not**
+  make `--passphrase-env` equivalent to `--passphrase-stdin` or
+  `--passphrase-file`.
+- Scope the variable to a single command and `unset VAR` immediately after.
 
 Prefer TTY prompt for interactive use; use `--passphrase-env` only when automation
-requires it and the environment is tightly controlled.
+requires it and the environment is tightly controlled. For a parent shell that
+already holds the passphrase, a verified pattern that keeps it out of the child
+without relying solely on the tool is:
+
+```bash
+printf '%s' "$VAR" | env -u VAR seclusor secrets run ... --passphrase-stdin -- <cmd>
+```
 
 ## 4. Library / FFI integration
 

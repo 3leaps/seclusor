@@ -84,6 +84,12 @@ jobs:
           # must make each real build entrypoint fail (EPR-0001 conformance). Runs
           # here because it resolves the dependency graph (needs the registry index).
           make negative-control-locks
+      - name: Child-env chokepoint inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Closed inventory: production Command::env* only at ChildEnv::apply.
+          make check-child-env
       - name: Go bindings tests
         shell: bash
         run: |

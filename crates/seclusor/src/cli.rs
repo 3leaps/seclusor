@@ -684,7 +684,7 @@ pub(crate) struct PassphraseArgs {
         long,
         value_name = "VAR",
         conflicts_with_all = ["passphrase", "passphrase_file", "passphrase_stdin"],
-        help = "Read passphrase from the named environment variable"
+        help = "Read passphrase from the named environment variable (secrets run excludes this name from the child environment; parent process may still hold it)"
     )]
     pub(crate) passphrase_env: Option<String>,
 
