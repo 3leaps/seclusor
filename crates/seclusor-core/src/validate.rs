@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use crate::constants::*;
 use crate::error::SeclusorError;
@@ -6,6 +6,57 @@ use crate::model::{Credential, SecretsFile};
 
 const MAX_CREDENTIAL_DESCRIPTION_LEN: usize = 128;
 const MAX_DOCSTRING_DESCRIPTION_LEN: usize = 512;
+
+/// Relationship between recorded document recipients and a proposed write set.
+///
+/// This is a transport-neutral predicate. Callers own policy and diagnostic
+/// rendering; an absent recorded set is deliberately not treated as a match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecipientSetRelation {
+    /// The two sets contain the same recipients.
+    Match,
+    /// The proposed write would add and/or remove recipients.
+    Delta {
+        /// Recipients present only in the proposed write set.
+        added: Vec<String>,
+        /// Recipients present only in the recorded document set.
+        removed: Vec<String>,
+    },
+    /// The document has no recorded recipient set to compare.
+    Indeterminate,
+}
+
+/// Compare recorded document recipients with a proposed write set.
+///
+/// Comparison uses set semantics and returns deterministic lexicographic
+/// deltas. Recipient parsing and policy enforcement remain the caller's
+/// responsibility.
+pub fn compare_recipient_sets(
+    document_recipients: Option<&[String]>,
+    proposed_recipients: &[String],
+) -> RecipientSetRelation {
+    let Some(document_recipients) = document_recipients else {
+        return RecipientSetRelation::Indeterminate;
+    };
+
+    let document: BTreeSet<&str> = document_recipients.iter().map(String::as_str).collect();
+    let proposed: BTreeSet<&str> = proposed_recipients.iter().map(String::as_str).collect();
+
+    let added: Vec<String> = proposed
+        .difference(&document)
+        .map(|recipient| (*recipient).to_owned())
+        .collect();
+    let removed: Vec<String> = document
+        .difference(&proposed)
+        .map(|recipient| (*recipient).to_owned())
+        .collect();
+
+    if added.is_empty() && removed.is_empty() {
+        RecipientSetRelation::Match
+    } else {
+        RecipientSetRelation::Delta { added, removed }
+    }
+}
 
 /// Check if a credential key matches the required pattern `^[A-Z_][A-Z0-9_]*$`.
 pub fn is_valid_credential_key(key: &str) -> bool {
@@ -611,6 +662,35 @@ mod tests {
         assert!(errors
             .iter()
             .any(|e| e.to_string().contains("not a valid age recipient")));
+    }
+
+    #[test]
+    fn recipient_set_relation_is_three_state_and_deterministic() {
+        let first = "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p".to_string();
+        let second = "age1q6x6r8cg3x5e5v66wk8jzm4krv3x3p8dtp3vh0wttw6h0g0z6vas4p7fw5".to_string();
+        let third = "age1qv3hcm0d3k4jl2q78q0m3qf3srkqykzrd5ufjl8m3v4eqf0dxy6q0g2zh7".to_string();
+
+        assert_eq!(
+            compare_recipient_sets(None, std::slice::from_ref(&first)),
+            RecipientSetRelation::Indeterminate
+        );
+        assert_eq!(
+            compare_recipient_sets(
+                Some(&[first.clone(), second.clone()]),
+                &[second.clone(), first.clone(), second.clone()]
+            ),
+            RecipientSetRelation::Match
+        );
+        assert_eq!(
+            compare_recipient_sets(
+                Some(&[second.clone(), first.clone()]),
+                &[third.clone(), second.clone()]
+            ),
+            RecipientSetRelation::Delta {
+                added: vec![third],
+                removed: vec![first],
+            }
+        );
     }
 
     #[test]

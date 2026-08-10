@@ -22,10 +22,11 @@ use crate::env_support::resolve_export_env_vars;
 use crate::error::{CliError, CliResult};
 use crate::handlers::encrypted_write::{
     apply_establishment, commit_bundle_mutation, commit_inline_ciphertext_document,
-    emit_establishment_notice, ensure_inline_stanza_count_matches,
-    inline_establishment_coverage_ok, load_inline_full_for_write, recipient_channels_present,
-    recipient_strings, refuse_scrypt_bundle_write, resolve_set_material, resolve_write_recipients,
-    SetMaterial, ValueChannelArgs,
+    emit_establishment_notice, emit_write_recipient_policy_notices,
+    ensure_inline_stanza_count_matches, inline_establishment_coverage_ok,
+    load_inline_full_for_write, recipient_channels_present, recipient_strings,
+    refuse_scrypt_bundle_write, resolve_set_material, resolve_write_recipients, SetMaterial,
+    ValueChannelArgs,
 };
 use crate::io::{
     probe_write_target, read_file_with_limit, read_runtime_document_file,
@@ -141,9 +142,17 @@ fn handle_init_bundle(args: InitArgs) -> CliResult<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn handle_set(args: SetArgs) -> CliResult<()> {
+    handle_set_with_policy(args, false)
+}
+
+pub(crate) fn handle_set_with_policy(
+    args: SetArgs,
+    allow_recipient_mismatch: bool,
+) -> CliResult<()> {
     if is_description_only_set(&args) {
-        return handle_description_only_set(args);
+        return handle_description_only_set(args, allow_recipient_mismatch);
     }
 
     match probe_write_target(&args.file)? {
@@ -161,11 +170,11 @@ pub(crate) fn handle_set(args: SetArgs) -> CliResult<()> {
         WriteTargetProbe::Encrypted {
             source: DocumentSource::Inline,
             bytes,
-        } => handle_set_inline_encrypted(args, &bytes),
+        } => handle_set_inline_encrypted(args, &bytes, allow_recipient_mismatch),
         WriteTargetProbe::Encrypted {
             source: DocumentSource::Bundle,
             bytes,
-        } => handle_set_bundle_encrypted(args, &bytes),
+        } => handle_set_bundle_encrypted(args, &bytes, allow_recipient_mismatch),
         WriteTargetProbe::Encrypted {
             source: DocumentSource::Plaintext,
             ..
@@ -195,7 +204,11 @@ fn apply_plaintext_set(mut secrets: SecretsFile, args: &mut SetArgs) -> CliResul
     Ok(())
 }
 
-fn handle_set_inline_encrypted(mut args: SetArgs, prior_bytes: &[u8]) -> CliResult<()> {
+fn handle_set_inline_encrypted(
+    mut args: SetArgs,
+    prior_bytes: &[u8],
+    allow_recipient_mismatch: bool,
+) -> CliResult<()> {
     // Full-load boundary: resolve identity once and decrypt-validate every field.
     let identities = resolve_identities(&args.identities, &args.passphrase, true)?;
     let secrets = load_inline_full_for_write(prior_bytes, &identities)?;
@@ -222,12 +235,17 @@ fn handle_set_inline_encrypted(mut args: SetArgs, prior_bytes: &[u8]) -> CliResu
                 secrets.recipients.as_deref(),
                 &args.recipients,
                 coverage_for_establish,
+                allow_recipient_mismatch,
             )?;
+            let prior_recipient_count = secrets
+                .recipients
+                .as_ref()
+                .map_or(resolved.recipients.len(), Vec::len);
 
             // Cardinality tripwire vs prior ciphertext fields (establishment
             // count-guard; meta-vs-reality when metadata present). Vacuous when
             // no prior encrypted fields (green-field first encrypt).
-            ensure_inline_stanza_count_matches(&secrets, resolved.recipients.len())?;
+            ensure_inline_stanza_count_matches(&secrets, prior_recipient_count)?;
 
             let mut working = secrets;
             let project_slug = ensure_project_for_write(
@@ -261,9 +279,7 @@ fn handle_set_inline_encrypted(mut args: SetArgs, prior_bytes: &[u8]) -> CliResu
             }
 
             commit_inline_ciphertext_document(&args.file, prior_bytes, &out)?;
-            if resolved.established {
-                emit_establishment_notice(&resolved.as_strings);
-            }
+            emit_write_recipient_policy_notices(&resolved);
             println!("ok");
             Ok(())
         }
@@ -279,6 +295,7 @@ fn handle_set_inline_encrypted(mut args: SetArgs, prior_bytes: &[u8]) -> CliResu
                     &args.recipients,
                     // Ref-only does not establish (does not cover encrypted fields).
                     false,
+                    allow_recipient_mismatch,
                 )?;
                 if let Some(meta) = working.recipients.as_ref() {
                     ensure_inline_stanza_count_matches(&working, meta.len())?;
@@ -312,7 +329,11 @@ fn handle_set_inline_encrypted(mut args: SetArgs, prior_bytes: &[u8]) -> CliResu
     }
 }
 
-fn handle_set_bundle_encrypted(mut args: SetArgs, prior_bytes: &[u8]) -> CliResult<()> {
+fn handle_set_bundle_encrypted(
+    mut args: SetArgs,
+    prior_bytes: &[u8],
+    allow_recipient_mismatch: bool,
+) -> CliResult<()> {
     refuse_scrypt_bundle_write(prior_bytes)?;
     let identities = resolve_identities(&args.identities, &args.passphrase, true)?;
     let material = resolve_set_material(value_channels_from_set(&mut args))?;
@@ -323,8 +344,17 @@ fn handle_set_bundle_encrypted(mut args: SetArgs, prior_bytes: &[u8]) -> CliResu
         return Err(refuse_encrypted_write(&args.file, peek.source));
     }
     // Bundle establishment always permitted.
-    let resolved =
-        resolve_write_recipients(peek.secrets.recipients.as_deref(), &args.recipients, true)?;
+    let resolved = resolve_write_recipients(
+        peek.secrets.recipients.as_deref(),
+        &args.recipients,
+        true,
+        allow_recipient_mismatch,
+    )?;
+    let prior_recipient_count = peek
+        .secrets
+        .recipients
+        .as_ref()
+        .map_or(resolved.recipients.len(), Vec::len);
     drop(peek);
 
     commit_bundle_mutation(
@@ -332,7 +362,7 @@ fn handle_set_bundle_encrypted(mut args: SetArgs, prior_bytes: &[u8]) -> CliResu
         prior_bytes,
         &identities,
         &resolved.recipients,
-        resolved.recipients.len(),
+        prior_recipient_count,
         |secrets| {
             if resolved.established {
                 apply_establishment(secrets, &resolved.as_strings)?;
@@ -353,9 +383,7 @@ fn handle_set_bundle_encrypted(mut args: SetArgs, prior_bytes: &[u8]) -> CliResu
             Ok(())
         },
     )?;
-    if resolved.established {
-        emit_establishment_notice(&resolved.as_strings);
-    }
+    emit_write_recipient_policy_notices(&resolved);
     println!("ok");
     Ok(())
 }
@@ -428,7 +456,7 @@ fn credential_from_material(
 /// - **Plaintext:** normal validated mutation (existing credential required).
 /// - **Inline:** structural-only authorized path (no crypto / identity / recipients).
 /// - **Bundle:** full encrypting write (recipient + identity rules).
-fn handle_description_only_set(args: SetArgs) -> CliResult<()> {
+fn handle_description_only_set(args: SetArgs, allow_recipient_mismatch: bool) -> CliResult<()> {
     if args.create_project {
         return Err(CliError::Message(
             "description-only edit cannot create credentials or projects; \
@@ -475,14 +503,20 @@ fn handle_description_only_set(args: SetArgs) -> CliResult<()> {
                 peek.secrets.recipients.as_deref(),
                 &args.recipients,
                 true,
+                allow_recipient_mismatch,
             )?;
+            let prior_recipient_count = peek
+                .secrets
+                .recipients
+                .as_ref()
+                .map_or(resolved.recipients.len(), Vec::len);
             drop(peek);
             commit_bundle_mutation(
                 &args.file,
                 &bytes,
                 &identities,
                 &resolved.recipients,
-                resolved.recipients.len(),
+                prior_recipient_count,
                 |secrets| {
                     if resolved.established {
                         apply_establishment(secrets, &resolved.as_strings)?;
@@ -500,9 +534,7 @@ fn handle_description_only_set(args: SetArgs) -> CliResult<()> {
                     Ok(())
                 },
             )?;
-            if resolved.established {
-                emit_establishment_notice(&resolved.as_strings);
-            }
+            emit_write_recipient_policy_notices(&resolved);
             println!("ok");
             Ok(())
         }
@@ -599,6 +631,13 @@ pub(crate) fn handle_list(args: ListArgs) -> CliResult<()> {
 }
 
 pub(crate) fn handle_unset(args: UnsetArgs) -> CliResult<()> {
+    handle_unset_with_policy(args, false)
+}
+
+pub(crate) fn handle_unset_with_policy(
+    args: UnsetArgs,
+    allow_recipient_mismatch: bool,
+) -> CliResult<()> {
     match probe_write_target(&args.file)? {
         WriteTargetProbe::Encrypted {
             source: DocumentSource::Inline,
@@ -626,14 +665,20 @@ pub(crate) fn handle_unset(args: UnsetArgs) -> CliResult<()> {
                 peek.secrets.recipients.as_deref(),
                 &args.recipients,
                 true,
+                allow_recipient_mismatch,
             )?;
+            let prior_recipient_count = peek
+                .secrets
+                .recipients
+                .as_ref()
+                .map_or(resolved.recipients.len(), Vec::len);
             drop(peek);
             commit_bundle_mutation(
                 &args.file,
                 &bytes,
                 &identities,
                 &resolved.recipients,
-                resolved.recipients.len(),
+                prior_recipient_count,
                 |secrets| {
                     if resolved.established {
                         apply_establishment(secrets, &resolved.as_strings)?;
@@ -642,9 +687,7 @@ pub(crate) fn handle_unset(args: UnsetArgs) -> CliResult<()> {
                     Ok(())
                 },
             )?;
-            if resolved.established {
-                emit_establishment_notice(&resolved.as_strings);
-            }
+            emit_write_recipient_policy_notices(&resolved);
             println!("ok");
             Ok(())
         }
@@ -888,7 +931,15 @@ pub(crate) fn enforce_export_shell_safety(
     enforce_export_shell_safety_preflight(args, stdout_is_tty)
 }
 
+#[cfg(test)]
 pub(crate) fn handle_import_env(args: ImportEnvArgs) -> CliResult<()> {
+    handle_import_env_with_policy(args, false)
+}
+
+pub(crate) fn handle_import_env_with_policy(
+    args: ImportEnvArgs,
+    allow_recipient_mismatch: bool,
+) -> CliResult<()> {
     match probe_write_target(&args.file)? {
         WriteTargetProbe::Plaintext { secrets, .. } => apply_import_env_plaintext(secrets, &args),
         WriteTargetProbe::NotEncrypted(bytes) => {
@@ -898,11 +949,11 @@ pub(crate) fn handle_import_env(args: ImportEnvArgs) -> CliResult<()> {
         WriteTargetProbe::Encrypted {
             source: DocumentSource::Inline,
             bytes,
-        } => handle_import_env_inline(args, &bytes),
+        } => handle_import_env_inline(args, &bytes, allow_recipient_mismatch),
         WriteTargetProbe::Encrypted {
             source: DocumentSource::Bundle,
             bytes,
-        } => handle_import_env_bundle(args, &bytes),
+        } => handle_import_env_bundle(args, &bytes, allow_recipient_mismatch),
         WriteTargetProbe::Encrypted {
             source: DocumentSource::Plaintext,
             ..
@@ -975,7 +1026,11 @@ fn apply_import_env_plaintext(mut secrets: SecretsFile, args: &ImportEnvArgs) ->
     Ok(())
 }
 
-fn handle_import_env_inline(args: ImportEnvArgs, prior_bytes: &[u8]) -> CliResult<()> {
+fn handle_import_env_inline(
+    args: ImportEnvArgs,
+    prior_bytes: &[u8],
+    allow_recipient_mismatch: bool,
+) -> CliResult<()> {
     let identities = resolve_identities(&args.identities, &args.passphrase, true)?;
     let secrets = load_inline_full_for_write(prior_bytes, &identities)?;
     let imported = prepare_import_pairs(&secrets, &args)?;
@@ -999,9 +1054,14 @@ fn handle_import_env_inline(args: ImportEnvArgs, prior_bytes: &[u8]) -> CliResul
         secrets.recipients.as_deref(),
         &args.recipients,
         coverage_for_establish,
+        allow_recipient_mismatch,
     )?;
+    let prior_recipient_count = secrets
+        .recipients
+        .as_ref()
+        .map_or(resolved.recipients.len(), Vec::len);
     // Cardinality vs prior encrypted fields (establish + meta paths).
-    ensure_inline_stanza_count_matches(&secrets, resolved.recipients.len())?;
+    ensure_inline_stanza_count_matches(&secrets, prior_recipient_count)?;
 
     let mut working = secrets;
     let project_slug =
@@ -1034,20 +1094,31 @@ fn handle_import_env_inline(args: ImportEnvArgs, prior_bytes: &[u8]) -> CliResul
         apply_establishment(&mut working, &resolved.as_strings)?;
     }
     commit_inline_ciphertext_document(&args.file, prior_bytes, &working)?;
-    if resolved.established {
-        emit_establishment_notice(&resolved.as_strings);
-    }
+    emit_write_recipient_policy_notices(&resolved);
     println!("{count}");
     Ok(())
 }
 
-fn handle_import_env_bundle(args: ImportEnvArgs, prior_bytes: &[u8]) -> CliResult<()> {
+fn handle_import_env_bundle(
+    args: ImportEnvArgs,
+    prior_bytes: &[u8],
+    allow_recipient_mismatch: bool,
+) -> CliResult<()> {
     refuse_scrypt_bundle_write(prior_bytes)?;
     let identities = resolve_identities(&args.identities, &args.passphrase, true)?;
     let peek = seclusor_codec::resolve_runtime_document(prior_bytes, &identities)?;
     let imported = prepare_import_pairs(&peek.secrets, &args)?;
-    let resolved =
-        resolve_write_recipients(peek.secrets.recipients.as_deref(), &args.recipients, true)?;
+    let resolved = resolve_write_recipients(
+        peek.secrets.recipients.as_deref(),
+        &args.recipients,
+        true,
+        allow_recipient_mismatch,
+    )?;
+    let prior_recipient_count = peek
+        .secrets
+        .recipients
+        .as_ref()
+        .map_or(resolved.recipients.len(), Vec::len);
     drop(peek);
 
     let count = imported.len();
@@ -1056,7 +1127,7 @@ fn handle_import_env_bundle(args: ImportEnvArgs, prior_bytes: &[u8]) -> CliResul
         prior_bytes,
         &identities,
         &resolved.recipients,
-        resolved.recipients.len(),
+        prior_recipient_count,
         |secrets| {
             if resolved.established {
                 apply_establishment(secrets, &resolved.as_strings)?;
@@ -1073,9 +1144,7 @@ fn handle_import_env_bundle(args: ImportEnvArgs, prior_bytes: &[u8]) -> CliResul
             Ok(())
         },
     )?;
-    if resolved.established {
-        emit_establishment_notice(&resolved.as_strings);
-    }
+    emit_write_recipient_policy_notices(&resolved);
     println!("{count}");
     Ok(())
 }

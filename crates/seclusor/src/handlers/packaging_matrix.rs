@@ -14,7 +14,7 @@ mod tests {
     use crate::cli::*;
     use crate::handlers::bundle::handle_bundle_encrypt;
     use crate::handlers::rekey::handle_rekey;
-    use crate::handlers::secrets::{handle_import_env, handle_set};
+    use crate::handlers::secrets::{handle_import_env, handle_set, handle_set_with_policy};
     use crate::io::{read_secrets_file, write_secrets_file};
     use crate::test_support::*;
 
@@ -722,8 +722,9 @@ mod tests {
     }
 
     #[test]
-    fn set_bundle_same_count_different_member_establishes_residual() {
-        // Documents accepted residual: same-count member swap is not detectable.
+    fn set_bundle_override_permits_detected_same_count_member_change() {
+        // Metadata detects the same-count member change; the explicit override
+        // deliberately accepts it while the stanza-count tripwire stays green.
         let dir = tempfile::tempdir().expect("temp");
         let input = dir.path().join("plain.json");
         let bundle = dir.path().join("secrets.age");
@@ -743,42 +744,45 @@ mod tests {
         })
         .expect("encrypt to A");
 
-        // Establish with C (same count 1) — residual: succeeds with Full-load by A.
-        handle_set(SetArgs {
-            file: bundle.clone(),
-            project: Some("demo".into()),
-            key: "API_KEY".into(),
-            credential_type: "secret".into(),
-            value: Some("swapped".into()),
-            reference: None,
-            description: None,
-            create_project: false,
-            value_stdin: false,
-            value_file: None,
-            value_env: None,
-            recipients: RecipientArgs {
-                recipients: vec![gen_c.recipient.clone()],
-                recipient_file: None,
-                recipient_env_var: None,
+        // Replace A with C (same count 1) using explicit delta consent.
+        handle_set_with_policy(
+            SetArgs {
+                file: bundle.clone(),
+                project: Some("demo".into()),
+                key: "API_KEY".into(),
+                credential_type: "secret".into(),
+                value: Some("swapped".into()),
+                reference: None,
+                description: None,
+                create_project: false,
+                value_stdin: false,
+                value_file: None,
+                value_env: None,
+                recipients: RecipientArgs {
+                    recipients: vec![gen_c.recipient.clone()],
+                    recipient_file: None,
+                    recipient_env_var: None,
+                },
+                identities: IdentityArgs {
+                    identity_files: vec![id_a],
+                    identity_public_key: None,
+                },
+                passphrase: PassphraseArgs::default(),
             },
-            identities: IdentityArgs {
-                identity_files: vec![id_a],
-                identity_public_key: None,
-            },
-            passphrase: PassphraseArgs::default(),
-        })
-        .expect("same-count member swap residual is accepted");
+            true,
+        )
+        .expect("same-count member change is accepted with override");
 
         let ct = fs::read(&bundle).expect("read");
         assert_eq!(
             seclusor_crypto::count_x25519_recipient_stanzas(&ct).expect("c"),
             1
         );
-        // A can no longer decrypt after swap to C — residual of count-only guard.
+        // A can no longer decrypt after the deliberately accepted change to C.
         let fail = seclusor_codec::decrypt_bundle(&ct, &[fixture_identity()]);
         assert!(
             fail.is_err(),
-            "old recipient should fail after swap residual"
+            "old recipient should fail after accepted member change"
         );
         let id_c_ident = seclusor_keyring::load_identity_file_auto(&id_c, None).expect("id c");
         let secrets = seclusor_codec::decrypt_bundle(&ct, &id_c_ident).expect("C decrypts");

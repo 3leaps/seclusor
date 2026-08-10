@@ -2,20 +2,53 @@ use seclusor_codec::{decrypt_bundle_from_file, encrypt_bundle_to_file, project_p
 
 use crate::cli::{BundleDecryptArgs, BundleEncryptArgs, BundleSubcommand};
 use crate::error::CliResult;
+use crate::handlers::encrypted_write::{
+    apply_establishment, emit_write_recipient_policy_notices, resolve_write_recipients,
+};
 use crate::io::{read_secrets_file, write_secrets_file};
-use crate::resolve::{resolve_identities, resolve_recipients};
+use crate::resolve::resolve_identities;
 
-pub(crate) fn handle_bundle_command(command: BundleSubcommand) -> CliResult<()> {
+pub(crate) fn handle_bundle_command_with_policy(
+    command: BundleSubcommand,
+    allow_recipient_mismatch: bool,
+) -> CliResult<()> {
     match command {
-        BundleSubcommand::Encrypt(args) => handle_bundle_encrypt(args),
-        BundleSubcommand::Decrypt(args) => handle_bundle_decrypt(args),
+        BundleSubcommand::Encrypt(args) => {
+            handle_bundle_encrypt_with_policy(args, allow_recipient_mismatch)
+        }
+        BundleSubcommand::Decrypt(args) => {
+            if allow_recipient_mismatch {
+                return Err(crate::error::CliError::Message(
+                    "--allow-recipient-mismatch is only valid for `bundle encrypt`".to_string(),
+                ));
+            }
+            handle_bundle_decrypt(args)
+        }
     }
 }
 
+#[cfg(test)]
 pub(crate) fn handle_bundle_encrypt(args: BundleEncryptArgs) -> CliResult<()> {
-    let secrets = read_secrets_file(&args.input)?;
-    let recipients = resolve_recipients(&args.recipients)?;
-    encrypt_bundle_to_file(&secrets, &recipients, &args.output)?;
+    handle_bundle_encrypt_with_policy(args, false)
+}
+
+fn handle_bundle_encrypt_with_policy(
+    args: BundleEncryptArgs,
+    allow_recipient_mismatch: bool,
+) -> CliResult<()> {
+    let mut secrets = read_secrets_file(&args.input)?;
+    let coverage_ok = seclusor_codec::encrypted_value_keys(&secrets).is_empty();
+    let resolved = resolve_write_recipients(
+        secrets.recipients.as_deref(),
+        &args.recipients,
+        coverage_ok,
+        allow_recipient_mismatch,
+    )?;
+    if resolved.established {
+        apply_establishment(&mut secrets, &resolved.as_strings)?;
+    }
+    encrypt_bundle_to_file(&secrets, &resolved.recipients, &args.output)?;
+    emit_write_recipient_policy_notices(&resolved);
     println!("{}", args.output.display());
     Ok(())
 }
@@ -132,7 +165,7 @@ mod tests {
         let output = dir.path().join("output.json");
         let identity_file = dir.path().join("identity.txt");
 
-        let secrets = fixture_secrets();
+        let mut secrets = fixture_secrets();
         write_secrets_file(&input, &secrets, true).expect("write input");
         write_identity_file(&identity_file, TEST_IDENTITY);
 
@@ -159,6 +192,7 @@ mod tests {
         .expect("bundle decrypt");
 
         let loaded = read_secrets_file(&output).expect("read output");
+        secrets.schema_version = seclusor_core::constants::SCHEMA_VERSION_V1_1_0.to_string();
         assert_eq!(loaded, secrets);
     }
 

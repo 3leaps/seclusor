@@ -33,7 +33,9 @@ fn run() -> CliResult<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        TopLevelCommand::Secrets(secrets) => handlers::handle_secrets_command(secrets.command),
+        TopLevelCommand::Secrets(secrets) => {
+            handlers::handle_secrets_command(secrets.command, secrets.allow_recipient_mismatch)
+        }
         TopLevelCommand::Keys(keys) => handlers::keys::handle_keys_command(keys.command),
         TopLevelCommand::Assets(assets) => handlers::handle_assets_command(assets.command),
         TopLevelCommand::Docs(docs) => handlers::docs::handle_docs_command(docs.command),

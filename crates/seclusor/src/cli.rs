@@ -24,6 +24,13 @@ pub(crate) enum TopLevelCommand {
 
 #[derive(Debug, Parser)]
 pub(crate) struct SecretsCommand {
+    #[arg(
+        long,
+        global = true,
+        default_value_t = false,
+        help = "Allow an explicit recipient-set change after printing its +added/-removed delta"
+    )]
+    pub(crate) allow_recipient_mismatch: bool,
     #[command(subcommand)]
     pub(crate) command: SecretsSubcommand,
 }

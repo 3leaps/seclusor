@@ -11,7 +11,7 @@ use seclusor_codec::{
     encrypted_value_keys, ensure_no_plaintext_credential_values, mutate_bundle, DocumentSource,
 };
 use seclusor_core::constants::MAX_SECRETS_DOC_BYTES;
-use seclusor_core::validate::validate_strict;
+use seclusor_core::validate::{compare_recipient_sets, validate_strict, RecipientSetRelation};
 use seclusor_core::{SeclusorError, SecretsFile};
 use seclusor_crypto::{Identity, Recipient};
 use zeroize::Zeroizing;
@@ -29,8 +29,10 @@ pub(crate) struct ResolvedWriteRecipients {
     pub recipients: Vec<Recipient>,
     /// Sorted public-key strings (document metadata form).
     pub as_strings: Vec<String>,
-    /// True when this write establishes document `recipients` metadata.
+    /// True when this write must establish or replace document `recipients` metadata.
     pub established: bool,
+    /// Relationship between prior metadata and the write target.
+    pub relation: RecipientSetRelation,
 }
 
 /// Whether any of the three explicit recipient channels is present on the CLI.
@@ -53,6 +55,7 @@ pub(crate) fn resolve_write_recipients(
     document_recipients: Option<&[String]>,
     args: &RecipientArgs,
     coverage_ok: bool,
+    allow_mismatch: bool,
 ) -> CliResult<ResolvedWriteRecipients> {
     let explicit = if recipient_channels_present(args) {
         Some(resolve_recipients(args)?)
@@ -81,6 +84,7 @@ pub(crate) fn resolve_write_recipients(
                 recipients,
                 as_strings,
                 established: true,
+                relation: RecipientSetRelation::Indeterminate,
             })
         }
         (Some(meta), None) => {
@@ -90,19 +94,36 @@ pub(crate) fn resolve_write_recipients(
                 recipients,
                 as_strings,
                 established: false,
+                relation: RecipientSetRelation::Match,
             })
         }
         (Some(meta), Some(explicit_recipients)) => {
             let meta_recipients = parse_metadata_recipients(meta)?;
-            let meta_set = recipient_string_set(&meta_recipients);
-            let explicit_set = recipient_string_set(&explicit_recipients);
-            if meta_set != explicit_set {
-                return Err(CliError::Message(
-                    "explicit recipients do not match document recipients metadata; \
-                     value-write commands cannot change the recipient set — use \
-                     `seclusor secrets rekey` to rotate recipients"
-                        .to_string(),
-                ));
+            let explicit_strings = recipient_strings(&explicit_recipients);
+            let relation = compare_recipient_sets(Some(meta), &explicit_strings);
+            if let RecipientSetRelation::Delta { added, removed } = &relation {
+                if !allow_mismatch {
+                    return Err(CliError::Message(format!(
+                        "explicit recipient set does not match document metadata; refusing write \
+                         without --allow-recipient-mismatch; use `seclusor secrets rekey` for a \
+                         full-document recipient rotation:{}",
+                        render_recipient_delta(added, removed)
+                    )));
+                }
+                if !coverage_ok {
+                    return Err(CliError::Message(format!(
+                        "recipient-set change cannot be applied safely while untouched inline \
+                         ciphertext remains; use `seclusor secrets rekey` to rewrite the full \
+                         document:{}",
+                        render_recipient_delta(added, removed)
+                    )));
+                }
+                return Ok(ResolvedWriteRecipients {
+                    recipients: explicit_recipients,
+                    as_strings: explicit_strings,
+                    established: true,
+                    relation,
+                });
             }
             // Prefer metadata order (already normalized).
             let as_strings = recipient_strings(&meta_recipients);
@@ -110,6 +131,7 @@ pub(crate) fn resolve_write_recipients(
                 recipients: meta_recipients,
                 as_strings,
                 established: false,
+                relation,
             })
         }
     }
@@ -140,8 +162,18 @@ pub(crate) fn recipient_strings(recipients: &[Recipient]) -> Vec<String> {
     keys
 }
 
-fn recipient_string_set(recipients: &[Recipient]) -> HashSet<String> {
-    recipients.iter().map(|r| r.to_string()).collect()
+/// Render a deterministic public-key-only delta for CLI diagnostics.
+pub(crate) fn render_recipient_delta(added: &[String], removed: &[String]) -> String {
+    let mut rendered = String::new();
+    for recipient in added {
+        rendered.push_str("\n  +");
+        rendered.push_str(recipient);
+    }
+    for recipient in removed {
+        rendered.push_str("\n  -");
+        rendered.push_str(recipient);
+    }
+    rendered
 }
 
 /// Establishment coverage for an **inline** write: after the mutation, every
@@ -274,10 +306,11 @@ pub(crate) fn commit_inline_ciphertext_document(
 
 /// Decrypt→mutate→re-encrypt a bundle and commit with CAS on the original bytes.
 ///
-/// `expected_recipient_count` is always the resolved canonical set size (metadata
-/// or establishing explicit set). Prior header stanza count must match (establishment count-guard;
-/// heterogeneity tripwire when metadata already present). Bundles
-/// always have prior ciphertext (≥1 stanza); there is no green-field bundle via `set`.
+/// `expected_recipient_count` describes the prior document set: metadata count
+/// when present, or the establishing explicit set when metadata is absent.
+/// The prior header stanza count must match it (establishment count-guard;
+/// heterogeneity tripwire when metadata already present). Bundles always have
+/// prior ciphertext (≥1 stanza); there is no green-field bundle via `set`.
 pub(crate) fn commit_bundle_mutation<F>(
     path: &Path,
     prior_ciphertext: &[u8],
@@ -339,6 +372,29 @@ pub(crate) fn emit_establishment_notice(as_strings: &[String]) {
     #[cfg(test)]
     ESTABLISHMENT_NOTICE_COUNT.with(|c| c.set(c.get().saturating_add(1)));
     eprintln!("recipient metadata established: {}", as_strings.join(", "));
+}
+
+/// Loud degradation notice when no prior recipient metadata was available.
+pub(crate) fn emit_recipient_comparison_indeterminate_notice() {
+    eprintln!(
+        "warning: recipient-set comparison was indeterminate because the input document \
+         had no recipients metadata; the age header cannot identify X25519 recipients"
+    );
+}
+
+/// Emit recipient-policy diagnostics only after a successful write.
+pub(crate) fn emit_write_recipient_policy_notices(resolved: &ResolvedWriteRecipients) {
+    match &resolved.relation {
+        RecipientSetRelation::Match => {}
+        RecipientSetRelation::Delta { added, removed } => eprintln!(
+            "recipient set change accepted:{}",
+            render_recipient_delta(added, removed)
+        ),
+        RecipientSetRelation::Indeterminate => {
+            emit_recipient_comparison_indeterminate_notice();
+            emit_establishment_notice(&resolved.as_strings);
+        }
+    }
 }
 
 // Test-only: count of establishment notices emitted (for post-commit-only proofs).
@@ -635,9 +691,12 @@ mod tests {
             recipient_file: None,
             recipient_env_var: None,
         };
-        let err = resolve_write_recipients(Some(&meta), &args, true).expect_err("mismatch");
-        assert!(err.to_string().contains("do not match"));
-        assert!(!err.to_string().contains("AGE-SECRET"));
+        let err = resolve_write_recipients(Some(&meta), &args, true, false).expect_err("mismatch");
+        let message = err.to_string();
+        assert!(message.contains("does not match document metadata"));
+        assert!(message.contains(&format!("  +{}", args.recipients[0])));
+        assert!(message.contains(&format!("  -{}", meta[0])));
+        assert!(!message.contains("AGE-SECRET"));
     }
 
     #[test]
@@ -645,9 +704,33 @@ mod tests {
         let r = fixture_recipient();
         let meta = vec![r.to_string()];
         let args = RecipientArgs::default();
-        let resolved = resolve_write_recipients(Some(&meta), &args, false).expect("meta");
+        let resolved = resolve_write_recipients(Some(&meta), &args, false, false).expect("meta");
         assert!(!resolved.established);
         assert_eq!(resolved.as_strings, meta);
+    }
+
+    #[test]
+    fn override_returns_delta_only_when_full_rewrite_coverage_is_safe() {
+        let meta = vec![fixture_recipient().to_string()];
+        let other = "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p";
+        let args = RecipientArgs {
+            recipients: vec![other.to_string()],
+            recipient_file: None,
+            recipient_env_var: None,
+        };
+
+        let blocked =
+            resolve_write_recipients(Some(&meta), &args, false, true).expect_err("partial");
+        assert!(blocked.to_string().contains("untouched inline ciphertext"));
+
+        let resolved =
+            resolve_write_recipients(Some(&meta), &args, true, true).expect("full rewrite");
+        assert!(resolved.established);
+        assert_eq!(resolved.as_strings, vec![other.to_string()]);
+        assert!(matches!(
+            resolved.relation,
+            RecipientSetRelation::Delta { .. }
+        ));
     }
 
     #[test]
