@@ -28,6 +28,20 @@ pub(crate) enum CliError {
          Re-run the command against the current file."
     )]
     ConcurrentModification { path: String },
+    /// The encrypted rekey target committed, but the separately named public
+    /// recipient-list refresh did not. These two paths cannot be one atomic
+    /// transaction, so the partial-success state must be explicit.
+    #[error(
+        "rekey output was committed to {output_path}, but recipient refresh at \
+         {recipient_path} failed; recipient-file state is uncertain and the durable \
+         recipient source may remain stale: {source}"
+    )]
+    RecipientRefreshFailed {
+        output_path: String,
+        recipient_path: String,
+        #[source]
+        source: Box<CliError>,
+    },
     #[error(transparent)]
     Core(#[from] SeclusorError),
     #[error(transparent)]

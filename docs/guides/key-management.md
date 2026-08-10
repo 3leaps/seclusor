@@ -27,7 +27,9 @@ seclusor secrets rekey \
   --file secrets.age \
   --identity-file ~/.config/seclusor/old-identity.txt \
   --recipient age1newrecipient1... \
-  --recipient age1newrecipient2...
+  --recipient age1newrecipient2... \
+  --write-recipients recipients.txt \
+  --allow-recipient-mismatch
 ```
 
 ### Rekey an inline document
@@ -36,8 +38,27 @@ seclusor secrets rekey \
 seclusor secrets rekey \
   --file secrets.json \
   --identity-file old.txt \
-  --recipient age1new...
+  --recipient age1new... \
+  --write-recipients recipients.txt \
+  --allow-recipient-mismatch
 ```
+
+`--write-recipients PATH` is explicit: after the encrypted rekey output
+commits, seclusor atomically writes the canonical resulting recipient set to
+that named path, one public key per line with a trailing newline. It never
+rewrites `--recipient-file` unless the same path is also named with
+`--write-recipients`.
+
+The encrypted document and public recipient list are two separate targets, not
+one transaction. If the recipient-list write fails, the command exits nonzero
+and reports that the rekey output committed while the durable recipient source
+may still be stale. Inspect the encrypted output, correct the recipient path,
+and retry the explicit refresh. Normal success stdout remains the rekeyed
+document path; recipient refresh status is written to stderr.
+
+Recipient lists contain public encryption keys, but their integrity controls
+who receives future writes. On Unix, a fresh list is created at `0644` subject
+to umask; replacing an existing list preserves its mode.
 
 When schema v1.1.0 recipient metadata is present, `rekey` compares the current
 and target sets. A change fails closed and prints each public-key delta as
@@ -62,8 +83,9 @@ For critical archives (root keys, master passphrases):
 1. Create new identities/recipients in a clean environment.
 2. Rekey the archive using the new recipients and inspect the displayed
    `+`/`-` delta before allowing it.
-3. Rewrite every durable recipient source (for example `recipients.txt`) to
-   exactly the new set **before any later `set` or `import-env` command**.
+3. Name each durable recipient source explicitly with
+   `--write-recipients` during rekey, then verify it contains exactly the new
+   set **before any later `set` or `import-env` command**.
 4. Verify the new bundle can be decrypted with the new identity and **cannot**
    be decrypted with the old one.
 5. Securely destroy or archive the old identity.

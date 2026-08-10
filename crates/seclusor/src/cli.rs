@@ -466,6 +466,12 @@ pub(crate) struct RekeyArgs {
         help = "Write rekeyed output to this path (default: overwrite --file in place)"
     )]
     pub(crate) output: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "After rekey succeeds, atomically write the resulting public recipient set to PATH"
+    )]
+    pub(crate) write_recipients: Option<PathBuf>,
     #[command(flatten)]
     pub(crate) recipients: RecipientArgs,
     #[command(flatten)]

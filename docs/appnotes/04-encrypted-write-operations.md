@@ -64,6 +64,14 @@ every encrypted field (else refuse → `rekey`).
 Stanza-count divergence on encrypting writes: **fail closed** (name `rekey`).
 Read/inspect paths may **warn** only.
 
+`rekey --write-recipients PATH` is the explicit durable-recipient refresh
+surface. The ciphertext commit happens first; the resulting canonical public
+recipient list is then committed through a distinct same-directory atomic
+writer. Fresh Unix recipient files are `0644` subject to umask, and existing
+modes are preserved. The input `--recipient-file` is never rewritten
+implicitly. Because the document and list are two targets, a list-write failure
+after rekey returns a nonzero, explicit partial-success diagnostic.
+
 ### Schema invariant: recipients ⇒ no plaintext credential values (JSON at rest)
 
 When top-level `recipients` is present on a **JSON** secrets document (plaintext

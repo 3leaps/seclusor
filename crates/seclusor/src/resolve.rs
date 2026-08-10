@@ -5,8 +5,8 @@ use std::path::Path;
 use seclusor_crypto::{assert_identity_file_access, parse_recipients, Identity};
 use seclusor_keyring::{
     discover_recipients, find_identity_path_by_public_key, is_passphrase_protected_identity,
-    load_identity_by_public_key, load_identity_file_auto, KeyringError, Recipient,
-    RecipientDiscoveryOptions, DEFAULT_RECIPIENTS_ENV_VAR,
+    load_identity_file_auto, KeyringError, Recipient, RecipientDiscoveryOptions,
+    DEFAULT_RECIPIENTS_ENV_VAR,
 };
 use secrecy::{ExposeSecret, SecretString};
 
@@ -218,7 +218,20 @@ pub(crate) fn resolve_identities(
     passphrase_args: &PassphraseArgs,
     required: bool,
 ) -> CliResult<Vec<Identity>> {
-    Ok(resolve_identities_with_passphrase(args, passphrase_args, required)?.0)
+    Ok(resolve_identities_full(args, passphrase_args, required)?.0)
+}
+
+/// Resolve identities together with the exact private source paths that were
+/// loaded. Callers that must protect those paths from output aliasing must use
+/// this single-discovery result rather than repeating keyring lookup.
+pub(crate) fn resolve_identities_with_sources(
+    args: &IdentityArgs,
+    passphrase_args: &PassphraseArgs,
+    required: bool,
+) -> CliResult<(Vec<Identity>, Vec<std::path::PathBuf>)> {
+    let (identities, _passphrase, sources) =
+        resolve_identities_full(args, passphrase_args, required)?;
+    Ok((identities, sources))
 }
 
 /// Resolve identities and retain the passphrase used to unlock them (if any).
@@ -233,6 +246,16 @@ pub(crate) fn resolve_identities_with_passphrase(
     passphrase_args: &PassphraseArgs,
     required: bool,
 ) -> CliResult<(Vec<Identity>, Option<SecretString>)> {
+    let (identities, passphrase, _sources) =
+        resolve_identities_full(args, passphrase_args, required)?;
+    Ok((identities, passphrase))
+}
+
+fn resolve_identities_full(
+    args: &IdentityArgs,
+    passphrase_args: &PassphraseArgs,
+    required: bool,
+) -> CliResult<(Vec<Identity>, Option<SecretString>, Vec<std::path::PathBuf>)> {
     // --identity-public-key and --identity-file conflict at clap parse time.
     if let Some(public_key) = &args.identity_public_key {
         let path = find_identity_path_by_public_key(public_key)?;
@@ -245,14 +268,27 @@ pub(crate) fn resolve_identities_with_passphrase(
         } else {
             None
         };
-        let identities = load_identity_by_public_key(public_key, passphrase.as_ref())?;
+        let identities = load_identity_file_auto(&path, passphrase.as_ref())?;
+        let want = public_key
+            .trim()
+            .parse::<Recipient>()
+            .map_err(|_| CliError::Keyring(KeyringError::InvalidIdentityPublicKey))?
+            .to_string();
+        if !identities
+            .iter()
+            .any(|identity| identity.to_public().to_string() == want)
+        {
+            return Err(CliError::Keyring(KeyringError::IdentityPublicKeyMismatch {
+                path,
+            }));
+        }
         if required && identities.is_empty() {
             return Err(CliError::Message(
                 "no identities resolved; provide --identity-file or --identity-public-key"
                     .to_string(),
             ));
         }
-        return Ok((identities, passphrase));
+        return Ok((identities, passphrase, vec![path]));
     }
 
     // Per SC-008 settled decision 1: scan all identity files first,
@@ -287,7 +323,7 @@ pub(crate) fn resolve_identities_with_passphrase(
         ));
     }
 
-    Ok((identities, passphrase))
+    Ok((identities, passphrase, args.identity_files.clone()))
 }
 
 /// Guard-only passphrase material for the child-env value-equality assertion.
