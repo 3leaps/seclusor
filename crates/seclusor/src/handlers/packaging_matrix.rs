@@ -395,6 +395,7 @@ mod tests {
         let err = handle_rekey(RekeyArgs {
             file: path.clone(),
             output: None,
+            write_recipients: None,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
                 recipient_file: None,
@@ -482,6 +483,7 @@ mod tests {
         handle_rekey(RekeyArgs {
             file: inline.clone(),
             output: Some(out.clone()),
+            write_recipients: None,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
                 recipient_file: None,
@@ -510,6 +512,7 @@ mod tests {
         let err = handle_rekey(RekeyArgs {
             file: inline.clone(),
             output: None,
+            write_recipients: None,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
                 recipient_file: None,
@@ -535,6 +538,7 @@ mod tests {
         let err = handle_rekey(RekeyArgs {
             file: inline.clone(),
             output: None,
+            write_recipients: None,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
                 recipient_file: None,
@@ -583,6 +587,7 @@ mod tests {
         handle_rekey(RekeyArgs {
             file: bundle.clone(),
             output: None,
+            write_recipients: None,
             recipients: RecipientArgs {
                 recipients: vec![recipient.clone()],
                 recipient_file: None,
@@ -641,6 +646,7 @@ mod tests {
         let err = handle_rekey(RekeyArgs {
             file: inline.clone(),
             output: None,
+            write_recipients: None,
             recipients: RecipientArgs {
                 recipients: vec![gen.recipient],
                 recipient_file: None,

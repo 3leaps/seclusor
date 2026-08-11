@@ -1,14 +1,15 @@
-//! Atomic **ciphertext** commit for encrypted secrets-file rewrites.
+//! Atomic commits for ciphertext and integrity-sensitive public data.
 //!
-//! CLI-local (`pub(crate)`) first cut. **Do not** route plaintext document
-//! serialization through this writer — temps may be orphaned on crash, and the
-//! contract requires ciphertext / encrypted JSON only.
+//! CLI-local (`pub(crate)`) first cut. Callers must choose the named entry point
+//! matching the data class. **Do not** route plaintext secrets through the
+//! public-data writer.
 //!
 //! # Contract
 //!
 //! - Temp file: unique `create_new` in the **same directory** as the target
-//! - Content: ciphertext / encrypted inline JSON only (caller responsibility)
-//! - Permissions: Unix fresh files `0600`; rewrites preserve existing mode
+//! - Content: ciphertext/encrypted JSON or explicitly public data
+//! - Permissions: Unix fresh ciphertext `0600`; fresh public data `0644`
+//!   respecting umask; rewrites preserve existing mode
 //! - Durability: `sync_all` temp before replace; parent-dir sync on Unix
 //!   (errors propagate where supported)
 //! - CAS: expected prior bytes re-read via a **fresh open** immediately before
@@ -83,14 +84,33 @@ pub(crate) fn atomic_write_ciphertext(
     content: &[u8],
     options: AtomicWriteOptions,
 ) -> CliResult<()> {
-    atomic_write_bytes(path, content, options)
+    atomic_write_with_permissions(path, content, options, PermissionPolicy::Ciphertext)
 }
 
-/// Backward-compatible name for [`atomic_write_ciphertext`].
-pub(crate) fn atomic_write_bytes(
+/// Atomically write integrity-sensitive **public** data.
+///
+/// Fresh Unix files are created with mode `0644` subject to the process umask.
+/// Rewrites preserve the existing target mode. This entry point must never
+/// receive plaintext secrets, identities, passphrases, or ciphertext.
+pub(crate) fn atomic_write_public_data(
     path: &Path,
     content: &[u8],
     options: AtomicWriteOptions,
+) -> CliResult<()> {
+    atomic_write_with_permissions(path, content, options, PermissionPolicy::PublicData)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PermissionPolicy {
+    Ciphertext,
+    PublicData,
+}
+
+fn atomic_write_with_permissions(
+    path: &Path,
+    content: &[u8],
+    options: AtomicWriteOptions,
+    permission_policy: PermissionPolicy,
 ) -> CliResult<()> {
     let parent = path
         .parent()
@@ -104,10 +124,25 @@ pub(crate) fn atomic_write_bytes(
         )));
     }
 
-    // Unique temp in same directory (randomized; never predictable .tmp alone).
-    let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(CliError::Io)?;
+    // Unique temp in the same directory. Setting the creation mode on the
+    // builder lets the OS apply umask for fresh public files; chmod-after-create
+    // would incorrectly widen a restrictive umask.
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".seclusor-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let fresh_mode = match permission_policy {
+            PermissionPolicy::Ciphertext => 0o600,
+            PermissionPolicy::PublicData => 0o644,
+        };
+        builder.permissions(fs::Permissions::from_mode(fresh_mode));
+    }
+    #[cfg(not(unix))]
+    let _ = permission_policy;
+    let mut temp = builder.tempfile_in(parent).map_err(CliError::Io)?;
 
-    apply_permissions(path, temp.as_file())?;
+    preserve_existing_permissions(path, temp.as_file())?;
 
     #[cfg(test)]
     if take_fault() == Some(AtomicFault::BeforeWrite) {
@@ -167,16 +202,12 @@ pub(crate) fn atomic_write_bytes(
     Ok(())
 }
 
-fn apply_permissions(target: &Path, temp: &File) -> CliResult<()> {
+fn preserve_existing_permissions(target: &Path, temp: &File) -> CliResult<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
         if target.exists() {
             let meta = fs::metadata(target).map_err(CliError::Io)?;
             temp.set_permissions(meta.permissions())
-                .map_err(CliError::Io)?;
-        } else {
-            temp.set_permissions(fs::Permissions::from_mode(0o600))
                 .map_err(CliError::Io)?;
         }
     }
@@ -618,6 +649,60 @@ mod tests {
 
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o640);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_data_rewrite_preserves_existing_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        inject_fault(None);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("recipients.txt");
+        fs::write(&path, b"age1old\n").expect("seed");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o664)).expect("mode");
+
+        atomic_write_public_data(
+            &path,
+            b"age1new\n",
+            AtomicWriteOptions {
+                expected_prior_bytes: Some(b"age1old\n".to_vec()),
+                create_new: false,
+            },
+        )
+        .expect("write");
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o664);
+    }
+
+    #[test]
+    fn public_data_fault_leaves_old_list_and_no_temp_residue() {
+        inject_fault(Some(AtomicFault::AfterSyncBeforeReplace));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("recipients.txt");
+        fs::write(&path, b"age1old\n").expect("seed");
+        let names_before: Vec<_> = fs::read_dir(dir.path())
+            .expect("read before")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+
+        atomic_write_public_data(
+            &path,
+            b"age1new\n",
+            AtomicWriteOptions {
+                expected_prior_bytes: Some(b"age1old\n".to_vec()),
+                create_new: false,
+            },
+        )
+        .expect_err("fault must surface");
+        inject_fault(None);
+
+        assert_eq!(fs::read(&path).expect("old list"), b"age1old\n");
+        let names_after: Vec<_> = fs::read_dir(dir.path())
+            .expect("read after")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(names_after, names_before, "temp file must be cleaned up");
     }
 
     #[cfg(unix)]

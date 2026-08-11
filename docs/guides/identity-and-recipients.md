@@ -281,10 +281,18 @@ seclusor secrets bundle encrypt \
 Any team member can decrypt with their own identity file.
 
 Treat `recipients.txt` as an integrity-sensitive encryption input. During
-rotation, rewrite it to the post-rekey recipient set before the next encrypted
-value write. Seclusor compares explicit recipients with schema v1.1.0 document
+rotation, pass an explicit `--write-recipients recipients.txt` to `rekey` so
+the canonical post-rekey set is atomically refreshed before the next encrypted
+value write. Supplying `--recipient-file recipients.txt` alone never rewrites
+that input. Seclusor compares explicit recipients with schema v1.1.0 document
 metadata and refuses a stale set while showing the public-key delta, but the
 file itself is not authenticated.
+
+Recipient keys are public data, not secret identity material. Fresh recipient
+lists use Unix mode `0644` subject to umask, while replacements preserve the
+existing mode. The encrypted output commits before the separately named list;
+if the second write fails, seclusor exits nonzero and explicitly reports the
+partial-success state.
 
 ## Platform notes
 

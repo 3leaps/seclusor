@@ -1153,6 +1153,7 @@ dependencies = [
  "glob",
  "libc",
  "rpassword",
+ "same-file",
  "seclusor-codec",
  "seclusor-core",
  "seclusor-crypto",
