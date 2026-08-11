@@ -2,6 +2,36 @@
 
 **Content policy**: This file contains the most recent 3 releases (reverse chronological). Older releases are archived in `docs/releases/vX.Y.Z.md`.
 
+## v0.2.1 (August 2026)
+
+**Security patch** — Keep the identity passphrase out of processes launched by
+`secrets run`, and stop a stale recipients list from silently restoring a
+retired recipient after rotation. GitHub Security Advisory published with this
+release.
+
+- **`secrets run`:** the `--passphrase-env` variable is excluded from the child
+  environment through a single construction chokepoint; the command also
+  refuses to start if any child env **value** equals the resolved passphrase
+- **Write paths:** fail closed when the write-target recipient set diverges from
+  document metadata (schema v1.1.0+); deliberate changes require
+  `--allow-recipient-mismatch`. On legacy v1.0.0 documents, a full inline
+  rewrite or bundle write emits an indeterminate establishment notice; a partial
+  inline write instead refuses and directs you to `secrets rekey`
+- **`rekey --write-recipients PATH`:** optional explicit durable recipient-list
+  refresh after a successful rekey (never an implicit rewrite of
+  `--recipient-file`)
+- Prefer `--passphrase-file` / `--passphrase-stdin` for ordinary automation;
+  parent-process residual remains for `--passphrase-env`
+
+**Upgrade cue:** install 0.2.1 first, then rotate any identity that may have
+been exposed; refresh durable recipient sources before further encrypted
+writes.
+
+**Install** (after the GitHub release is published):
+`brew upgrade seclusor` · `scoop update seclusor`
+
+See `docs/releases/v0.2.1.md` for full notes, ranges, residuals, and workarounds.
+
 ## v0.2.0 (August 2026)
 
 **Encrypted documents you can live in** — Inspect, mutate, and rekey bundle and
@@ -40,15 +70,5 @@ See `docs/releases/v0.2.0.md` for full notes and upgrade guidance.
 - **Docs fix**: Corrected stale flag names in codecs guide (`--to-codec` → `--from`/`--to`)
 
 See `docs/releases/v0.1.6.md` for full notes.
-
-## v0.1.5 (April 2026)
-
-**Blob encryption for opaque files** — Encrypt any file (shell scripts, configs, binary tokens) as age ciphertext.
-
-- `secrets blob encrypt` and `secrets blob decrypt` for opaque file encryption (SC-010)
-- 10 MB default size limit with `--allow-large` override
-- Atomic writes on blob decrypt; output created with 0600 permissions on Unix
-
-See `docs/releases/v0.1.5.md` for full notes.
 
 _(Older releases archived in `docs/releases/`. This file is kept short per project convention.)_
