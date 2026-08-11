@@ -23,6 +23,12 @@ appropriate channel:
 Only one passphrase channel can be used per command. Passphrases are never
 accepted as bare CLI argument values.
 
+When using `secrets run` with `--passphrase-env` (v0.2.1+), the named variable
+is excluded from the **child** environment. It still exists in the parent
+`seclusor` process environment for that invocation. Prefer
+`--passphrase-file` or `--passphrase-stdin` when the runner can supply them;
+`--allow` / `--deny` only filter which store keys are injected.
+
 ## GitHub Actions example
 
 Store two secrets in your GitHub repository settings:

@@ -8,6 +8,98 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-11
+
+### Security
+
+This release fixes a privilege-boundary defect in `secrets run` and hardens
+encrypted write paths against recipient-set divergence after identity rotation.
+A GitHub Security Advisory is published with the `v0.2.1` release (see the
+repository Security Advisories page for CVSS, affected ranges, and CVE status).
+
+- **`secrets run` child environment boundary:** when identity material is
+  supplied with `--passphrase-env`, the named variable is excluded from the
+  child process environment through a single construction chokepoint. The
+  command also refuses to start if any effective child environment value equals
+  the resolved passphrase (covering aliases under a different variable name).
+  `--allow` / `--deny` continue to filter only which store keys are injected;
+  they never controlled ambient environment pass-through.
+  - Affected: **v0.1.4 – v0.2.0** (requires both `secrets run` and
+    `--passphrase-env`)
+  - Residual: the passphrase remains in the parent `seclusor` process
+    environment for the lifetime of that invocation when supplied via
+    `--passphrase-env`. Prefer `--passphrase-file` or `--passphrase-stdin` for
+    ordinary use. This fix does **not** make `--passphrase-env` equivalent to
+    those channels.
+- **Recipient-set divergence on write:** write paths that establish or preserve
+  recipient metadata (`set`, `import-env`, `rekey`, bundle encrypt) compare the
+  write-target recipient set to recorded document metadata and **fail closed**
+  on divergence, printing each public-key difference as `+age1…` / `-age1…`.
+  Deliberate membership changes require an explicit `--allow-recipient-mismatch`
+  on the same command (recipient-set only — not a general force switch). The
+  guard reports a set difference the operator must read; it does not claim to
+  classify “re-grant” vs intentional add.
+  - Reported trap: **v0.2.0** only (`rekey` first shipped there)
+  - Underlying missing cross-check: **v0.1.0 – v0.2.0** for writes that accept
+    a recipient set, though the delta is only **detectable** once schema
+    **v1.1.0** `recipients` metadata exists (v0.2.0+)
+  - Residual: on legacy **v1.0.0** documents (no recorded recipient set) the
+    comparison is **indeterminate**. When the operation covers every inline
+    encrypted field (or writes a bundle), seclusor prints an explicit notice and
+    establishes metadata from the write target; a partial inline write instead
+    refuses and directs you to `secrets rekey`. It does not infer recipients
+    from age stanzas. Prefer rekeying before relying on fail-closed divergence.
+- **Explicit durable recipient refresh:** `secrets rekey --write-recipients PATH`
+  optionally writes the canonical resulting public-key set to a named path after
+  a successful rekey (atomic public-data write; never an implicit rewrite of
+  `--recipient-file` unless the same path is named). Use this so a following
+  write does not restore a retired recipient from a stale durable list. If the
+  recipient-list write fails after the encrypted output commits, retry the
+  refresh against that committed output with an identity for the new set.
+
+If you may have been exposed via `--passphrase-env`: **upgrade to 0.2.1 first**,
+then rotate the affected identity. On 0.2.1, recipient divergence fails closed
+when metadata is present; rewrite durable recipient sources (or use
+`--write-recipients` during rekey) before further encrypted writes. Treat
+credentials reachable by the exposed child as compromised.
+
+Interim workaround on unpatched binaries (stdin channel; `printf` is a shell
+builtin so the value never appears in process arguments):
+
+```bash
+printf '%s' "$VAR" | env -u VAR \
+  seclusor secrets run --passphrase-stdin … -- <command>
+```
+
+### Added
+
+- `secrets rekey --write-recipients <path>` for explicit post-rekey recipient
+  list refresh (canonical sorted public keys, one per line, trailing newline)
+- `--allow-recipient-mismatch` on encrypted write commands that compare
+  recipient metadata (deliberate set change only; not a general `--force`)
+- Library three-state recipient-set comparison predicate for document writers
+  that want the same delta check the CLI enforces
+
+### Fixed
+
+- `secrets run` no longer passes the identity passphrase environment variable
+  through to the launched child (see Security)
+- Encrypted write paths no longer succeed silently when the configured
+  recipient set diverges from document recipient metadata (see Security)
+
+### Changed
+
+- Encrypted writes with recipient metadata now **fail closed** on
+  write-target vs metadata divergence (previously could succeed silently —
+  see Security). Deliberate membership changes use
+  `--allow-recipient-mismatch`.
+- Release workflow uploads the PGP public key (`release-key.asc`) with
+  provenance / `--all` asset selection
+- CI retains generated SBOM artifacts under stable package-named CycloneDX
+  filenames for release audit trails
+
+See `docs/releases/v0.2.1.md` for full notes and upgrade guidance.
+
 ## [0.2.0] - 2026-08-03
 
 ### Added

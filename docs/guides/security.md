@@ -23,6 +23,18 @@ documents without writing a plaintext working copy to disk. Use
 `seclusor-keyring`. Ordinary `secrets set` / `import-env` preserve an
 established recipient set and refuse ambiguous membership changes.
 
+When schema v1.1.0 recipient metadata is present, write paths compare the
+write-target recipient set to document metadata and **fail closed** on
+divergence (`+age1…` / `-age1…` lines). Intentional membership changes require
+`--allow-recipient-mismatch` on the same command (recipient-set only). The
+guard reports a set difference; it does not classify “re-grant” vs intentional
+add. On legacy v1.0.0 documents (no recorded recipient set) the comparison is
+indeterminate. Seclusor establishes metadata only when the operation covers
+every inline encrypted field or writes a bundle; a partial inline write instead
+refuses and directs you to `secrets rekey`. After rekey, name durable recipient
+sources explicitly with `--write-recipients PATH` so a later write does not
+restore a retired recipient from a stale list.
+
 Documents that establish top-level `recipients` metadata use schema v1.1.0.
 Older strict readers fail closed on those documents; documents without
 `recipients` remain compatible with older binaries.
@@ -49,17 +61,40 @@ store them outside of version control. See the
 [identity and recipients guide](identity-and-recipients.md) for full
 details on passphrase input channels and migration.
 
+### `secrets run` and passphrase channels
+
+Prefer **`--passphrase-file`** or **`--passphrase-stdin`** when launching
+commands with `secrets run`. The `--passphrase-env` channel is supported for
+CI, but:
+
+- the named variable is excluded from the **child** environment (v0.2.1+);
+- the passphrase still resides in the **parent** `seclusor` process environment
+  for the lifetime of that invocation;
+- `--allow` / `--deny` filter injected store keys only — they never controlled
+  ambient environment pass-through.
+
+Do not treat `--passphrase-env` as equivalent to file or stdin channels.
+
 ## Compromise Response
 
 If an identity or recipient key is believed compromised:
 
 1. Immediately stop using the affected identity.
-2. Generate new identities and recipients.
-3. Rekey all affected armored files (bundle or inline).
-4. Update any systems using the old keys.
-5. Audit git history if files were stored in version control (see App Note 01).
+2. **Upgrade to a patched seclusor** before rotating when a security release is
+   available (recipient divergence is fail-closed on current releases).
+3. Generate new identities and recipients.
+4. Rekey all affected armored files (bundle or inline), refreshing durable
+   recipient lists with `--write-recipients` (or rewrite and verify them by
+   hand) **before any further encrypted write**.
+5. Update any systems using the old keys.
+6. Audit git history if files were stored in version control (see App Note 01).
+7. If a process may have seen an identity passphrase via the environment,
+   treat credentials that process could reach as compromised, not only those
+   it was deliberately given.
 
 Old ciphertexts remain decryptable by the compromised key until rekeyed.
+Removing an identity file locally is not revocation while stores remain
+encrypted to that recipient.
 
 ## File Integrity and Signatures
 
