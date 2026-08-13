@@ -96,21 +96,35 @@ const PROTECTED_NO_TERMINAL_MSG: &str = "identity file is passphrase-protected b
      terminal is available. Provide --passphrase-env, \
      --passphrase-file, or --passphrase-stdin.";
 
+/// Normalize the single line read by interactive, file, and stdin channels.
+///
+/// Environment-sourced passphrases intentionally bypass this helper so an
+/// exact legacy value containing a carriage return remains usable for recovery.
+fn normalize_passphrase_line_ending(
+    mut value: String,
+    empty_message: &'static str,
+) -> CliResult<SecretString> {
+    if value.ends_with('\n') {
+        value.pop();
+    }
+    if value.ends_with('\r') {
+        value.pop();
+    }
+    if value.is_empty() {
+        return Err(CliError::Message(empty_message.to_string()));
+    }
+    Ok(SecretString::from(value))
+}
+
 /// Prompt on the controlling console via rpassword, after a device preflight.
 fn prompt_passphrase_interactive(prompt: &str, no_console_msg: &str) -> CliResult<SecretString> {
     if !interactive_console_available() {
         return Err(CliError::Message(no_console_msg.to_string()));
     }
     eprint!("{prompt}");
-    let pp = SecretString::from(
-        rpassword::read_password().map_err(|_| CliError::Message(no_console_msg.to_string()))?,
-    );
-    if pp.expose_secret().is_empty() {
-        return Err(CliError::Message(
-            "passphrase must not be empty".to_string(),
-        ));
-    }
-    Ok(pp)
+    let value =
+        rpassword::read_password().map_err(|_| CliError::Message(no_console_msg.to_string()))?;
+    normalize_passphrase_line_ending(value, "passphrase must not be empty")
 }
 
 /// Resolve a passphrase from the configured input channel.
@@ -155,35 +169,26 @@ pub(crate) fn resolve_passphrase(
     } else if let Some(path) = &args.passphrase_file {
         seclusor_crypto::assert_secure_permissions(path)?;
         assert_file_owned_by_current_user(path)?;
-        // Read file bytes and extract first line directly into SecretString
+        // Read file bytes and use only the first line.
         let bytes = fs::read(path)?;
         let first_newline = bytes
             .iter()
             .position(|&b| b == b'\n')
             .unwrap_or(bytes.len());
         let line_bytes = &bytes[..first_newline];
-        if line_bytes.is_empty() {
-            return Err(CliError::Message("passphrase file is empty".to_string()));
-        }
         let line_str = std::str::from_utf8(line_bytes)
             .map_err(|_| CliError::Message("passphrase file is not valid UTF-8".to_string()))?;
-        Ok(Some(SecretString::from(line_str.to_owned())))
+        Ok(Some(normalize_passphrase_line_ending(
+            line_str.to_owned(),
+            "passphrase file is empty",
+        )?))
     } else if args.passphrase_stdin {
-        // Read directly into SecretString via rpassword's stdin helper
-        // to avoid a plain String intermediate
-        let pp = SecretString::from({
-            let mut buf = String::new();
-            std::io::stdin().read_line(&mut buf)?;
-            let trimmed = buf.trim_end_matches('\n').trim_end_matches('\r').to_owned();
-            buf.clear();
-            trimmed
-        });
-        if pp.expose_secret().is_empty() {
-            return Err(CliError::Message(
-                "passphrase from stdin is empty".to_string(),
-            ));
-        }
-        Ok(Some(pp))
+        let mut value = String::new();
+        std::io::stdin().read_line(&mut value)?;
+        Ok(Some(normalize_passphrase_line_ending(
+            value,
+            "passphrase from stdin is empty",
+        )?))
     } else {
         Ok(None)
     }
@@ -378,6 +383,58 @@ mod tests {
 
     use crate::cli::{IdentityArgs, PassphraseArgs};
     use crate::error::CliError;
+
+    #[test]
+    fn line_oriented_passphrases_normalize_crlf_and_reject_blank_lines() {
+        let normalized =
+            normalize_passphrase_line_ending("synthetic-value\r\n".to_string(), "empty")
+                .expect("normalize CRLF");
+        let expected = "synthetic-value";
+        assert!(
+            normalized.expose_secret() == expected,
+            "normalized passphrase mismatch"
+        );
+
+        let err = normalize_passphrase_line_ending("\r\n".to_string(), "channel is empty")
+            .expect_err("CRLF-only input must be empty after normalization");
+        assert!(matches!(err, CliError::Message(ref message) if message == "channel is empty"));
+    }
+
+    #[test]
+    fn passphrase_file_normalizes_first_line_and_rejects_crlf_blank() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("passphrase.txt");
+        fs::write(&path, b"synthetic-value\r\nignored-second-line\n").expect("write file");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod");
+
+        let resolved = resolve_passphrase(
+            &PassphraseArgs {
+                passphrase_file: Some(path.clone()),
+                ..PassphraseArgs::default()
+            },
+            false,
+        )
+        .expect("resolve file")
+        .expect("passphrase");
+        let expected = "synthetic-value";
+        assert!(
+            resolved.expose_secret() == expected,
+            "resolved passphrase mismatch"
+        );
+
+        fs::write(&path, b"\r\nignored-second-line\n").expect("rewrite file");
+        let err = resolve_passphrase(
+            &PassphraseArgs {
+                passphrase_file: Some(path),
+                ..PassphraseArgs::default()
+            },
+            false,
+        )
+        .expect_err("CRLF-only first line must be rejected");
+        assert!(
+            matches!(err, CliError::Message(ref message) if message == "passphrase file is empty")
+        );
+    }
 
     #[test]
     fn resolve_identities_insecure_protected_file_fails_before_passphrase_probe() {

@@ -108,6 +108,14 @@ without relying solely on the tool is:
 printf '%s' "$VAR" | env -u VAR seclusor secrets run ... --passphrase-stdin -- <cmd>
 ```
 
+One recovery case requires the environment channel's exact-byte behavior. On
+v0.2.1 and later, an identity created from a CRLF-terminated passphrase file on
+v0.2.1 or earlier can be unlocked by supplying its legacy value, including the
+retained carriage return, through `--passphrase-env`. Immediately generate a
+replacement identity with normalized file or stdin input, rekey encrypted data
+to its recipient, retire the legacy identity, and unset the variable. Do not
+use this recovery workflow with `secrets run` on v0.2.0 or earlier.
+
 ## 4. Library / FFI integration
 
 - **Rust**: depend on `seclusor-crypto`, `seclusor-codec`, and/or `seclusor-keyring`

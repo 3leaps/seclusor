@@ -678,8 +678,15 @@ fn chmod_600(path: &Path) {
 fn chmod_600(_path: &Path) {}
 
 fn write_protected_run_fixture(extra_credentials: &[(&str, &str)]) -> ProtectedRunFixture {
+    write_protected_run_fixture_with_suffix(extra_credentials, "")
+}
+
+fn write_protected_run_fixture_with_suffix(
+    extra_credentials: &[(&str, &str)],
+    passphrase_suffix: &str,
+) -> ProtectedRunFixture {
     let seq = PP_FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let pp_value = format!("test-child-env-pp-{seq}-not-a-real-secret");
+    let pp_value = format!("test-child-env-pp-{seq}-not-a-real-secret{passphrase_suffix}");
     let pp_var = format!("SECLUSOR_TEST_PP_{}_{}", std::process::id(), seq);
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -775,6 +782,43 @@ fn run_protected(
     output
 }
 
+fn run_protected_with_stdin(fx: &ProtectedRunFixture, input: &[u8]) -> Output {
+    let fixture_dir = tempfile::tempdir().expect("tempdir");
+    let fixture = compile_fixture(fixture_dir.path(), "run-pp-stdin-normalization");
+    let mut child = Command::new(seclusor_bin());
+    child
+        .env("SECLUSOR_TEST_CAPTURE_KEYS", "APP_SIMPLE")
+        .args([
+            "secrets",
+            "run",
+            "--file",
+            fx.secrets.to_str().unwrap(),
+            "--project",
+            "demo",
+            "--identity-file",
+            fx.identity.to_str().unwrap(),
+            "--passphrase-stdin",
+            "--allow",
+            "APP_SIMPLE",
+            fixture.to_str().unwrap(),
+            "dump",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut process = child.spawn().expect("spawn seclusor");
+    {
+        use std::io::Write;
+        process
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(input)
+            .expect("write passphrase input");
+    }
+    process.wait_with_output().expect("wait")
+}
+
 #[test]
 fn run_passphrase_env_var_absent_from_child_with_sentinel_present() {
     let fx = write_protected_run_fixture(&[]);
@@ -801,6 +845,55 @@ fn run_passphrase_env_var_absent_from_child_with_sentinel_present() {
         payload["env"][&fx.pp_var].is_null(),
         "passphrase env var must not reach child: {}",
         payload["env"][&fx.pp_var]
+    );
+}
+
+#[test]
+fn run_passphrase_env_preserves_carriage_return_for_legacy_identity() {
+    let fx = write_protected_run_fixture_with_suffix(&[], "\r");
+    let fixture_dir = tempfile::tempdir().expect("tempdir");
+    let fixture = compile_fixture(fixture_dir.path(), "run-pp-legacy-cr");
+    let capture = [fx.pp_var.as_str(), "APP_SIMPLE"];
+    let output = run_protected(
+        &fx,
+        &["--allow", "APP_SIMPLE"],
+        &capture,
+        &[fixture.display().to_string(), "dump".to_string()],
+        &[],
+    );
+    assert!(
+        output.status.success(),
+        "raw environment passphrase must unlock the identity; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload = parsed_stdout(&output);
+    assert_eq!(payload["env"]["APP_SIMPLE"], "sk-sentinel-ok");
+    assert!(payload["env"][&fx.pp_var].is_null());
+}
+
+#[test]
+fn run_passphrase_stdin_normalizes_crlf_first_line() {
+    let fx = write_protected_run_fixture(&[]);
+    let input = format!("{}\r\nignored-second-line\n", fx.pp_value);
+    let output = run_protected_with_stdin(&fx, input.as_bytes());
+    assert!(
+        output.status.success(),
+        "normalized stdin passphrase must unlock the identity; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload = parsed_stdout(&output);
+    assert_eq!(payload["env"]["APP_SIMPLE"], "sk-sentinel-ok");
+}
+
+#[test]
+fn run_passphrase_stdin_rejects_crlf_blank_first_line() {
+    let fx = write_protected_run_fixture(&[]);
+    let output = run_protected_with_stdin(&fx, b"\r\nignored-second-line\n");
+    assert!(!output.status.success(), "blank stdin input must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("passphrase from stdin is empty"),
+        "unexpected redacted diagnostic: {stderr}"
     );
 }
 

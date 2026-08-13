@@ -8,6 +8,15 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+### Fixed
+
+- Interactive, file, and stdin passphrase channels now normalize a single
+  trailing LF or CRLF line ending consistently and reject input that is empty
+  after normalization. Environment passphrases remain byte-for-byte unchanged
+  so identities created from legacy CRLF passphrase files can be recovered on
+  v0.2.1 and later, then replaced by normalized-passphrase identities and
+  encrypted data rekeyed to the replacement recipients.
+
 ## [0.2.1] - 2026-08-11
 
 ### Security
