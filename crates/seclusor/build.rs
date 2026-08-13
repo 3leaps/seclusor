@@ -38,13 +38,13 @@ fn main() {
         .expect("workspace root")
         .to_path_buf();
     let docs_root = workspace_root.join("docs");
-    let manifest_path = docs_root.join("embed-manifest.yaml");
+    let manifest_path = docs_root.join("embed-manifest.json");
 
     println!("cargo:rerun-if-changed={}", manifest_path.display());
 
     let manifest_raw = fs::read_to_string(&manifest_path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", manifest_path.display()));
-    let manifest: EmbedManifest = serde_yaml::from_str(&manifest_raw)
+    let manifest: EmbedManifest = serde_json::from_str(&manifest_raw)
         .unwrap_or_else(|e| panic!("invalid {}: {e}", manifest_path.display()));
 
     if manifest.version != "1.0.0" {
