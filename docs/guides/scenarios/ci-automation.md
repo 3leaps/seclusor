@@ -29,6 +29,13 @@ is excluded from the **child** environment. It still exists in the parent
 `--passphrase-file` or `--passphrase-stdin` when the runner can supply them;
 `--allow` / `--deny` only filter which store keys are injected.
 
+For recovery on v0.2.1 and later only, `--passphrase-env` can supply the exact
+legacy value needed by an identity created from a CRLF-terminated passphrase
+file on v0.2.1 or earlier. Use it only to unlock that identity, then create a
+replacement identity with normalized file or stdin input, rekey encrypted data,
+retire the legacy identity, and unset the variable. Do not use this recovery
+workflow with `secrets run` on v0.2.0 or earlier.
+
 ## GitHub Actions example
 
 Store two secrets in your GitHub repository settings:

@@ -75,6 +75,15 @@ CI, but:
 
 Do not treat `--passphrase-env` as equivalent to file or stdin channels.
 
+There is one narrow recovery exception on v0.2.1 and later. An identity created
+with a CRLF-terminated passphrase file on v0.2.1 or earlier may require the
+retained carriage-return byte. Supply that exact legacy value through
+`--passphrase-env` only long enough to unlock the identity, generate a
+replacement identity using normalized file or stdin input, rekey encrypted data
+to the replacement recipient, retire the legacy identity, and unset the
+variable. Do not use this environment recovery workflow with `secrets run` on
+v0.2.0 or earlier, where the named variable can reach the child process.
+
 ## Compromise Response
 
 If an identity or recipient key is believed compromised:
