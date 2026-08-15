@@ -1,0 +1,15 @@
+{
+  "schema": "seclusor.signature.v1",
+  "algorithm": "Ed25519",
+  "digest": {
+    "algorithm": "SHA-256",
+    "value": "cgzOvjh0HfjERslGURcNUtPs3ihMIU5OUrGuyNI9kmM"
+  },
+  "signature": "-i5KFP8fTscuc_I1oR9-gBo21vL6Hblos4J4pYdu2vr3dHl4dQJ4932RgvQKUgJIOIeaYMCqEOUZ_X4eLgTsCw",
+  "public_key": "IVL40Zt5HSRFMkLhXy6rbLfP-ntqXtMAl5YOBpiB2xI",
+  "key_fingerprint": "MJfi3uLLSjS1OEDNtwWu1xBnw29o2w4PVZw_P6BDMV8",
+  "signer": {
+    "label": "release-signing",
+    "claimed_at": "2026-05-11T00:00:00Z"
+  }
+}

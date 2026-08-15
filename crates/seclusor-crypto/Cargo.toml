@@ -10,13 +10,13 @@ path = "src/lib.rs"
 
 [features]
 default = []
-signing = ["dep:ed25519-dalek", "dep:rand_core", "dep:zeroize"]
+signing = ["dep:ed25519-dalek", "dep:getrandom", "dep:zeroize"]
 
 [dependencies]
 age = { workspace = true, features = ["armor"] }
 base64 = { workspace = true }
-ed25519-dalek = { version = "2", optional = true, default-features = false, features = ["rand_core", "zeroize"] }
-rand_core = { version = "0.6", optional = true, features = ["getrandom"] }
+ed25519-dalek = { version = "3", optional = true, default-features = false, features = ["zeroize"] }
+getrandom = { version = "0.4", optional = true }
 seclusor-core = { workspace = true }
 thiserror = { workspace = true }
 zeroize = { version = "1", optional = true, features = ["derive"] }
