@@ -397,6 +397,26 @@ pub(crate) fn emit_write_recipient_policy_notices(resolved: &ResolvedWriteRecipi
     }
 }
 
+/// Warn when none of the identities already loaded for a write belongs to the
+/// target recipient set.
+///
+/// This notice is advisory only. Callers must not resolve identities solely to
+/// emit it, and recipient-policy failures must be handled before it is called.
+pub(crate) fn emit_self_lockout_warning(identities: &[Identity], target_recipients: &[String]) {
+    let identity_matches = identities.iter().any(|identity| {
+        let public = identity.to_public().to_string();
+        target_recipients
+            .iter()
+            .any(|recipient| recipient == &public)
+    });
+    if !identity_matches {
+        eprintln!(
+            "warning: none of the loaded identities corresponds to the target recipient set; \
+             this write may produce a document that is not decryptable with the supplied identities"
+        );
+    }
+}
+
 // Test-only: count of establishment notices emitted (for post-commit-only proofs).
 #[cfg(test)]
 thread_local! {

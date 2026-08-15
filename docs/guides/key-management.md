@@ -71,9 +71,11 @@ Seclusor prints an explicit indeterminate notice and establishes metadata from
 the target set. It does not infer recipient identities from the age header,
 because X25519 stanzas do not reveal them.
 
-If none of the identities loaded for rekey corresponds to the target set,
-seclusor warns about possible operator self-lockout. This warning is expected
-when rotating with only the old identity loaded; verify the result with a new
+If none of the identities already loaded for an identity-bearing encrypted
+write corresponds to the target set, seclusor warns about possible operator
+self-lockout. This applies to `rekey` and to encrypted `set` / `import-env`
+writes. The advisory is not a decryption guarantee. It is expected when
+rotating with only the old identity loaded; verify the result with a new
 identity before retiring the old one.
 
 ### Glassbreak / High-Value Credential Archives

@@ -9,23 +9,24 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
+use crate::atomic_write::{atomic_write_ciphertext, atomic_write_public_data, AtomicWriteOptions};
+use crate::cli::RekeyArgs;
+use crate::error::{CliError, CliResult};
+use crate::handlers::encrypted_write::{
+    apply_establishment, emit_establishment_notice, emit_recipient_comparison_indeterminate_notice,
+    emit_self_lockout_warning, recipient_strings, refuse_scrypt_bundle_write,
+    render_recipient_delta,
+};
+use crate::io::{probe_write_target, WriteTargetProbe};
+use crate::resolve::{resolve_identities_with_sources, resolve_recipients};
 use seclusor_codec::{
     ensure_no_plaintext_credential_values, mutate_bundle, reencrypt_all_inline, DocumentSource,
 };
 use seclusor_core::constants::MAX_SECRETS_DOC_BYTES;
 use seclusor_core::validate::{compare_recipient_sets, validate_strict, RecipientSetRelation};
 use seclusor_core::SeclusorError;
+#[cfg(test)]
 use seclusor_crypto::Identity;
-
-use crate::atomic_write::{atomic_write_ciphertext, atomic_write_public_data, AtomicWriteOptions};
-use crate::cli::RekeyArgs;
-use crate::error::{CliError, CliResult};
-use crate::handlers::encrypted_write::{
-    apply_establishment, emit_establishment_notice, emit_recipient_comparison_indeterminate_notice,
-    recipient_strings, refuse_scrypt_bundle_write, render_recipient_delta,
-};
-use crate::io::{probe_write_target, WriteTargetProbe};
-use crate::resolve::{resolve_identities_with_sources, resolve_recipients};
 
 #[cfg(test)]
 pub(crate) fn handle_rekey(args: RekeyArgs) -> CliResult<()> {
@@ -87,10 +88,9 @@ pub(crate) fn handle_rekey_with_policy(
             let policy_notices = evaluate_rekey_recipient_policy(
                 secrets.recipients.as_deref(),
                 &new_strings,
-                &identities,
                 allow_recipient_mismatch,
             )?;
-            emit_rekey_self_lockout_warning(&policy_notices);
+            emit_self_lockout_warning(&identities, &new_strings);
             // Optional equality: if metadata present and explicit matches, still rekey
             // (rekey *is* allowed to change the set — skip equality fail).
             // Stanza tripwire: only refuse if metadata claims N but fields disagree.
@@ -163,13 +163,12 @@ pub(crate) fn handle_rekey_with_policy(
                 let notices = evaluate_rekey_recipient_policy(
                     secrets.recipients.as_deref(),
                     &new_strings,
-                    &identities,
                     allow_recipient_mismatch,
                 )
                 .map_err(|error| {
                     seclusor_codec::CodecError::Core(SeclusorError::Validation(error.to_string()))
                 })?;
-                emit_rekey_self_lockout_warning(&notices);
+                emit_self_lockout_warning(&identities, &new_strings);
                 policy_notices = Some(notices);
                 secrets
                     .establish_recipients(new_strings.clone())
@@ -208,10 +207,9 @@ pub(crate) fn handle_rekey_with_policy(
             let policy_notices = evaluate_rekey_recipient_policy(
                 secrets.recipients.as_deref(),
                 &new_strings,
-                &identities,
                 allow_recipient_mismatch,
             )?;
-            emit_rekey_self_lockout_warning(&policy_notices);
+            emit_self_lockout_warning(&identities, &new_strings);
             let result = reencrypt_all_inline(&secrets, &identities, &new_recipients)?;
             secrets = result.secrets;
             apply_establishment(&mut secrets, &new_strings)?;
@@ -247,10 +245,9 @@ pub(crate) fn handle_rekey_with_policy(
             let policy_notices = evaluate_rekey_recipient_policy(
                 secrets.recipients.as_deref(),
                 &new_strings,
-                &identities,
                 allow_recipient_mismatch,
             )?;
-            emit_rekey_self_lockout_warning(&policy_notices);
+            emit_self_lockout_warning(&identities, &new_strings);
             let result = reencrypt_all_inline(&secrets, &identities, &new_recipients)?;
             secrets = result.secrets;
             apply_establishment(&mut secrets, &new_strings)?;
@@ -293,13 +290,11 @@ pub(crate) fn handle_rekey_with_policy(
 #[derive(Debug)]
 struct RekeyPolicyNotices {
     relation: RecipientSetRelation,
-    self_lockout: bool,
 }
 
 fn evaluate_rekey_recipient_policy(
     document_recipients: Option<&[String]>,
     target_recipients: &[String],
-    identities: &[Identity],
     allow_mismatch: bool,
 ) -> CliResult<RekeyPolicyNotices> {
     let relation = compare_recipient_sets(document_recipients, target_recipients);
@@ -313,17 +308,7 @@ fn evaluate_rekey_recipient_policy(
         }
     }
 
-    let self_lockout = !identities.iter().any(|identity| {
-        let public = identity.to_public().to_string();
-        target_recipients
-            .iter()
-            .any(|recipient| recipient == &public)
-    });
-
-    Ok(RekeyPolicyNotices {
-        relation,
-        self_lockout,
-    })
+    Ok(RekeyPolicyNotices { relation })
 }
 
 fn emit_rekey_policy_notices(notices: &RekeyPolicyNotices) {
@@ -336,15 +321,6 @@ fn emit_rekey_policy_notices(notices: &RekeyPolicyNotices) {
         RecipientSetRelation::Indeterminate => {
             emit_recipient_comparison_indeterminate_notice();
         }
-    }
-}
-
-fn emit_rekey_self_lockout_warning(notices: &RekeyPolicyNotices) {
-    if notices.self_lockout {
-        eprintln!(
-            "warning: none of the loaded identities corresponds to the target recipient set; \
-             this write may produce a document that is not decryptable with the supplied identities"
-        );
     }
 }
 
