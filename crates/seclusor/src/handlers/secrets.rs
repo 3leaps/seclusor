@@ -22,7 +22,7 @@ use crate::env_support::resolve_export_env_vars;
 use crate::error::{CliError, CliResult};
 use crate::handlers::encrypted_write::{
     apply_establishment, commit_bundle_mutation, commit_inline_ciphertext_document,
-    emit_establishment_notice, emit_write_recipient_policy_notices,
+    emit_establishment_notice, emit_self_lockout_warning, emit_write_recipient_policy_notices,
     ensure_inline_stanza_count_matches, inline_establishment_coverage_ok,
     load_inline_full_for_write, recipient_channels_present, recipient_strings,
     refuse_scrypt_bundle_write, resolve_set_material, resolve_write_recipients, SetMaterial,
@@ -280,6 +280,7 @@ fn handle_set_inline_encrypted(
 
             commit_inline_ciphertext_document(&args.file, prior_bytes, &out)?;
             emit_write_recipient_policy_notices(&resolved);
+            emit_self_lockout_warning(&identities, &resolved.as_strings);
             println!("ok");
             Ok(())
         }
@@ -384,6 +385,7 @@ fn handle_set_bundle_encrypted(
         },
     )?;
     emit_write_recipient_policy_notices(&resolved);
+    emit_self_lockout_warning(&identities, &resolved.as_strings);
     println!("ok");
     Ok(())
 }
@@ -1095,6 +1097,7 @@ fn handle_import_env_inline(
     }
     commit_inline_ciphertext_document(&args.file, prior_bytes, &working)?;
     emit_write_recipient_policy_notices(&resolved);
+    emit_self_lockout_warning(&identities, &resolved.as_strings);
     println!("{count}");
     Ok(())
 }
@@ -1145,6 +1148,7 @@ fn handle_import_env_bundle(
         },
     )?;
     emit_write_recipient_policy_notices(&resolved);
+    emit_self_lockout_warning(&identities, &resolved.as_strings);
     println!("{count}");
     Ok(())
 }

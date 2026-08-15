@@ -11,6 +11,10 @@ fn seclusor_bin() -> &'static str {
     env!("CARGO_BIN_EXE_seclusor")
 }
 
+const SELF_LOCKOUT_WARNING: &str =
+    "warning: none of the loaded identities corresponds to the target recipient set; \
+     this write may produce a document that is not decryptable with the supplied identities";
+
 fn run_seclusor(args: &[&str]) -> std::process::Output {
     Command::new(seclusor_bin())
         .args(args)
@@ -323,8 +327,6 @@ fn process_set_inline_with_recipient_covers_single_field_doc() {
             "API_KEY",
             "--value-env",
             "SECLUSOR_TEST_SET_VALUE",
-            "--recipient",
-            recipient,
             "--identity-file",
             identity.to_str().unwrap(),
         ])
@@ -337,6 +339,10 @@ fn process_set_inline_with_recipient_covers_single_field_doc() {
         String::from_utf8_lossy(&set.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&set.stdout), "ok\n");
+    assert!(
+        !String::from_utf8_lossy(&set.stderr).contains(SELF_LOCKOUT_WARNING),
+        "matching loaded identity must not warn"
+    );
     let after: serde_json::Value =
         serde_json::from_slice(&fs::read(&inline).unwrap()).expect("parse");
     assert_eq!(after["schema_version"], "v1.1.0");
@@ -345,6 +351,50 @@ fn process_set_inline_with_recipient_covers_single_field_doc() {
         .as_str()
         .unwrap();
     assert!(ct.starts_with("sec:age:v1:"));
+
+    let other_identity = dir.path().join("other-identity.txt");
+    let other_generated = run_seclusor(&[
+        "keys",
+        "age",
+        "identity",
+        "generate",
+        "--output",
+        other_identity.to_str().unwrap(),
+    ]);
+    assert!(other_generated.status.success());
+    let other_recipient = String::from_utf8(other_generated.stdout).unwrap();
+    let rotated = Command::new(seclusor_bin())
+        .args([
+            "secrets",
+            "set",
+            "--file",
+            inline.to_str().unwrap(),
+            "--project",
+            "demo",
+            "--key",
+            "API_KEY",
+            "--value-env",
+            "SECLUSOR_TEST_SET_VALUE",
+            "--recipient",
+            other_recipient.trim(),
+            "--identity-file",
+            identity.to_str().unwrap(),
+            "--allow-recipient-mismatch",
+        ])
+        .env("SECLUSOR_TEST_SET_VALUE", "rotated-secret")
+        .output()
+        .expect("run rotated set");
+    assert!(
+        rotated.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&rotated.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&rotated.stdout), "ok\n");
+    let rotated_stderr = String::from_utf8_lossy(&rotated.stderr);
+    assert!(rotated_stderr.contains("recipient set change accepted"));
+    assert!(rotated_stderr.contains(SELF_LOCKOUT_WARNING));
+    assert!(!rotated_stderr.contains("fresh-secret"));
+    assert!(!rotated_stderr.contains("rotated-secret"));
 }
 
 #[test]
@@ -408,8 +458,6 @@ fn process_import_env_inline_encrypted_happy_and_mismatch() {
         "APP_",
         "--dotenv-file",
         dotenv.to_str().unwrap(),
-        "--recipient",
-        recipient,
         "--identity-file",
         identity.to_str().unwrap(),
     ]);
@@ -419,6 +467,10 @@ fn process_import_env_inline_encrypted_happy_and_mismatch() {
         String::from_utf8_lossy(&import.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&import.stdout).trim(), "1");
+    assert!(
+        !String::from_utf8_lossy(&import.stderr).contains(SELF_LOCKOUT_WARNING),
+        "matching loaded identity must not warn"
+    );
 
     // Mismatch recipients refuse without mutating.
     let before = fs::read(&inline).expect("before");
@@ -481,7 +533,9 @@ fn process_import_env_inline_encrypted_happy_and_mismatch() {
     assert!(allowed_stderr.contains("recipient set change accepted"));
     assert!(allowed_stderr.contains(&format!("  +{other_r}")));
     assert!(allowed_stderr.contains(&format!("  -{recipient}")));
+    assert!(allowed_stderr.contains(SELF_LOCKOUT_WARNING));
     assert!(!allowed_stderr.contains("AGE-SECRET"));
+    assert!(!allowed_stderr.contains("from-process"));
     let rotated: seclusor_core::SecretsFile =
         serde_json::from_slice(&fs::read(&inline).expect("read rotated inline"))
             .expect("parse rotated inline");
@@ -556,7 +610,9 @@ fn process_import_env_inline_encrypted_happy_and_mismatch() {
     assert!(bundle_stderr.contains("recipient set change accepted"));
     assert!(bundle_stderr.contains(&format!("  +{other_r}")));
     assert!(bundle_stderr.contains(&format!("  -{recipient}")));
+    assert!(bundle_stderr.contains(SELF_LOCKOUT_WARNING));
     assert!(!bundle_stderr.contains("AGE-SECRET"));
+    assert!(!bundle_stderr.contains("from-process"));
 
     let decrypted = dir.path().join("bundle-decrypted.json");
     let bundle_decrypt = run_seclusor(&[
