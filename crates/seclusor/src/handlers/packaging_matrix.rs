@@ -76,6 +76,7 @@ mod tests {
             description: None,
             create_project: false,
             value_stdin: false,
+            echo_value: false,
             value_file: None,
             value_env: None,
             recipients: RecipientArgs {
@@ -107,6 +108,7 @@ mod tests {
             description: None,
             create_project: false,
             value_stdin: false,
+            echo_value: false,
             value_file: None,
             value_env: None,
             recipients: RecipientArgs {
@@ -144,6 +146,7 @@ mod tests {
             description: None,
             create_project: false,
             value_stdin: false,
+            echo_value: false,
             value_file: None,
             value_env: None,
             recipients: RecipientArgs {
@@ -174,6 +177,7 @@ mod tests {
             description: None,
             create_project: false,
             value_stdin: false,
+            echo_value: false,
             value_file: None,
             value_env: None,
             recipients: RecipientArgs {
@@ -357,6 +361,7 @@ mod tests {
             description: None,
             create_project: false,
             value_stdin: false,
+            echo_value: false,
             value_file: None,
             value_env: None,
             recipients: RecipientArgs {
@@ -450,6 +455,7 @@ mod tests {
             description: None,
             create_project: false,
             value_stdin: false,
+            echo_value: false,
             value_file: None,
             value_env: None,
             recipients: RecipientArgs {
@@ -708,6 +714,7 @@ mod tests {
             description: None,
             create_project: false,
             value_stdin: false,
+            echo_value: false,
             value_file: None,
             value_env: None,
             recipients: RecipientArgs {
@@ -762,6 +769,7 @@ mod tests {
                 description: None,
                 create_project: false,
                 value_stdin: false,
+                echo_value: false,
                 value_file: None,
                 value_env: None,
                 recipients: RecipientArgs {

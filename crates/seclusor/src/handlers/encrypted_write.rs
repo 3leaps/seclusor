@@ -482,6 +482,7 @@ pub(crate) fn load_inline_full_for_write(
 pub(crate) struct ValueChannelArgs {
     pub value: Option<String>,
     pub value_stdin: bool,
+    pub echo_value: bool,
     pub value_file: Option<std::path::PathBuf>,
     pub value_env: Option<String>,
     pub reference: Option<String>,
@@ -524,12 +525,75 @@ impl SetMaterial {
 /// Max plaintext value size for set channels (matches inline crypto limit).
 pub(crate) const MAX_SET_VALUE_BYTES: usize = seclusor_core::constants::MAX_INLINE_PLAINTEXT_BYTES;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StdinValueMode {
+    NotSelected,
+    Hidden,
+    Stream,
+}
+
+fn classify_stdin_value_mode(
+    value_stdin: bool,
+    echo_value: bool,
+    stdin_is_terminal: bool,
+) -> CliResult<StdinValueMode> {
+    if echo_value && (!value_stdin || !stdin_is_terminal) {
+        return Err(CliError::Message(
+            "--echo-value requires --value-stdin with terminal stdin".to_string(),
+        ));
+    }
+    if !value_stdin {
+        Ok(StdinValueMode::NotSelected)
+    } else if stdin_is_terminal && !echo_value {
+        Ok(StdinValueMode::Hidden)
+    } else {
+        Ok(StdinValueMode::Stream)
+    }
+}
+
+fn stdin_is_terminal() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal()
+}
+
+/// Validate the terminal-only echo switch before target, passphrase, or value
+/// I/O. The later material resolver repeats the check at the read boundary.
+pub(crate) fn validate_set_value_input_flags(
+    value_stdin: bool,
+    echo_value: bool,
+    has_other_material: bool,
+) -> CliResult<()> {
+    validate_set_value_input_flags_with_other(value_stdin, echo_value, has_other_material)
+        .map(|_| ())
+}
+
+fn validate_set_value_input_flags_with_other(
+    value_stdin: bool,
+    echo_value: bool,
+    has_other_material: bool,
+) -> CliResult<StdinValueMode> {
+    if echo_value && has_other_material {
+        return Err(CliError::Message(
+            "--echo-value may only be used with --value-stdin".to_string(),
+        ));
+    }
+    classify_stdin_value_mode(value_stdin, echo_value, stdin_is_terminal())
+}
+
 /// Read set material from mutually exclusive channels.
 ///
 /// Legacy `--value` is accepted with a stderr warning. Value bodies never appear
 /// in returned errors. Stdin/file reads are bounded before allocation; buffers
 /// are zeroizing from earliest ownership with no plaintext `to_vec` clone.
 pub(crate) fn resolve_set_material(mut channels: ValueChannelArgs) -> CliResult<SetMaterial> {
+    let stdin_mode = validate_set_value_input_flags_with_other(
+        channels.value_stdin,
+        channels.echo_value,
+        channels.value.is_some()
+            || channels.value_file.is_some()
+            || channels.value_env.is_some()
+            || channels.reference.is_some(),
+    )?;
     let value_sources = [
         channels.value.is_some(),
         channels.value_stdin,
@@ -576,7 +640,16 @@ pub(crate) fn resolve_set_material(mut channels: ValueChannelArgs) -> CliResult<
     }
 
     if channels.value_stdin {
-        return Ok(SetMaterial::Value(read_value_stdin_bounded()?));
+        let value = match stdin_mode {
+            StdinValueMode::Hidden => read_value_hidden_bounded()?,
+            StdinValueMode::Stream => read_value_stdin_bounded()?,
+            StdinValueMode::NotSelected => {
+                return Err(CliError::Message(
+                    "internal: missing stdin value mode".to_string(),
+                ));
+            }
+        };
+        return Ok(SetMaterial::Value(value));
     }
 
     if let Some(path) = channels.value_file.take() {
@@ -601,9 +674,7 @@ pub(crate) fn resolve_set_material(mut channels: ValueChannelArgs) -> CliResult<
 fn guard_owned_value_string(v: String) -> CliResult<Zeroizing<Vec<u8>>> {
     let guarded = Zeroizing::new(v.into_bytes());
     if guarded.len() > MAX_SET_VALUE_BYTES {
-        return Err(CliError::Message(format!(
-            "value exceeds maximum size of {MAX_SET_VALUE_BYTES} bytes"
-        )));
+        return Err(value_too_large_error());
     }
     Ok(guarded)
 }
@@ -615,6 +686,31 @@ fn ensure_utf8_zeroizing(bytes: &Zeroizing<Vec<u8>>) -> CliResult<()> {
     Ok(())
 }
 
+fn value_too_large_error() -> CliError {
+    CliError::Message(format!(
+        "value exceeds maximum size of {MAX_SET_VALUE_BYTES} bytes"
+    ))
+}
+
+fn read_value_hidden_bounded() -> CliResult<Zeroizing<Vec<u8>>> {
+    use crate::hidden_input::{read_hidden_line_bounded, HiddenInputError};
+
+    let bytes = read_hidden_line_bounded(MAX_SET_VALUE_BYTES).map_err(|err| match err {
+        HiddenInputError::Unavailable => CliError::Message(
+            "no interactive terminal available for hidden value input".to_string(),
+        ),
+        HiddenInputError::Interrupted => {
+            CliError::Message("hidden value input interrupted".to_string())
+        }
+        HiddenInputError::Read => {
+            CliError::Message("failed to read hidden value from terminal".to_string())
+        }
+        HiddenInputError::TooLong => value_too_large_error(),
+    })?;
+    ensure_utf8_zeroizing(&bytes)?;
+    Ok(bytes)
+}
+
 fn read_value_stdin_bounded() -> CliResult<Zeroizing<Vec<u8>>> {
     use std::io::Read;
     let mut limited = std::io::stdin().take((MAX_SET_VALUE_BYTES as u64) + 1);
@@ -623,9 +719,7 @@ fn read_value_stdin_bounded() -> CliResult<Zeroizing<Vec<u8>>> {
         .read_to_end(&mut bytes)
         .map_err(|_| CliError::Message("failed to read value from stdin".to_string()))?;
     if bytes.len() > MAX_SET_VALUE_BYTES {
-        return Err(CliError::Message(format!(
-            "value exceeds maximum size of {MAX_SET_VALUE_BYTES} bytes"
-        )));
+        return Err(value_too_large_error());
     }
     if bytes.ends_with(b"\n") {
         bytes.pop();
@@ -648,9 +742,7 @@ fn read_value_file_bounded(path: &Path) -> CliResult<Zeroizing<Vec<u8>>> {
         CliError::Message(format!("failed to read --value-file {}", path.display()))
     })?;
     if bytes.len() > MAX_SET_VALUE_BYTES {
-        return Err(CliError::Message(format!(
-            "value exceeds maximum size of {MAX_SET_VALUE_BYTES} bytes"
-        )));
+        return Err(value_too_large_error());
     }
     ensure_utf8_zeroizing(&bytes)?;
     Ok(bytes)
@@ -835,5 +927,40 @@ mod tests {
         .expect_err("conflict");
         assert!(err.to_string().contains("at most one value channel"));
         assert!(!err.to_string().contains("a\n") || !err.to_string().ends_with('a'));
+    }
+
+    #[test]
+    fn stdin_value_mode_uses_stdin_terminal_status_only() {
+        assert_eq!(
+            classify_stdin_value_mode(true, false, true).expect("tty hidden"),
+            StdinValueMode::Hidden
+        );
+        assert_eq!(
+            classify_stdin_value_mode(true, true, true).expect("tty echo"),
+            StdinValueMode::Stream
+        );
+        // A controlling console may still exist in this case; it is
+        // intentionally not an input to the classifier, so a pipe cannot be
+        // diverted into the hidden-console path.
+        assert_eq!(
+            classify_stdin_value_mode(true, false, false).expect("pipe"),
+            StdinValueMode::Stream
+        );
+    }
+
+    #[test]
+    fn echo_value_flag_matrix_fails_closed_before_io() {
+        for (value_stdin, stdin_is_terminal) in [(false, false), (false, true), (true, false)] {
+            let err = classify_stdin_value_mode(value_stdin, true, stdin_is_terminal)
+                .expect_err("invalid echo flag combination");
+            assert_eq!(
+                err.to_string(),
+                "--echo-value requires --value-stdin with terminal stdin"
+            );
+        }
+        assert_eq!(
+            classify_stdin_value_mode(false, false, false).expect("not selected"),
+            StdinValueMode::NotSelected
+        );
     }
 }

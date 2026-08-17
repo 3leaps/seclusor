@@ -1331,6 +1331,89 @@ fn process_plaintext_set_stdout_ok() {
 }
 
 #[test]
+fn process_piped_value_stdin_preserves_contract_and_rejects_echo_flag() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("secrets.json");
+    write_plaintext_fixture(&path);
+
+    let entered_value = b"piped-value-fixture";
+    let mut child = Command::new(seclusor_bin())
+        .args([
+            "secrets",
+            "set",
+            "--file",
+            path.to_str().expect("utf8"),
+            "--project",
+            "demo",
+            "--key",
+            "API_KEY",
+            "--value-stdin",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn piped set");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(&[entered_value.as_slice(), b"\r\n"].concat())
+        .expect("write piped value");
+    let output = child.wait_with_output().expect("wait piped set");
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"ok\n");
+    assert!(output.stderr.is_empty());
+
+    let revealed = run_seclusor(&[
+        "secrets",
+        "get",
+        "--file",
+        path.to_str().expect("utf8"),
+        "--project",
+        "demo",
+        "--key",
+        "API_KEY",
+        "--reveal",
+    ]);
+    assert!(revealed.status.success());
+    assert_eq!(revealed.stdout, [entered_value.as_slice(), b"\n"].concat());
+
+    let before = fs::read(&path).expect("before rejected echo");
+    let rejected = Command::new(seclusor_bin())
+        .args([
+            "secrets",
+            "set",
+            "--file",
+            path.to_str().expect("utf8"),
+            "--project",
+            "demo",
+            "--key",
+            "API_KEY",
+            "--value-stdin",
+            "--echo-value",
+        ])
+        .stdin(Stdio::piped())
+        .output()
+        .expect("run rejected echo");
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert!(
+        stderr.contains("--echo-value requires --value-stdin with terminal stdin"),
+        "stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains(std::str::from_utf8(entered_value).expect("fixture utf8")),
+        "stderr must not contain prior value"
+    );
+    assert_eq!(fs::read(&path).expect("after rejected echo"), before);
+}
+
+#[test]
 fn process_plaintext_unset_stdout_ok() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("secrets.json");

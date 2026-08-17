@@ -49,17 +49,18 @@ pub(crate) fn resolve_recipients(args: &RecipientArgs) -> CliResult<Vec<Recipien
     Ok(recipients)
 }
 
-/// True when `rpassword` can open a controlling console.
+/// True when interactive readers can open a controlling console.
 ///
 /// rpassword 7.x does **not** read stdin: it opens `/dev/tty` (Unix) or
-/// `CONIN$` (Windows). Checking `stdin().is_terminal()` is therefore wrong —
-/// it refuses valid interactive use with redirected stdin (pipeline input)
-/// while a controlling TTY remains available for the passphrase prompt.
+/// `CONIN$` (Windows). Passphrase prompting uses this directly. Hidden value
+/// input first classifies with `stdin().is_terminal()` and calls this only
+/// after terminal stdin selects the hidden path; this helper must never divert
+/// piped value input to a controlling console.
 ///
 /// Preflight here mirrors the device rpassword opens so we fail closed before
 /// calling `read_password`, which can block indefinitely on some Windows
 /// noninteractive runners instead of returning an error.
-fn interactive_console_available() -> bool {
+pub(crate) fn interactive_console_available() -> bool {
     #[cfg(unix)]
     {
         use std::io::IsTerminal;

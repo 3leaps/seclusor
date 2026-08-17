@@ -6,6 +6,7 @@ mod cli;
 mod env_support;
 mod error;
 mod handlers;
+mod hidden_input;
 mod io;
 mod lenient;
 mod resolve;

@@ -27,6 +27,13 @@ Every credential stores exactly one of `--value` or `--ref`:
   seclusor secrets set --key DB_PASSWORD --value "s3cret"
   ```
 
+  Prefer `--value-stdin`, `--value-file`, or `--value-env` so the value does
+  not appear in process arguments. On a terminal, `--value-stdin` hides input
+  by default and accepts Enter; `--echo-value` explicitly restores visible
+  terminal input and its EOF terminator. Piped or redirected stdin keeps its
+  existing byte-stream behavior and rejects `--echo-value`. This input switch
+  is distinct from `secrets get --reveal`, which controls output.
+
 - **`--ref`** stores a pointer to a secret held elsewhere — a vault path,
   environment variable name, cloud secret manager ARN, or any URI your
   toolchain resolves at runtime. Seclusor stores and encrypts the reference
