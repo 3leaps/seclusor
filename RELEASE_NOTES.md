@@ -2,12 +2,44 @@
 
 **Content policy**: This file contains the most recent 3 releases (reverse chronological). Older releases are archived in `docs/releases/vX.Y.Z.md`.
 
+## v0.2.2 (August 2026)
+
+**Safer interactive input and compatibility-focused maintenance** — Hide
+terminal value entry by default, normalize line-oriented passphrases across
+platforms, extend encrypted-write self-lockout advisories, and refresh private
+signing and build dependencies without changing public formats.
+
+- **Interactive values:** terminal `secrets set --value-stdin` hides input and
+  accepts Enter; explicit `--echo-value` restores visible entry and its existing
+  EOF terminator. Piped and redirected stdin behavior is unchanged
+- **Passphrases:** interactive, file, and stdin channels normalize one trailing
+  LF or CRLF and reject empty normalized input; environment input remains
+  byte-for-byte unchanged for narrow legacy recovery
+- **Encrypted writes:** `set` and `import-env` warn when none of the already
+  loaded identities belongs to the target recipient set; the advisory does not
+  replace fail-closed recipient policy or post-write verification
+- **Compatibility:** signing, digest, entropy, error, and embedded-doc build
+  dependencies are refreshed with byte-exact signing-envelope coverage and no
+  public API or data-format changes
+
+**Upgrade cue:** scripts using piped input require no change. Interactive
+`--value-stdin` now hides input and closes on Enter; add `--echo-value` only for
+deliberate visible terminal entry.
+
+The `secrets run` child-environment issue fixed in v0.2.1 is documented in
+[GHSA-2w88-3q86-736g](https://github.com/3leaps/seclusor/security/advisories/GHSA-2w88-3q86-736g).
+
+**Install** (after the GitHub release is published):
+`brew upgrade seclusor` · `scoop update seclusor`
+
+See `docs/releases/v0.2.2.md` for full notes, compatibility, and residuals.
+
 ## v0.2.1 (August 2026)
 
 **Security patch** — Keep the identity passphrase out of processes launched by
 `secrets run`, and stop a stale recipients list from silently restoring a
-retired recipient after rotation. GitHub Security Advisory published with this
-release.
+retired recipient after rotation. The published advisory is
+[GHSA-2w88-3q86-736g](https://github.com/3leaps/seclusor/security/advisories/GHSA-2w88-3q86-736g).
 
 - **`secrets run`:** the `--passphrase-env` variable is excluded from the child
   environment through a single construction chokepoint; the command also
@@ -60,15 +92,5 @@ binaries.
 `scoop bucket add 3leaps https://github.com/3leaps/scoop-bucket && scoop install seclusor`
 
 See `docs/releases/v0.2.0.md` for full notes and upgrade guidance.
-
-## v0.1.6 (April 2026)
-
-**Inline runtime decryption fix and workflow scenarios guide** — Fixes a bug where inline-encrypted values were not decrypted at runtime, and adds comprehensive end-to-end workflow documentation.
-
-- **Bug fix (SC-012)**: `secrets run`, `secrets get`, and `secrets export-env` now correctly decrypt `sec:age:v1:` inline-encrypted values when identity files are provided. Previously these commands returned raw ciphertext for inline-encrypted documents
-- **Workflow scenarios (SC-014)**: 7 new embedded docs in `docs/guides/scenarios/` covering bundle, inline, blob, CI/automation, team recipients, and a quick-reference command table. Available via `seclusor docs show scenarios/index`
-- **Docs fix**: Corrected stale flag names in codecs guide (`--to-codec` → `--from`/`--to`)
-
-See `docs/releases/v0.1.6.md` for full notes.
 
 _(Older releases archived in `docs/releases/`. This file is kept short per project convention.)_

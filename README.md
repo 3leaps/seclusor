@@ -9,7 +9,7 @@ Seclusor is a library-first Rust project that lets developers, DevSecOps enginee
 
 **Important**: While armored secrets _can_ be stored in git, this is not always advisable. See [App Note 01: Git Storage of Armored Secrets](docs/appnotes/01-git-armored-storage.md) for the risk continuum and guidance by sensitivity level.
 
-**Lifecycle Phase**: `alpha` | Current version: **v0.2.1** (security patch: `secrets run` passphrase boundary + recipient-set write guard) | See [VERSION](VERSION) and [CHANGELOG.md](CHANGELOG.md)
+**Lifecycle Phase**: `alpha` | Current version: **v0.2.2** (safer interactive input + compatibility maintenance) | See [VERSION](VERSION) and [CHANGELOG.md](CHANGELOG.md)
 
 ## The Problem
 

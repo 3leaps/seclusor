@@ -8,14 +8,37 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-08-17
+
+### Added
+
+- `secrets set --value-stdin` now hides terminal input by default, accepts Enter
+  as the terminator, and restores terminal state across success, errors, and
+  interrupts. Use the explicit terminal-only `--echo-value` switch when visible
+  entry is required. Piped and redirected stdin behavior is unchanged.
+
 ### Fixed
 
 - Interactive, file, and stdin passphrase channels now normalize a single
   trailing LF or CRLF line ending consistently and reject input that is empty
   after normalization. Environment passphrases remain byte-for-byte unchanged
-  so identities created from legacy CRLF passphrase files can be recovered on
-  v0.2.1 and later, then replaced by normalized-passphrase identities and
-  encrypted data rekeyed to the replacement recipients.
+  so identities created from legacy CRLF passphrase files can be recovered,
+  replaced, and rekeyed.
+- Encrypted `set` and `import-env` writes now emit the existing self-lockout
+  advisory when none of the identities already loaded for the operation belongs
+  to the target recipient set. The warning is advisory and does not replace
+  recipient-policy enforcement or post-write verification.
+
+### Changed
+
+- Updated the private Ed25519, SHA-256, and entropy dependencies behind the
+  existing signing wrappers, with byte-exact compatibility coverage for
+  versioned signing envelopes and fixtures.
+- Updated first-party error derives and replaced the embedded-docs YAML build
+  manifest with JSON, removing the build-only YAML parser.
+
+The `secrets run` child-environment issue fixed in v0.2.1 remains documented in
+[GHSA-2w88-3q86-736g](https://github.com/3leaps/seclusor/security/advisories/GHSA-2w88-3q86-736g).
 
 ## [0.2.1] - 2026-08-11
 
@@ -23,8 +46,9 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 This release fixes a privilege-boundary defect in `secrets run` and hardens
 encrypted write paths against recipient-set divergence after identity rotation.
-A GitHub Security Advisory is published with the `v0.2.1` release (see the
-repository Security Advisories page for CVSS, affected ranges, and CVE status).
+The published advisory is
+[GHSA-2w88-3q86-736g](https://github.com/3leaps/seclusor/security/advisories/GHSA-2w88-3q86-736g)
+(see it for CVSS, affected ranges, and CVE status).
 
 - **`secrets run` child environment boundary:** when identity material is
   supplied with `--passphrase-env`, the named variable is excluded from the
