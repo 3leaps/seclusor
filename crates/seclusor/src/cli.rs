@@ -259,6 +259,15 @@ pub(crate) struct SetArgs {
     )]
     pub(crate) value_stdin: bool,
     #[arg(
+        long = "echo-value",
+        default_value_t = false,
+        requires = "value_stdin",
+        conflicts_with_all = ["value", "value_file", "value_env", "reference"],
+        help = "Show terminal input for --value-stdin (TTY only; default hides \
+                input and accepts Enter). Piped stdin never accepts this flag"
+    )]
+    pub(crate) echo_value: bool,
+    #[arg(
         long = "value-file",
         value_name = "PATH",
         help = "Read the secret value from a file (preferred non-argv channel)"
@@ -834,6 +843,64 @@ mod tests {
                 _ => panic!("expected list"),
             },
             _ => panic!("expected secrets"),
+        }
+    }
+
+    #[test]
+    fn echo_value_requires_value_stdin_and_parses_with_it() {
+        let missing_stdin = Cli::try_parse_from([
+            "seclusor",
+            "secrets",
+            "set",
+            "--key",
+            "API_KEY",
+            "--echo-value",
+        ]);
+        assert!(missing_stdin.is_err());
+
+        let parsed = Cli::try_parse_from([
+            "seclusor",
+            "secrets",
+            "set",
+            "--key",
+            "API_KEY",
+            "--value-stdin",
+            "--echo-value",
+        ])
+        .expect("echo-value with value-stdin");
+        match parsed.command {
+            TopLevelCommand::Secrets(cmd) => match cmd.command {
+                SecretsSubcommand::Set(args) => {
+                    assert!(args.value_stdin);
+                    assert!(args.echo_value);
+                }
+                _ => panic!("expected set"),
+            },
+            _ => panic!("expected secrets"),
+        }
+
+        for conflicting in [
+            ["--value", "argv-value"],
+            ["--value-file", "value.txt"],
+            ["--value-env", "VALUE_VAR"],
+            ["--ref", "vault://example"],
+        ] {
+            let parsed = Cli::try_parse_from([
+                "seclusor",
+                "secrets",
+                "set",
+                "--key",
+                "API_KEY",
+                "--value-stdin",
+                "--echo-value",
+                conflicting[0],
+                conflicting[1],
+            ]);
+            assert!(
+                parsed.is_err(),
+                "--echo-value must conflict with {}",
+                conflicting[0]
+            );
         }
     }
 }
