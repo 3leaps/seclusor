@@ -12,10 +12,9 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ### Added
 
-- `secrets set --value-stdin` now hides terminal input by default, accepts Enter
-  as the terminator, and restores terminal state across success, errors, and
-  interrupts. Use the explicit terminal-only `--echo-value` switch when visible
-  entry is required. Piped and redirected stdin behavior is unchanged.
+- `--echo-value` opt-in for visible terminal `secrets set --value-stdin`. The
+  switch is rejected unless stdin is a terminal. Visible mode keeps the existing
+  EOF terminator.
 
 ### Fixed
 
@@ -31,6 +30,9 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ### Changed
 
+- Terminal `secrets set --value-stdin` is hidden by default, closes on Enter,
+  and restores terminal state across success, errors, and interrupts. Piped and
+  redirected stdin behavior is unchanged.
 - Updated the private Ed25519, SHA-256, and entropy dependencies behind the
   existing signing wrappers, with byte-exact compatibility coverage for
   versioned signing envelopes and fixtures.

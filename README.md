@@ -36,7 +36,7 @@ Seclusor fills the gap for teams that want local-first, library-native, git-comp
 - **Blob encryption**: Encrypt any file (shell scripts, configs, binary tokens) with `secrets blob encrypt`/`decrypt`. No JSON required.
 - **Passphrase-protected identities**: Encrypt identity files at rest with a passphrase, like SSH keys. Four input channels for automation.
 - **Secure CLI**: Full command set including `secrets run` (injects secrets without exposing them in CLI args, history, or process lists).
-- **Safe by default**: Redaction, stdout purity, no secrets in arguments, strict validation.
+- **Safe by default**: Redaction, stdout purity, no secrets in arguments, hidden terminal value entry, strict validation.
 - **Audience-focused**: Great for developers (local workflows), DevSecOps (secure pipelines), and integrators (library usage).
 
 For guidance on storing armored files in git, see [App Note 01](docs/appnotes/01-git-armored-storage.md). For runtime patterns see [App Note 02](docs/appnotes/02-runtime-deployment-patterns.md).
@@ -289,6 +289,9 @@ See [ADR-0011](docs/decisions/ADR-0011-ed25519-signing-in-seclusor-crypto.md), [
 - Prefer `--value-stdin`, `--value-file`, or `--value-env` for secret input;
   legacy `--value` warns because argv may appear in shell history or process
   listings
+- On a terminal, `--value-stdin` hides keystrokes and closes on Enter; use
+  `--echo-value` only for visible terminal entry (EOF terminator). Pipes are
+  unchanged. This is not `get --reveal`
 - `get` redacts by default; `--reveal` required to see values
 - `get --show-description` prints description metadata only
 - `list --verbose` prints `KEY<TAB>description` without exposing values

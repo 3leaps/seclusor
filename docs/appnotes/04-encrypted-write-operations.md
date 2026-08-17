@@ -44,6 +44,10 @@ seclusor secrets set --value-file ./secret.txt ...
 seclusor secrets set --value-env MY_SECRET ...
 ```
 
+On a terminal, `--value-stdin` hides input and closes on Enter unless
+`--echo-value` is set. A pipe or redirect keeps the existing byte-stream
+path and rejects `--echo-value`.
+
 Legacy `--value <str>` remains but **warns on stderr** and is not the
 documented safe path.
 
