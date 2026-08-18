@@ -2,12 +2,46 @@
 
 **Content policy**: This file contains the most recent 3 releases (reverse chronological). Older releases are archived in `docs/releases/vX.Y.Z.md`.
 
+## v0.2.2 (August 2026)
+
+**Type a secret without it showing on screen** — Hidden terminal value entry,
+consistent LF/CRLF passphrase-file handling across Windows and Unix, a
+self-lockout heads-up on encrypted writes, and a drop-in dependency refresh.
+Document formats and Rust, Go, TypeScript, and C-ABI contracts are unchanged.
+
+- **Interactive values:** type at the `Value:` prompt; keystrokes are hidden
+  and Enter finishes. `--echo-value` is opt-in visible typing (still ends on
+  EOF). Piped and redirected stdin is unchanged
+- **Passphrases:** file and stdin channels treat a trailing LF or CRLF the
+  same and reject empty input. `--passphrase-env` stays exact-byte for the
+  narrow legacy-recovery path
+- **Encrypted writes:** `set` and `import-env` warn when none of the already
+  loaded identities belongs to the target recipient set. Verify decryptability
+  before retiring an old identity; the warning is not a safety verdict
+- **Compatibility:** signing and build internals refresh with byte-exact
+  envelope coverage and no library, binding, FFI, or data-format changes
+
+**Upgrade cue:** scripts that pipe values need no change. If you type values
+at a prompt, press Enter — not EOF. First-time install uses `brew install`
+/ `scoop install`; existing installs use `brew upgrade` / `scoop update`.
+
+If you are still on v0.2.0 or earlier, this release also includes the v0.2.1
+`secrets run` fix:
+[GHSA-2w88-3q86-736g](https://github.com/3leaps/seclusor/security/advisories/GHSA-2w88-3q86-736g).
+This release does not reopen that advisory.
+
+**Install** (after the GitHub release is published):
+`brew upgrade seclusor` · `scoop update seclusor`
+
+See `docs/releases/v0.2.2.md` for full notes and `docs/releases/v0.2.2-announce.md`
+for a short announcement.
+
 ## v0.2.1 (August 2026)
 
 **Security patch** — Keep the identity passphrase out of processes launched by
 `secrets run`, and stop a stale recipients list from silently restoring a
-retired recipient after rotation. GitHub Security Advisory published with this
-release.
+retired recipient after rotation. The published advisory is
+[GHSA-2w88-3q86-736g](https://github.com/3leaps/seclusor/security/advisories/GHSA-2w88-3q86-736g).
 
 - **`secrets run`:** the `--passphrase-env` variable is excluded from the child
   environment through a single construction chokepoint; the command also
@@ -60,15 +94,5 @@ binaries.
 `scoop bucket add 3leaps https://github.com/3leaps/scoop-bucket && scoop install seclusor`
 
 See `docs/releases/v0.2.0.md` for full notes and upgrade guidance.
-
-## v0.1.6 (April 2026)
-
-**Inline runtime decryption fix and workflow scenarios guide** — Fixes a bug where inline-encrypted values were not decrypted at runtime, and adds comprehensive end-to-end workflow documentation.
-
-- **Bug fix (SC-012)**: `secrets run`, `secrets get`, and `secrets export-env` now correctly decrypt `sec:age:v1:` inline-encrypted values when identity files are provided. Previously these commands returned raw ciphertext for inline-encrypted documents
-- **Workflow scenarios (SC-014)**: 7 new embedded docs in `docs/guides/scenarios/` covering bundle, inline, blob, CI/automation, team recipients, and a quick-reference command table. Available via `seclusor docs show scenarios/index`
-- **Docs fix**: Corrected stale flag names in codecs guide (`--to-codec` → `--from`/`--to`)
-
-See `docs/releases/v0.1.6.md` for full notes.
 
 _(Older releases archived in `docs/releases/`. This file is kept short per project convention.)_
