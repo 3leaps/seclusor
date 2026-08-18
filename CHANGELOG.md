@@ -10,6 +10,11 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [0.2.2] - 2026-08-17
 
+Compatibility release: hidden terminal value entry, consistent line-oriented
+passphrases, broader self-lockout advisories, and a private dependency
+refresh. Document formats and Rust, Go, TypeScript, and C-ABI contracts are
+unchanged.
+
 ### Added
 
 - `--echo-value` opt-in for visible terminal `secrets set --value-stdin`. The

@@ -4,35 +4,37 @@
 
 ## v0.2.2 (August 2026)
 
-**Safer interactive input and compatibility-focused maintenance** — Hide
-terminal value entry by default, normalize line-oriented passphrases across
-platforms, extend encrypted-write self-lockout advisories, and refresh private
-signing and build dependencies without changing public formats.
+**Type a secret without it showing on screen** — Hidden terminal value entry,
+consistent LF/CRLF passphrase-file handling across Windows and Unix, a
+self-lockout heads-up on encrypted writes, and a drop-in dependency refresh.
+Document formats and Rust, Go, TypeScript, and C-ABI contracts are unchanged.
 
-- **Interactive values:** terminal `secrets set --value-stdin` hides input and
-  accepts Enter; explicit `--echo-value` restores visible entry and its existing
-  EOF terminator. Piped and redirected stdin behavior is unchanged
-- **Passphrases:** interactive, file, and stdin channels normalize one trailing
-  LF or CRLF and reject empty normalized input; environment input remains
-  byte-for-byte unchanged for narrow legacy recovery
+- **Interactive values:** type at the `Value:` prompt; keystrokes are hidden
+  and Enter finishes. `--echo-value` is opt-in visible typing (still ends on
+  EOF). Piped and redirected stdin is unchanged
+- **Passphrases:** file and stdin channels treat a trailing LF or CRLF the
+  same and reject empty input. `--passphrase-env` stays exact-byte for the
+  narrow legacy-recovery path
 - **Encrypted writes:** `set` and `import-env` warn when none of the already
-  loaded identities belongs to the target recipient set; the advisory does not
-  replace fail-closed recipient policy or post-write verification
-- **Compatibility:** signing, digest, entropy, error, and embedded-doc build
-  dependencies are refreshed with byte-exact signing-envelope coverage and no
-  public API or data-format changes
+  loaded identities belongs to the target recipient set. Verify decryptability
+  before retiring an old identity; the warning is not a safety verdict
+- **Compatibility:** signing and build internals refresh with byte-exact
+  envelope coverage and no library, binding, FFI, or data-format changes
 
-**Upgrade cue:** scripts using piped input require no change. Interactive
-`--value-stdin` now hides input and closes on Enter; add `--echo-value` only for
-deliberate visible terminal entry.
+**Upgrade cue:** scripts that pipe values need no change. If you type values
+at a prompt, press Enter — not EOF. First-time install uses `brew install`
+/ `scoop install`; existing installs use `brew upgrade` / `scoop update`.
 
-The `secrets run` child-environment issue fixed in v0.2.1 is documented in
+If you are still on v0.2.0 or earlier, this release also includes the v0.2.1
+`secrets run` fix:
 [GHSA-2w88-3q86-736g](https://github.com/3leaps/seclusor/security/advisories/GHSA-2w88-3q86-736g).
+This release does not reopen that advisory.
 
 **Install** (after the GitHub release is published):
 `brew upgrade seclusor` · `scoop update seclusor`
 
-See `docs/releases/v0.2.2.md` for full notes, compatibility, and residuals.
+See `docs/releases/v0.2.2.md` for full notes and `docs/releases/v0.2.2-announce.md`
+for a short announcement.
 
 ## v0.2.1 (August 2026)
 

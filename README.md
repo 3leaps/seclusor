@@ -9,7 +9,7 @@ Seclusor is a library-first Rust project that lets developers, DevSecOps enginee
 
 **Important**: While armored secrets _can_ be stored in git, this is not always advisable. See [App Note 01: Git Storage of Armored Secrets](docs/appnotes/01-git-armored-storage.md) for the risk continuum and guidance by sensitivity level.
 
-**Lifecycle Phase**: `alpha` | Current version: **v0.2.2** (safer interactive input + compatibility maintenance) | See [VERSION](VERSION) and [CHANGELOG.md](CHANGELOG.md)
+**Lifecycle Phase**: `alpha` | Current version: **v0.2.2** (hidden terminal secret entry; drop-in for scripts) | See [VERSION](VERSION), [CHANGELOG.md](CHANGELOG.md), and [v0.2.2 notes](docs/releases/v0.2.2.md)
 
 ## The Problem
 
@@ -43,7 +43,9 @@ For guidance on storing armored files in git, see [App Note 01](docs/appnotes/01
 
 ## Install
 
-After each GitHub release is published, package-manager formulas are updated:
+After each GitHub release is published, package-manager formulas are updated.
+
+**First install:**
 
 ```bash
 # Homebrew
@@ -54,10 +56,18 @@ scoop bucket add 3leaps https://github.com/3leaps/scoop-bucket
 scoop install seclusor
 ```
 
+**Already installed:**
+
+```bash
+brew upgrade seclusor
+scoop update seclusor
+```
+
 Platform binaries, checksums, and detached signatures are published on the
 [GitHub Releases](https://github.com/3leaps/seclusor/releases) page. Prefer
 verifying release assets with an expected public key or fingerprint
-(`seclusor assets verify`).
+(`seclusor assets verify`). See [v0.2.2 announcement](docs/releases/v0.2.2-announce.md)
+for the current-release one-pager.
 
 ## Quick Start
 
@@ -130,7 +140,8 @@ seclusor keys age identity generate --output ~/.config/seclusor/identity.txt
 
 # 2. Create and armor a simple secrets file
 seclusor secrets init --output secrets.json --project myapp
-# Prefer non-argv value channels so secrets stay out of shell history
+# Prefer non-argv value channels so secrets stay out of shell history.
+# Interactive: omit the pipe, type at the hidden Value: prompt, press Enter.
 printf '%s' 'example-db-password-9xK7mP2qR8vT' | seclusor secrets set \
   --file secrets.json \
   --project myapp \

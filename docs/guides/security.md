@@ -7,8 +7,9 @@ Seclusor is a security-sensitive library and tool for managing encrypted secrets
 - Strict schema and credential-shape validation
 - Size limits enforced before allocation (16 MiB decrypt, 1 MiB inline)
 - Redaction-by-default for `secrets get` (requires `--reveal`)
-- Hidden-by-default terminal input for `secrets set --value-stdin`; visible
-  terminal entry requires `--echo-value`, while pipes remain unchanged
+- Hidden-by-default terminal input for `secrets set --value-stdin` so typed
+  secrets do not appear on screen; visible terminal entry requires
+  `--echo-value`, while pipes remain unchanged
 - Stdout purity: data on stdout, diagnostics and prompts on stderr
 - Secret key material blocked from CLI arguments (see SDR-0002)
 - Ciphertext prefix validation (`sec:age:v1:`)
