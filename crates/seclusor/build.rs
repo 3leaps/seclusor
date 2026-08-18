@@ -1,5 +1,5 @@
 use glob::{glob_with, MatchOptions, Pattern};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -21,7 +21,7 @@ struct EmbedTopic {
     tags: Option<Vec<String>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize)]
 struct EmbeddedDoc {
     slug: String,
     title: String,
@@ -32,6 +32,7 @@ struct EmbeddedDoc {
 fn main() {
     let manifest_dir =
         PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let snapshot_path = manifest_dir.join("embedded-docs.json");
     let workspace_root = manifest_dir
         .parent()
         .and_then(Path::parent)
@@ -41,8 +42,22 @@ fn main() {
     let manifest_path = docs_root.join("embed-manifest.json");
 
     println!("cargo:rerun-if-changed={}", manifest_path.display());
+    println!("cargo:rerun-if-changed={}", snapshot_path.display());
+    println!("cargo:rerun-if-env-changed=SECLUSOR_UPDATE_EMBEDDED_DOCS");
 
-    let manifest_raw = fs::read_to_string(&manifest_path)
+    let docs = if manifest_path.is_file() {
+        let docs = load_docs(&docs_root, &manifest_path);
+        verify_or_update_snapshot(&snapshot_path, &docs);
+        docs
+    } else {
+        load_snapshot(&snapshot_path)
+    };
+
+    write_generated_docs(docs);
+}
+
+fn load_docs(docs_root: &Path, manifest_path: &Path) -> Vec<EmbeddedDoc> {
+    let manifest_raw = fs::read_to_string(manifest_path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", manifest_path.display()));
     let manifest: EmbedManifest = serde_json::from_str(&manifest_raw)
         .unwrap_or_else(|e| panic!("invalid {}: {e}", manifest_path.display()));
@@ -56,7 +71,7 @@ fn main() {
 
     let mut docs = Vec::new();
     for (topic_key, topic) in &manifest.topics {
-        let files = resolve_topic_files(&docs_root, topic);
+        let files = resolve_topic_files(docs_root, topic);
         if files.is_empty() {
             panic!("topic {topic_key:?} resolved zero files");
         }
@@ -65,7 +80,7 @@ fn main() {
         for file in files {
             println!("cargo:rerun-if-changed={}", file.display());
             let rel = file
-                .strip_prefix(&docs_root)
+                .strip_prefix(docs_root)
                 .unwrap_or_else(|_| panic!("file outside docs root: {}", file.display()));
             let content = fs::read_to_string(&file)
                 .unwrap_or_else(|e| panic!("failed to read {}: {e}", file.display()));
@@ -92,7 +107,66 @@ fn main() {
     }
 
     docs.sort_by(|a, b| a.slug.cmp(&b.slug));
+    docs
+}
 
+fn verify_or_update_snapshot(snapshot_path: &Path, docs: &[EmbeddedDoc]) {
+    let snapshot =
+        serde_json::to_string_pretty(docs).expect("embedded documentation should serialize") + "\n";
+
+    match std::env::var("SECLUSOR_UPDATE_EMBEDDED_DOCS") {
+        Ok(value) if value == "1" => {
+            fs::write(snapshot_path, &snapshot)
+                .unwrap_or_else(|e| panic!("failed to write {}: {e}", snapshot_path.display()));
+        }
+        Ok(value) => {
+            panic!("SECLUSOR_UPDATE_EMBEDDED_DOCS must be \"1\" when set, got {value:?}");
+        }
+        Err(std::env::VarError::NotPresent) => {
+            let committed = fs::read_to_string(snapshot_path).unwrap_or_else(|e| {
+                panic!(
+                    "failed to read {}: {e}; run `make embedded-docs-sync`",
+                    snapshot_path.display()
+                )
+            });
+            if committed != snapshot {
+                panic!(
+                    "{} is stale; run `make embedded-docs-sync`",
+                    snapshot_path.display()
+                );
+            }
+        }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("SECLUSOR_UPDATE_EMBEDDED_DOCS must contain valid UTF-8");
+        }
+    }
+}
+
+fn load_snapshot(snapshot_path: &Path) -> Vec<EmbeddedDoc> {
+    let snapshot = fs::read_to_string(snapshot_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", snapshot_path.display()));
+    let docs: Vec<EmbeddedDoc> = serde_json::from_str(&snapshot)
+        .unwrap_or_else(|e| panic!("invalid {}: {e}", snapshot_path.display()));
+
+    if docs.is_empty() {
+        panic!("{} contains no documents", snapshot_path.display());
+    }
+
+    let mut slugs = BTreeSet::new();
+    for doc in &docs {
+        if !slugs.insert(&doc.slug) {
+            panic!(
+                "{} contains duplicate slug {:?}",
+                snapshot_path.display(),
+                doc.slug
+            );
+        }
+    }
+
+    docs
+}
+
+fn write_generated_docs(docs: Vec<EmbeddedDoc>) {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     let out_file = out_dir.join("embedded_docs.rs");
 
