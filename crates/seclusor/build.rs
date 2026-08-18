@@ -124,12 +124,14 @@ fn verify_or_update_snapshot(snapshot_path: &Path, docs: &[EmbeddedDoc]) {
             panic!("SECLUSOR_UPDATE_EMBEDDED_DOCS must be \"1\" when set, got {value:?}");
         }
         Err(std::env::VarError::NotPresent) => {
-            let committed = fs::read_to_string(snapshot_path).unwrap_or_else(|e| {
-                panic!(
-                    "failed to read {}: {e}; run `make embedded-docs-sync`",
-                    snapshot_path.display()
-                )
-            });
+            let committed = fs::read_to_string(snapshot_path)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "failed to read {}: {e}; run `make embedded-docs-sync`",
+                        snapshot_path.display()
+                    )
+                })
+                .replace("\r\n", "\n");
             if committed != snapshot {
                 panic!(
                     "{} is stale; run `make embedded-docs-sync`",
