@@ -33,6 +33,8 @@ fn main() {
     let manifest_dir =
         PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let snapshot_path = manifest_dir.join("embedded-docs.json");
+    let packaged_source = manifest_dir.join("Cargo.toml.orig").is_file()
+        && manifest_dir.join(".cargo_vcs_info.json").is_file();
     let workspace_root = manifest_dir
         .parent()
         .and_then(Path::parent)
@@ -41,16 +43,21 @@ fn main() {
     let docs_root = workspace_root.join("docs");
     let manifest_path = docs_root.join("embed-manifest.json");
 
-    println!("cargo:rerun-if-changed={}", manifest_path.display());
     println!("cargo:rerun-if-changed={}", snapshot_path.display());
     println!("cargo:rerun-if-env-changed=SECLUSOR_UPDATE_EMBEDDED_DOCS");
 
     let docs = if manifest_path.is_file() {
+        println!("cargo:rerun-if-changed={}", docs_root.display());
         let docs = load_docs(&docs_root, &manifest_path);
         verify_or_update_snapshot(&snapshot_path, &docs);
         docs
-    } else {
+    } else if packaged_source {
         load_snapshot(&snapshot_path)
+    } else {
+        panic!(
+            "canonical embed manifest missing from workspace source: {}",
+            manifest_path.display()
+        );
     };
 
     write_generated_docs(docs);
