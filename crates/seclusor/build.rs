@@ -83,7 +83,8 @@ fn load_docs(docs_root: &Path, manifest_path: &Path) -> Vec<EmbeddedDoc> {
                 .strip_prefix(docs_root)
                 .unwrap_or_else(|_| panic!("file outside docs root: {}", file.display()));
             let content = fs::read_to_string(&file)
-                .unwrap_or_else(|e| panic!("failed to read {}: {e}", file.display()));
+                .unwrap_or_else(|e| panic!("failed to read {}: {e}", file.display()))
+                .replace("\r\n", "\n");
 
             let slug = if is_single {
                 topic_key.clone()
