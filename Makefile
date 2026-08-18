@@ -14,7 +14,7 @@
 .PHONY: check-windows check-windows-msvc check-windows-gnu
 .PHONY: install dogfood-cli
 .PHONY: version version-patch version-minor version-major version-set version-sync version-check
-.PHONY: ci release-check release-preflight
+.PHONY: ci release-check release-preflight embedded-docs-sync negative-control-embedded-docs
 .PHONY: release-clean release-download release-checksums release-sign release-export-keys
 .PHONY: release-verify release-verify-checksums release-verify-signatures release-verify-keys
 .PHONY: release-notes release-upload release-upload-all release
@@ -99,6 +99,8 @@ help: ## Show available targets
 	@echo "Release:"
 	@echo "  release-preflight  Verify all pre-tag requirements (REQUIRED before tagging)"
 	@echo "  release-check      Version consistency + package check"
+	@echo "  embedded-docs-sync Refresh the packaged embedded-doc snapshot"
+	@echo "  negative-control-embedded-docs Prove embedded-doc fail-closed checks"
 	@echo "  release-clean      Remove dist/release contents"
 	@echo "  release-download   Download release assets from GitHub"
 	@echo "  release-checksums  Generate SHA256SUMS and SHA512SUMS"
@@ -788,7 +790,7 @@ version-check: ## Validate version consistency across files
 # CI/CD
 # -----------------------------------------------------------------------------
 
-ci: fmt-check lint test deny version-check check-child-env ## Run exactly what CI runs
+ci: fmt-check lint test deny version-check check-child-env negative-control-embedded-docs ## Run exactly what CI runs
 	@echo "[ok] CI checks passed"
 
 release-check: version-check ## Version consistency + package check
@@ -808,6 +810,13 @@ release-check: version-check ## Version consistency + package check
 	@echo "  3. git push origin v$$(cat $(VERSION_FILE))"
 	@echo "  4. Wait for CI + release workflow"
 	@echo "  5. make release (sign + upload)"
+
+embedded-docs-sync: ## Refresh the packaged embedded-doc snapshot
+	@SECLUSOR_UPDATE_EMBEDDED_DOCS=1 $(CARGO) check -p seclusor
+	@echo "[ok] Packaged embedded-doc snapshot refreshed"
+
+negative-control-embedded-docs: ## Prove embedded-doc fail-closed checks
+	@./scripts/negative-control-embedded-docs.sh
 
 # -----------------------------------------------------------------------------
 # Release Signing
