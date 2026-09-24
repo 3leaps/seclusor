@@ -140,6 +140,9 @@ enum SeclusorResult seclusor_keyring_handle_add_recipient(struct SeclusorKeyring
 /**
  * Load identities from an age identity file and append to a keyring handle.
  *
+ * On macOS, an extended ACL grant emits a path-and-remediation warning on
+ * process stderr before the identity is read; callers should surface stderr.
+ *
  * # Safety
  * `handle` must be a valid mutable keyring handle pointer from this library.
  * `identity_file_path` must be a valid non-null C string path.
@@ -231,7 +234,9 @@ enum SeclusorResult seclusor_encrypt_bundle(const char *input_json_path,
 /**
  * Decrypt a bundle ciphertext file into pretty JSON file.
  *
- * `identity_file_path` must point to an age identity file.
+ * `identity_file_path` must point to an age identity file. On macOS, an
+ * extended ACL grant on that file emits a path-and-remediation warning on
+ * process stderr before the identity is read; callers should surface stderr.
  */
 enum SeclusorResult seclusor_decrypt_bundle(const char *input_ciphertext_path,
                                             const char *output_json_path,

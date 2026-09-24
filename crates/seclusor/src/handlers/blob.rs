@@ -66,7 +66,12 @@ pub(crate) fn handle_blob_decrypt(args: BlobDecryptArgs) -> CliResult<()> {
     let plaintext = seclusor_crypto::decrypt(&ciphertext, &identities)?;
 
     // Atomic write via unique temp file (create_new semantics, no symlink risk)
-    let output_dir = args.output.parent().unwrap_or(Path::new("."));
+    let output_dir = args
+        .output
+        .parent()
+        .filter(|part| !part.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    seclusor_crypto::acl::reject_writable_directory_acl(output_dir)?;
     let mut temp = tempfile::NamedTempFile::new_in(output_dir)?;
 
     // Set 0600 before writing sensitive content
@@ -77,6 +82,7 @@ pub(crate) fn handle_blob_decrypt(args: BlobDecryptArgs) -> CliResult<()> {
             .set_permissions(fs::Permissions::from_mode(0o600))?;
     }
 
+    seclusor_crypto::acl::prepare_private_file(temp.as_file(), temp.path())?;
     std::io::Write::write_all(&mut temp, &plaintext)?;
 
     // persist() replaces the target atomically on Unix; on Windows it

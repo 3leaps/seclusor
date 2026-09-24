@@ -120,6 +120,14 @@ mod tests {
         })
         .expect("cli decrypt");
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
         let on_disk = read_secrets_file(&output).expect("read");
         assert!(on_disk.recipients.is_none());
         assert_eq!(

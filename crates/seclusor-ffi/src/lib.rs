@@ -568,6 +568,9 @@ pub unsafe extern "C" fn seclusor_keyring_handle_add_recipient(
 
 /// Load identities from an age identity file and append to a keyring handle.
 ///
+/// On macOS, an extended ACL grant emits a path-and-remediation warning on
+/// process stderr before the identity is read; callers should surface stderr.
+///
 /// # Safety
 /// `handle` must be a valid mutable keyring handle pointer from this library.
 /// `identity_file_path` must be a valid non-null C string path.
@@ -833,7 +836,9 @@ pub extern "C" fn seclusor_encrypt_bundle(
 
 /// Decrypt a bundle ciphertext file into pretty JSON file.
 ///
-/// `identity_file_path` must point to an age identity file.
+/// `identity_file_path` must point to an age identity file. On macOS, an
+/// extended ACL grant on that file emits a path-and-remediation warning on
+/// process stderr before the identity is read; callers should surface stderr.
 #[no_mangle]
 pub extern "C" fn seclusor_decrypt_bundle(
     input_ciphertext_path: *const c_char,
@@ -849,7 +854,7 @@ pub extern "C" fn seclusor_decrypt_bundle(
         let secrets = decrypt_bundle_from_file(input_ciphertext_path, &identities)?;
         // Persistence boundary: project to JSON-at-rest plaintext (no recipients).
         let json = serialize_plaintext_at_rest(&secrets)?;
-        fs::write(output_json_path, json)?;
+        seclusor_crypto::acl::write_private_file(output_json_path.as_ref(), &json, false)?;
         Ok(())
     }) {
         Ok(()) => SeclusorResult::Ok,
@@ -1359,6 +1364,14 @@ mod tests {
             SeclusorResult::Ok
         );
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
         let output_json = fs::read_to_string(&output).expect("read output");
         assert!(output_json.contains("\"API_KEY\""));
         assert!(

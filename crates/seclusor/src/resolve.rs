@@ -262,6 +262,7 @@ fn resolve_identities_full(
     passphrase_args: &PassphraseArgs,
     required: bool,
 ) -> CliResult<(Vec<Identity>, Option<SecretString>, Vec<std::path::PathBuf>)> {
+    let _acl_warning_scope = seclusor_crypto::acl::warning_scope();
     // --identity-public-key and --identity-file conflict at clap parse time.
     if let Some(public_key) = &args.identity_public_key {
         let path = find_identity_path_by_public_key(public_key)?;

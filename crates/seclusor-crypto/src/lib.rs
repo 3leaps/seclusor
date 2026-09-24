@@ -3,6 +3,7 @@
 //! Encryption boundary for seclusor (age wrapper). Library consumers (e.g.
 //! lanyte-attest) will link this crate directly.
 
+pub mod acl;
 mod error;
 #[cfg(feature = "signing")]
 mod signing;
@@ -381,6 +382,9 @@ fn ensure_size_limit(kind: &'static str, actual: usize, max: usize) -> Result<()
 
 /// Check that an identity file has secure permissions (0600 on Unix).
 ///
+/// On macOS, an extended ACL grant to a non-owner emits a warning on the
+/// process stderr before any private file bytes are read. This also applies to
+/// Rust library and FFI callers. ACL inspection errors refuse the load.
 /// On non-Unix platforms this is a no-op.
 pub fn assert_secure_permissions(path: &Path) -> Result<()> {
     #[cfg(unix)]
@@ -390,6 +394,27 @@ pub fn assert_secure_permissions(path: &Path) -> Result<()> {
         let mode = fs::metadata(path)?.permissions().mode() & 0o777;
         if mode != 0o600 {
             return Err(CryptoError::InsecureIdentityFilePermissions { actual: mode });
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let parent = path
+            .parent()
+            .filter(|part| !part.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        acl::reject_writable_directory_acl(parent)?;
+        let has_extended_acl = acl::has_non_owner_file_acl(path).map_err(|err| {
+            CryptoError::Io(std::io::Error::new(
+                err.kind(),
+                format!("unable to inspect private file ACL before reading: {err}"),
+            ))
+        })?;
+        if has_extended_acl && acl::should_emit_warning(path) {
+            eprintln!(
+                "warning: private file {:?} has an extended ACL grant; inspect with ls -le and remove with chmod -N",
+                path
+            );
         }
     }
 

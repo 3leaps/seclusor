@@ -80,6 +80,14 @@ mod tests {
         })
         .expect("inline decrypt");
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
         let loaded = read_secrets_file(&output).expect("read output");
         // CLI decrypt projects to JSON-at-rest: no recipients, plaintext values.
         assert_eq!(loaded.projects, secrets.projects);

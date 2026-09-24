@@ -218,6 +218,7 @@ pub fn load_identity_file_auto(
     passphrase: Option<&SecretString>,
 ) -> Result<Vec<Identity>> {
     let path = path.as_ref();
+    let _acl_warning_scope = seclusor_crypto::acl::warning_scope();
     seclusor_crypto::assert_identity_file_access(path)?;
     if is_passphrase_protected_identity(path)? {
         match passphrase {
@@ -927,41 +928,42 @@ fn is_repo_root_marker(dir: &Path) -> Result<bool> {
 }
 
 fn create_new_identity_file(path: &Path) -> Result<File> {
+    let parent = path
+        .parent()
+        .filter(|part| !part.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    seclusor_crypto::acl::reject_writable_directory_acl(parent)?;
+
     #[cfg(unix)]
-    {
+    let file = {
         use std::os::unix::fs::OpenOptionsExt;
         std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(path)
-            .map_err(|err| {
-                if err.kind() == std::io::ErrorKind::AlreadyExists {
-                    KeyringError::IdentityFileAlreadyExists {
-                        path: path.to_path_buf(),
-                    }
-                } else {
-                    err.into()
-                }
-            })
-    }
-
+    };
     #[cfg(not(unix))]
-    {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .map_err(|err| {
-                if err.kind() == std::io::ErrorKind::AlreadyExists {
-                    KeyringError::IdentityFileAlreadyExists {
-                        path: path.to_path_buf(),
-                    }
-                } else {
-                    err.into()
-                }
-            })
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path);
+
+    let file = file.map_err(|err| {
+        if err.kind() == std::io::ErrorKind::AlreadyExists {
+            KeyringError::IdentityFileAlreadyExists {
+                path: path.to_path_buf(),
+            }
+        } else {
+            err.into()
+        }
+    })?;
+    if let Err(err) = seclusor_crypto::acl::prepare_private_file(&file, path) {
+        drop(file);
+        fs::remove_file(path)?;
+        return Err(err.into());
     }
+    Ok(file)
 }
 
 fn read_utf8_file_with_limit(
@@ -1146,6 +1148,26 @@ mod tests {
         generate_identity_file(&path).expect("generation should work");
         let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn generate_identity_file_clears_inherited_acl() {
+        let _guard = cwd_lock().lock().expect("lock cwd");
+        let dir = tempfile::tempdir().expect("temp dir");
+        exacl::setfacl(
+            &[dir.path()],
+            &[exacl::AclEntry::allow_user(
+                "root",
+                exacl::Perm::READ,
+                exacl::Flag::FILE_INHERIT,
+            )],
+            None,
+        )
+        .expect("set inheritable ACL");
+        let path = dir.path().join("identity.txt");
+        generate_identity_file(&path).expect("generation should clear inherited ACL");
+        assert!(exacl::getfacl(&path, None).expect("read ACL").is_empty());
     }
 
     #[test]
