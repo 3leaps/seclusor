@@ -223,10 +223,7 @@ pub(crate) fn write_secrets_file(
     secrets: &SecretsFile,
     create_new: bool,
 ) -> CliResult<()> {
-    use std::fs::OpenOptions;
-    use std::io::Write;
-
-    let data = serde_json::to_vec_pretty(secrets)?;
+    let mut data = serde_json::to_vec_pretty(secrets)?;
     if data.len() > MAX_SECRETS_DOC_BYTES {
         return Err(CliError::Core(SeclusorError::DocumentTooLarge {
             actual: data.len(),
@@ -235,13 +232,9 @@ pub(crate) fn write_secrets_file(
     }
 
     if create_new {
-        let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-        file.write_all(&data)?;
-        file.write_all(b"\n")?;
-        return Ok(());
+        data.push(b'\n');
     }
-
-    fs::write(path, data)?;
+    seclusor_crypto::acl::write_private_file(path, &data, create_new)?;
     Ok(())
 }
 
@@ -254,7 +247,7 @@ pub(crate) fn write_json_value_file(path: &Path, value: &serde_json::Value) -> C
         }));
     }
 
-    fs::write(path, data)?;
+    seclusor_crypto::acl::write_private_file(path, &data, false)?;
     Ok(())
 }
 

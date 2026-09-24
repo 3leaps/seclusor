@@ -605,41 +605,39 @@ fn is_repo_root_marker(dir: &Path) -> Result<bool> {
 }
 
 fn create_new_signing_key_file(path: &Path) -> Result<File> {
+    let parent = path
+        .parent()
+        .filter(|part| !part.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    seclusor_crypto::acl::reject_writable_directory_acl(parent)?;
+
     #[cfg(unix)]
-    {
+    let file = {
         use std::os::unix::fs::OpenOptionsExt;
         OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(path)
-            .map_err(|err| {
-                if err.kind() == std::io::ErrorKind::AlreadyExists {
-                    SignError::SigningKeyFileAlreadyExists {
-                        path: path.to_path_buf(),
-                    }
-                } else {
-                    SignError::Io(err)
-                }
-            })
-    }
-
+    };
     #[cfg(not(unix))]
-    {
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .map_err(|err| {
-                if err.kind() == std::io::ErrorKind::AlreadyExists {
-                    SignError::SigningKeyFileAlreadyExists {
-                        path: path.to_path_buf(),
-                    }
-                } else {
-                    SignError::Io(err)
-                }
-            })
+    let file = OpenOptions::new().write(true).create_new(true).open(path);
+
+    let file = file.map_err(|err| {
+        if err.kind() == std::io::ErrorKind::AlreadyExists {
+            SignError::SigningKeyFileAlreadyExists {
+                path: path.to_path_buf(),
+            }
+        } else {
+            SignError::Io(err)
+        }
+    })?;
+    if let Err(err) = seclusor_crypto::acl::prepare_private_file(&file, path) {
+        drop(file);
+        fs::remove_file(path)?;
+        return Err(SignError::Io(err));
     }
+    Ok(file)
 }
 
 #[derive(Debug)]
@@ -1474,6 +1472,27 @@ mod tests {
             fingerprint_public_key(&public_key),
             generated.key_fingerprint
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn generate_signing_key_file_clears_inherited_acl() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        exacl::setfacl(
+            &[dir.path()],
+            &[exacl::AclEntry::allow_user(
+                "root",
+                exacl::Perm::READ,
+                exacl::Flag::FILE_INHERIT,
+            )],
+            None,
+        )
+        .expect("set inheritable ACL");
+        let path = dir.path().join("signing.key.age");
+        let recipient = Identity::generate().to_public();
+        generate_signing_key_file(&path, &[recipient])
+            .expect("generation should clear inherited ACL");
+        assert!(exacl::getfacl(&path, None).expect("read ACL").is_empty());
     }
 
     #[test]

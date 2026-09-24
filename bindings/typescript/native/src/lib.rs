@@ -199,5 +199,6 @@ pub fn decrypt_bundle(
         .map_err(|e| Error::from_reason(e.to_string()))?;
     // Persistence boundary: project to JSON-at-rest plaintext (no recipients).
     let bytes = serialize_plaintext_at_rest(&secrets).map_err(|e| Error::from_reason(e.to_string()))?;
-    std::fs::write(output_json_path, bytes).map_err(|e| Error::from_reason(e.to_string()))
+    seclusor_crypto::acl::write_private_file(output_json_path.as_ref(), &bytes, false)
+        .map_err(|e| Error::from_reason(e.to_string()))
 }
