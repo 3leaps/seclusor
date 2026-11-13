@@ -2,11 +2,11 @@
 
 Status: Accepted
 Date: 2026-05-16
-Owner: cxotech (drafted) → entarch + secrev + foxtrot-devlead + foxtrot-devrev (reviewed) → foxtrot-devlead (implements via SC-016)
+Owner: cxotech (drafted) → entarch + secrev + devlead + devrev (reviewed) → devlead (implemented)
 
 ## Context
 
-SC-016 (asset signing and verification, v0.2.0) defines the user-facing
+Asset signing and verification (v0.2.0) defines the user-facing
 workflow for signing and verifying release assets using the existing
 Ed25519 primitives from [DDR-0002](DDR-0002-ed25519-signing-contract.md).
 The detached signature envelope `seclusor.signature.v1` is a JSON
