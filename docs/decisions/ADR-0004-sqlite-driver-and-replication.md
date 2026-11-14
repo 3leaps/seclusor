@@ -1,7 +1,7 @@
 # ADR-0004: SQLite Driver and Replication Strategy
 
-Status: Proposed (carried forward; Rust TBD)  
-Date: 2026-02-28
+Status: Retired — Not Planned (superseded by ADR-0013)  
+Date: 2026-02-28 (retired 2026-11-13)
 
 ## Context
 
@@ -42,6 +42,6 @@ Replication/backups:
 
 ## Notes
 
-This decision is carried forward from a prior internal Go implementation
-(unpublished) and must be revisited in
-Rust if/when server mode requires a state store.
+Retired as **Not Planned** by [ADR-0013](ADR-0013-value-free-control-plane-and-mcp-boundary.md):
+`seclusor` does not ship a standalone secret-serving server/daemon mode or
+local database store. This record is preserved for historical context only.

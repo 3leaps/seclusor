@@ -1,7 +1,7 @@
 # SDR-0001: Server Unseal and Key Management
 
-Status: Accepted (carried forward; server mode deferred)  
-Date: 2026-02-28
+Status: Accepted (standalone server mode retired per ADR-0013; key-custody and rotation posture retained)  
+Date: 2026-02-28 (updated 2026-11-13)
 
 ## Context
 
@@ -18,11 +18,17 @@ operationally safe.
 
 ## Decision
 
-Recommended default for production-like server deployments:
+> **Scope update ([ADR-0013](ADR-0013-value-free-control-plane-and-mcp-boundary.md)):**
+> Standalone `seclusor` server/daemon mode (`serve`) is retired. The custody,
+> unseal-channel, pathguard, and re-encryption rotation rules below remain
+> normative for CLI usage and for external services that embed `seclusor`
+> library crates in-process for cold-start unseal or at-rest storage.
+
+Recommended default for production-like host or embedded-library deployments:
 
 - Use age X25519 recipient encryption.
-- Store the age identity (private key) on the server as a file, delivered by the
-  runtime platform’s secret mechanism.
+- Store the age identity (private key) on the host as an owner-only file,
+  delivered by the runtime platform’s secret mechanism.
 - Do not default to storing passphrases in environment variables.
 
 Supported modes (explicit opt-in):
@@ -63,6 +69,10 @@ already-existing ciphertext.
 
 ## Notes
 
-This SDR is carried forward from a prior internal Go implementation
-(unpublished). Server mode is deferred beyond
-v0.1.0, but the key material posture influences CLI/FFI design now.
+This SDR was originally carried forward from a prior internal Go implementation
+(unpublished). Standalone `seclusor` server/daemon mode was retired in
+[ADR-0013](ADR-0013-value-free-control-plane-and-mcp-boundary.md); the
+non-repository identity custody, unseal channel guardrails, and re-encryption
+rotation model in this record remain normative for CLI usage and for external
+services that embed `seclusor` library crates for cold-start unseal or at-rest
+storage.

@@ -87,6 +87,7 @@
         "decisions/ADR-0002-*.md",
         "decisions/ADR-0003-*.md",
         "decisions/ADR-0006-*.md",
+        "decisions/ADR-0013-*.md",
         "decisions/SDR-0002-*.md"
       ]
     },
