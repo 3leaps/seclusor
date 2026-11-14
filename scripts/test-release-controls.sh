@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Exercise the signed-tag boundary using disposable keys and a local bare remote.
 set -euo pipefail
+unset GITHUB_ACTIONS GITHUB_TOKEN GH_TOKEN SECLUSOR_GITHUB_API
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/release-tag-common.sh
@@ -904,8 +905,12 @@ api_port="$(cat "$TEST_ROOT/api-port")"
     cd "$pin_repo"
     GITHUB_TOKEN='' SECLUSOR_RELEASE_TAG=v0.2.2 SECLUSOR_GITHUB_API="http://127.0.0.1:${api_port}" \
         expect_fail 'missing token in restore-tag-ref' ./scripts/release-restore-tag-ref.sh
+    GITHUB_ACTIONS=true GITHUB_TOKEN=tok SECLUSOR_RELEASE_TAG=v0.2.2 \
+        expect_fail 'non-GitHub origin rejected on GHA' ./scripts/release-restore-tag-ref.sh
+    git remote set-url origin "https://github.com/3leaps/seclusor.git"
     GITHUB_ACTIONS=true GITHUB_TOKEN=tok SECLUSOR_RELEASE_TAG=v0.2.2 SECLUSOR_GITHUB_API="http://127.0.0.1:${api_port}" \
         expect_fail 'GITHUB_API override rejected on GHA' ./scripts/release-restore-tag-ref.sh
+    git remote set-url origin "$pin_remote"
     GITHUB_TOKEN=tok SECLUSOR_RELEASE_TAG=v0.2.2 SECLUSOR_GITHUB_API="http://127.0.0.1:${api_port}" \
         SECLUSOR_EXPECTED_TAG_OBJECT="$(printf '%040d' 0)" \
         expect_fail 'mismatched expected canonical tag object' ./scripts/release-restore-tag-ref.sh

@@ -679,7 +679,7 @@ precommit: fmt-check lint ## Run pre-commit checks (fast)
 prepush: repo-status check version-check go-test ts-test ## Run pre-push checks (thorough)
 	@echo "[ok] Pre-push checks passed"
 
-pr-final: ci go-test ts-test ## Final local PR gate before pushing a branch
+pr-final: ci test-release-controls go-test ts-test ## Final local PR gate before pushing a branch
 	@echo "[ok] PR final gate passed"
 
 repo-status: ## Fail if working tree has uncommitted changes (goneat assess repo-status)
@@ -818,7 +818,9 @@ version-check: ## Validate version consistency across files
 # CI/CD
 # -----------------------------------------------------------------------------
 
-ci: fmt-check lint test deny license-check version-check check-child-env check-workflow-pins negative-control-embedded-docs test-release-controls ## Run exactly what CI runs
+# test-release-controls runs in the dedicated Release & Provenance Controls GHA job
+# (which carries gnupg, minisign, PyYAML, and decernor outside the goneat container).
+ci: fmt-check lint test deny license-check version-check check-child-env check-workflow-pins negative-control-embedded-docs ## Run container-safe CI quality checks
 	@echo "[ok] CI checks passed"
 
 release-check: version-check ## Version consistency + package check
@@ -942,6 +944,8 @@ release-preflight: ## Verify all pre-tag requirements (REQUIRED before tagging)
 	@echo "[ok] Committed public signing pins and anchors exist"
 	@$(MAKE) check-workflow-pins --silent
 	@echo "[ok] Workflow SHA-256 pins verified"
+	@$(MAKE) test-release-controls --silent
+	@echo "[ok] Synthetic release controls passed"
 	@# Check 5: Local/remote sync
 	@echo "[..] Verifying local/remote sync..."; \
 	git fetch origin >/dev/null 2>&1; \
