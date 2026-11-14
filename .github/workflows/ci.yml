@@ -118,7 +118,7 @@ jobs:
             name: linux-amd64
           - os: ubuntu-latest-arm64-s
             name: linux-arm64
-          - os: macos-14
+          - os: macos-15
             name: darwin-arm64
           - os: windows-latest
             name: windows-amd64
