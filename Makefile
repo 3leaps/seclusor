@@ -8,7 +8,7 @@
 #   make fmt        - Format code (cargo fmt + goneat format)
 #   make build      - Build all crates
 
-.PHONY: all help bootstrap bootstrap-prereqs bootstrap-release-tools bootstrap-format-tools bootstrap-rust-tools bootstrap-force tools check check-all test fmt fmt-check lint build build-release clean
+.PHONY: all help bootstrap bootstrap-prereqs bootstrap-release-tools bootstrap-format-tools bootstrap-rust-tools bootstrap-force tools check check-all test fmt fmt-check lint license-check build build-release clean
 .PHONY: ffi-header build-ffi go-bindings-sync go-bindings-ci go-build go-test go-test-committed ts-build ts-test embed-verify
 .PHONY: precommit prepush pr-final repo-status deny deny-all audit ci-security check-locked-builds check-child-env negative-control-locks parity-check parity-manifest-regen negative-control-parity miri msrv
 .PHONY: check-windows check-windows-msvc check-windows-gnu
@@ -272,6 +272,16 @@ bootstrap-rust-tools:
 	else \
 		echo "[ok] cargo-edit installed"; \
 	fi
+	@if [ "$$(uname -s)" = "Darwin" ] && command -v rustup >/dev/null 2>&1; then \
+		sysroot="$$(rustc --print sysroot 2>/dev/null || true)"; \
+		host="$$(rustc -vV 2>/dev/null | sed -n 's/^host: //p')"; \
+		if [ -n "$$sysroot" ] && [ -n "$$host" ] && [ ! -x "$$sysroot/lib/rustlib/$$host/bin/llvm-objcopy" ]; then \
+			echo "[..] Installing rustup llvm-tools (for Go FFI archive bitcode stripping)..."; \
+			rustup component add llvm-tools; \
+		else \
+			echo "[ok] rustup llvm-tools installed"; \
+		fi; \
+	fi
 
 bootstrap-force: ## Force reinstall all tools
 	@$(MAKE) bootstrap FORCE=1
@@ -351,10 +361,21 @@ tools: ## Verify external tools are available
 # Quality Gates
 # -----------------------------------------------------------------------------
 
-check: fmt-check lint test deny check-child-env ## Run all quality checks
+check: fmt-check lint test deny license-check check-child-env ## Run all quality checks
 	@echo "[ok] All quality checks passed"
 
 check-all: check ## Back-compat alias for older docs/tools
+
+license-check: ## Verify root and binding LICENSE-MIT, LICENSE-APACHE, and NOTICE files match
+	@echo "Checking license and notice files..."
+	@for file in LICENSE-MIT LICENSE-APACHE NOTICE; do \
+		[ -f "$$file" ] && [ ! -L "$$file" ] || { echo "[!!] Missing or symlinked root $$file" >&2; exit 1; }; \
+		for dir in $(GO_BINDINGS_DIR) $(TS_BINDINGS_DIR); do \
+			[ -f "$$dir/$$file" ] && [ ! -L "$$dir/$$file" ] || { echo "[!!] Missing or symlinked $$dir/$$file" >&2; exit 1; }; \
+			cmp -s "$$file" "$$dir/$$file" || { echo "[!!] $$dir/$$file differs from root $$file" >&2; exit 1; }; \
+		done; \
+	done
+	@echo "[ok] License and notice files verified"
 
 test: ## Run test suite
 	@echo "Running tests..."
@@ -470,23 +491,22 @@ audit: ## Run cargo-audit security scan
 	fi
 	@echo "[ok] cargo-audit passed"
 
-# Advisory backstop for the RUSTSEC-2026-0173 exception (accepted per SDR-0003 —
-# the decision of record). Deliberately kept OUT of `make ci` (which stays
-# offline-safe) because advisory checks fetch the RustSec DB over the network. CI
-# enforces this as a dedicated step so a new, unacknowledged advisory cannot hide
-# behind the single-ID ignore. cargo-audit does not read deny.toml, so the --ignore
-# ID below MUST match the single-ID ignore in deny.toml; drop both together per the
-# SDR-0003 removal condition (revisit by v0.2.1 or 2026-10-13). Both committed locks
-# are scanned so the accepted disposition cannot silently widen or drift.
+# Advisory backstop for the accepted build-time proc-macro exceptions (RUSTSEC-2026-0173
+# per SDR-0003 and RUSTSEC-2026-0374 per SDR-0004). Deliberately kept OUT of `make ci`
+# (which stays offline-safe) because advisory checks fetch the RustSec DB over the
+# network. CI enforces this as a dedicated step so a new, unacknowledged advisory cannot
+# hide behind the ID-pinned ignores. cargo-audit does not read deny.toml, so the --ignore
+# IDs below MUST match deny.toml; drop together per SDR-0003/SDR-0004 removal conditions
+# (revisit by v0.3.0 or 2027-02-13). Both committed locks are scanned.
 ci-security: ## Run advisory + audit gates (network required; enforced in CI)
 	@echo "Running advisory + audit gates..."
 	@command -v cargo-deny >/dev/null 2>&1 || { echo "[!!] cargo-deny not found (run 'make bootstrap')"; exit 1; }
 	@command -v cargo-audit >/dev/null 2>&1 || { echo "[!!] cargo-audit not found (run 'make bootstrap')"; exit 1; }
 	cargo-deny check advisories
-	cargo-audit audit --deny warnings --ignore RUSTSEC-2026-0173
+	cargo-audit audit --deny warnings --ignore RUSTSEC-2026-0173 --ignore RUSTSEC-2026-0374
 	# The TS-native addon has its own tracked lockfile (independent crypto graph);
 	# scan it too so a new advisory there cannot ship unremarked.
-	cargo-audit audit --file bindings/typescript/native/Cargo.lock --deny warnings --ignore RUSTSEC-2026-0173
+	cargo-audit audit --file bindings/typescript/native/Cargo.lock --deny warnings --ignore RUSTSEC-2026-0173 --ignore RUSTSEC-2026-0374
 	@echo "[ok] advisory + audit gates passed"
 
 check-locked-builds: ## Static guard: every artifact-producing cargo/zigbuild invocation enforces --locked (covers the workflow paths)
@@ -563,6 +583,7 @@ go-bindings-sync: build-ffi ## Sync FFI header + static lib into Go bindings
 	@mkdir -p $(GO_BINDINGS_DIR)/lib/$(GO_PLATFORM)
 	@cp crates/seclusor-ffi/seclusor.h $(GO_BINDINGS_DIR)/include/seclusor.h
 	@cp target/release/libseclusor_ffi.a $(GO_BINDINGS_DIR)/lib/local/$(GO_PLATFORM)/libseclusor_ffi.a
+	@./scripts/strip-ffi-bitcode.sh $(GO_BINDINGS_DIR)/lib/local/$(GO_PLATFORM)/libseclusor_ffi.a
 	@echo "[ok] Synced Go binding artifacts into $(GO_BINDINGS_DIR)"
 
 go-bindings-ci: ## Dispatch Go bindings prep workflow for current VERSION
@@ -572,33 +593,22 @@ go-bindings-ci: ## Dispatch Go bindings prep workflow for current VERSION
 
 go-build: go-bindings-sync ## Build Go bindings
 	@echo "Building Go bindings..."
-	@cd $(GO_BINDINGS_DIR) && go build ./...
+	@cd $(GO_BINDINGS_DIR) && GOWORK=off go build -tags seclusor_local ./...
 	@echo "[ok] Go bindings build complete"
 
 go-test: go-bindings-sync ## Run Go bindings tests
 	@echo "Running Go bindings tests..."
-	@cd $(GO_BINDINGS_DIR) && go test ./...
+	@cd $(GO_BINDINGS_DIR) && GOWORK=off go test -tags seclusor_local ./...
 	@echo "[ok] Go bindings tests passed"
 
 go-test-committed: ## Run Go bindings tests against committed prebuilt lib
 	@echo "Running Go bindings tests against committed lib ($(GO_PLATFORM))..."
 	@committed_lib="$(GO_BINDINGS_DIR)/lib/$(GO_PLATFORM)/libseclusor_ffi.a"; \
-	local_lib="$(GO_BINDINGS_DIR)/lib/local/$(GO_PLATFORM)/libseclusor_ffi.a"; \
-	backup_lib="$$local_lib.bak"; \
 	if [ ! -f "$$committed_lib" ]; then \
 		echo "[!!] Missing committed FFI lib: $$committed_lib"; \
 		exit 1; \
 	fi; \
-	restore() { \
-		if [ -f "$$backup_lib" ]; then \
-			mv "$$backup_lib" "$$local_lib"; \
-		fi; \
-	}; \
-	trap restore EXIT INT TERM; \
-	if [ -f "$$local_lib" ]; then \
-		mv "$$local_lib" "$$backup_lib"; \
-	fi; \
-	cd $(GO_BINDINGS_DIR) && go test ./...
+	cd $(GO_BINDINGS_DIR) && GOWORK=off go test ./...
 	@echo "[ok] Go bindings tests passed against committed lib"
 
 ts-build: ## Build TypeScript bindings
@@ -790,7 +800,7 @@ version-check: ## Validate version consistency across files
 # CI/CD
 # -----------------------------------------------------------------------------
 
-ci: fmt-check lint test deny version-check check-child-env negative-control-embedded-docs ## Run exactly what CI runs
+ci: fmt-check lint test deny license-check version-check check-child-env negative-control-embedded-docs ## Run exactly what CI runs
 	@echo "[ok] CI checks passed"
 
 release-check: version-check ## Version consistency + package check

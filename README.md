@@ -380,7 +380,7 @@ Licensed under either of:
 
 at your option.
 
-Subject to [3 Leaps OSS policies](https://github.com/3leaps/oss-policies).
+See [NOTICE](NOTICE) for attribution, project name, and trademark details. Subject to [3 Leaps OSS policies](https://github.com/3leaps/oss-policies).
 
 ## Contributing
 

@@ -36,7 +36,8 @@ it so the rationale does not fork.
 ## Decision
 
 seclusor **accepts** RUSTSEC-2026-0173 as a residual, under the conditions below.
-It is the **only** permitted advisory ignore.
+Any additional accepted advisory requires its own separate SDR (for example,
+[SDR-0004](SDR-0004-rustsec-2026-0374-advisory-acceptance.md)).
 
 ### 1) Scope of acceptance
 
@@ -59,8 +60,11 @@ It is the **only** permitted advisory ignore.
 - A **single-ID** ignore in `deny.toml` — a _new_ advisory must not hide behind
   it. `cargo audit` does not read `deny.toml`, so its `--ignore RUSTSEC-2026-0173`
   flag MUST match the `deny.toml` ID exactly (drop both together on removal).
-- **Both** locks are audited: `cargo audit --file <lock> --deny warnings --ignore
-RUSTSEC-2026-0173` for root and TS-native (see `make ci-security`).
+- **Both** locks are audited: `cargo audit --file <lock> --deny warnings` with
+  only explicit SDR-governed `--ignore` pins (`RUSTSEC-2026-0173` per this SDR,
+  plus any companion single-ID pin such as
+  [SDR-0004](SDR-0004-rustsec-2026-0374-advisory-acceptance.md)) for root and
+  TS-native (see `make ci-security`).
 - Audits run **on-change** (ci.yml) **and on a daily schedule**
   (`security-audit.yml`), so a vulnerability newly disclosed against
   `proc-macro-error2` — which would change this SDR's basis — is surfaced even
@@ -69,7 +73,12 @@ RUSTSEC-2026-0173` for root and TS-native (see `make ci-security`).
 ### 4) Owner and revisit
 
 - Owner: seclusor maintainers (secrev gate).
-- **Revisit by the v0.2.1 train or 2026-10-13, whichever comes first.**
+- **Revisit log:**
+  - Initial revisit window: `v0.2.1` or `2026-10-13`.
+  - **2026-11-13 revisit:** Re-verified against `age v0.11.5`; `i18n-embed-fl`
+    still pulls `proc-macro-error2` with no upstream `age 0.11.x` removal path.
+    Extended revisit boundary to the **`v0.3.0` (`age 0.12`) migration or
+    `2027-02-13`, whichever comes first**.
 
 ### 5) Removal condition
 
@@ -86,20 +95,25 @@ an unignored finding.
   decision (EPR-0001 §3), not a comment that quietly widens as surfaces are added.
 - Keeps a single acceptance covering both affected graphs, so the disposition
   cannot drift between the root and TS-native locks.
-- Preserves fail-closed posture: exactly one advisory is ignored, by ID, on both
-  locks, on-change and on schedule.
+- Preserves fail-closed posture: advisories are never wildcard-suppressed —
+  each accepted build-time advisory (`RUSTSEC-2026-0173` here;
+  `RUSTSEC-2026-0374` in
+  [SDR-0004](SDR-0004-rustsec-2026-0374-advisory-acceptance.md)) is pinned
+  individually by ID on both locks, on-change and on schedule.
 
 ## Consequences
 
 - `deny.toml` and both `cargo audit` invocations cite this SDR as the source of
   truth and carry only terse enforcement context.
-- The revisit date and removal condition are load-bearing: at v0.2.1 / 2026-10-13
-  the chain must be re-checked and this SDR updated or retired.
-- Any second advisory ignore requires its own SDR — this one does not stretch.
+- The revisit date and removal condition are load-bearing: at `v0.3.0` /
+  `2027-02-13` the chain must be re-checked and this SDR updated or retired.
+- Any additional advisory ignore requires its own SDR — this one does not stretch
+  (see [SDR-0004](SDR-0004-rustsec-2026-0374-advisory-acceptance.md)).
 
 ## Related Decisions
 
 - [ADR-0002](ADR-0002-age-as-default-encryption-backend.md)
 - [SDR-0001](SDR-0001-server-unseal-and-key-management.md)
+- [SDR-0004](SDR-0004-rustsec-2026-0374-advisory-acceptance.md)
 - crucible **EPR-0001** — published-artifact dependency integrity (governing
   principle; see `3leaps/crucible docs/decisions/EPR-0001-published-artifact-dependency-integrity.md`)

@@ -1,0 +1,57 @@
+seclusor
+Copyright 2026 3 Leaps, LLC
+
+This product includes software developed at 3 Leaps, LLC (https://3leaps.net/).
+This project is dual-licensed under the MIT License (see LICENSE-MIT) or the
+Apache License, Version 2.0 (see LICENSE-APACHE), at your option.
+
+Subject to 3 Leaps OSS policies: https://github.com/3leaps/oss-policies
+
+---
+
+## Project Name and Trademark Notice
+
+"seclusor" is a project name of 3 Leaps, LLC, used to identify this software.
+"3 Leaps®" is a registered trademark of 3 Leaps, LLC, a North Carolina
+Limited Liability Company.
+
+While code and documentation are open under the MIT or Apache-2.0 License,
+usage of the "seclusor" project name is reserved for official implementations
+to prevent confusion and benefit the ecosystem. Use of this name in derivative
+works does not imply endorsement by 3 Leaps, LLC.
+
+For the benefit of the community, please rename your project folder and
+configurations to avoid using "3leaps" or "seclusor" in derivative works that
+are not official 3 Leaps projects.
+
+For questions regarding project name usage, contact hello@3leaps.net.
+
+---
+
+## Acceptable Use of "seclusor"
+
+We built seclusor for the community and encourage its use. You may freely:
+
+- Use "seclusor" descriptively to identify this software (e.g., "secrets
+  managed by seclusor", "encrypted with seclusor", "compatible with seclusor")
+- Integrate seclusor crates, bindings, ciphertext formats, or signature
+  verification in your projects and CI pipelines
+- Fork this repository, contribute improvements, and build integrations
+- Reference seclusor in documentation, articles, and educational materials
+- Use seclusor in your toolchains and recommend it to others
+
+These uses do not require permission and do not imply endorsement by 3 Leaps, LLC.
+
+What we ask you not to do:
+
+- Create a separate product, service, or distribution called "seclusor" or
+  using "seclusor" as a prominent name element (e.g., "seclusor-pro",
+  "YourCo seclusor", "seclusor-enterprise")
+- Use "seclusor" in a way that suggests official affiliation with or
+  endorsement by 3 Leaps, LLC
+
+If you fork this project for internal use or as a base for a different tool,
+please choose a new name. The code is yours under MIT or Apache-2.0; the name
+is how we maintain a coherent identity for the community.
+
+For questions regarding project name usage, contact hello@3leaps.net.
