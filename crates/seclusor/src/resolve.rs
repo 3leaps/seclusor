@@ -4,9 +4,9 @@ use std::path::Path;
 
 use seclusor_crypto::{assert_identity_file_access, parse_recipients, Identity};
 use seclusor_keyring::{
-    discover_recipients, find_identity_path_by_public_key, is_passphrase_protected_identity,
-    load_identity_file_auto, KeyringError, Recipient, RecipientDiscoveryOptions,
-    DEFAULT_RECIPIENTS_ENV_VAR,
+    discover_recipients_from_env_var, discover_recipients_from_file,
+    find_identity_path_by_public_key, is_passphrase_protected_identity, load_identity_file_auto,
+    KeyringError, Recipient, DEFAULT_RECIPIENTS_ENV_VAR,
 };
 use secrecy::{ExposeSecret, SecretString};
 
@@ -22,18 +22,19 @@ pub(crate) fn resolve_recipients(args: &RecipientArgs) -> CliResult<Vec<Recipien
         )?);
     }
 
-    if args.recipient_file.is_some() || args.recipient_env_var.is_some() {
-        let discovered = discover_recipients(&RecipientDiscoveryOptions {
-            recipient_file: args.recipient_file.clone(),
-            recipient_env_var: args.recipient_env_var.clone(),
-        })?;
-        recipients.extend(discovered);
-    } else if recipients.is_empty() && std::env::var(DEFAULT_RECIPIENTS_ENV_VAR).is_ok() {
-        let discovered = discover_recipients(&RecipientDiscoveryOptions {
-            recipient_file: None,
-            recipient_env_var: Some(DEFAULT_RECIPIENTS_ENV_VAR.to_string()),
-        })?;
-        recipients.extend(discovered);
+    for path in &args.recipient_files {
+        recipients.extend(discover_recipients_from_file(path)?);
+    }
+
+    if let Some(env_var) = &args.recipient_env_var {
+        recipients.extend(discover_recipients_from_env_var(env_var)?);
+    } else if recipients.is_empty()
+        && args.recipient_files.is_empty()
+        && std::env::var(DEFAULT_RECIPIENTS_ENV_VAR).is_ok()
+    {
+        recipients.extend(discover_recipients_from_env_var(
+            DEFAULT_RECIPIENTS_ENV_VAR,
+        )?);
     }
 
     if recipients.is_empty() {
@@ -46,10 +47,18 @@ pub(crate) fn resolve_recipients(args: &RecipientArgs) -> CliResult<Vec<Recipien
     let mut seen = HashSet::new();
     recipients.retain(|recipient| seen.insert(recipient.to_string()));
 
+    let max = seclusor_core::constants::MAX_RECIPIENTS;
+    if recipients.len() > max {
+        return Err(CliError::Message(format!(
+            "recipient count {} exceeds maximum of {max}",
+            recipients.len()
+        )));
+    }
+
     Ok(recipients)
 }
 
-/// True when interactive readers can open a controlling console.
+/// True when interactive readers can open and read the foreground controlling console.
 ///
 /// rpassword 7.x does **not** read stdin: it opens `/dev/tty` (Unix) or
 /// `CONIN$` (Windows). Passphrase prompting uses this directly. Hidden value
@@ -58,14 +67,27 @@ pub(crate) fn resolve_recipients(args: &RecipientArgs) -> CliResult<Vec<Recipien
 /// piped value input to a controlling console.
 ///
 /// Preflight here mirrors the device rpassword opens so we fail closed before
-/// calling `read_password`, which can block indefinitely on some Windows
-/// noninteractive runners instead of returning an error.
+/// calling `read_password`, which can block indefinitely on Windows
+/// noninteractive runners or stop on `SIGTTOU`/`SIGTTIN` when a Unix caller
+/// (such as plain `timeout` without `--foreground`) places the process in a
+/// background process group.
 pub(crate) fn interactive_console_available() -> bool {
     #[cfg(unix)]
     {
         use std::io::IsTerminal;
+        use std::os::fd::AsRawFd;
         match std::fs::File::open("/dev/tty") {
-            Ok(f) => f.is_terminal(),
+            Ok(f) => {
+                if !f.is_terminal() {
+                    return false;
+                }
+                let fd = f.as_raw_fd();
+                // SAFETY: `fd` is a valid open file descriptor owned by `f`;
+                // `getpgrp` has no preconditions.
+                let fg_pgrp = unsafe { libc::tcgetpgrp(fd) };
+                let self_pgrp = unsafe { libc::getpgrp() };
+                fg_pgrp > 0 && fg_pgrp == self_pgrp
+            }
             Err(_) => false,
         }
     }
@@ -515,5 +537,63 @@ mod tests {
             err,
             CliError::Keyring(KeyringError::ProtectedIdentityNoPassphrase)
         ));
+    }
+
+    #[test]
+    fn resolve_recipients_merges_multiple_files_and_deduplicates_preserving_order() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let id1 = seclusor_keyring::generate_identity();
+        let id2 = seclusor_keyring::generate_identity();
+        let id3 = seclusor_keyring::generate_identity();
+
+        let file_a = dir.path().join("a.txt");
+        let file_b = dir.path().join("b.txt");
+        fs::write(
+            &file_a,
+            format!("# team a\n{}\n{}\n", id1.recipient, id2.recipient),
+        )
+        .expect("write a");
+        fs::write(
+            &file_b,
+            format!("# team b\n{}\n{}\n", id2.recipient, id3.recipient),
+        )
+        .expect("write b");
+
+        let resolved = resolve_recipients(&RecipientArgs {
+            recipients: vec![],
+            recipient_files: vec![file_a.clone(), file_b],
+            recipient_env_var: None,
+        })
+        .expect("resolve multiple files");
+        let as_strings: Vec<String> = resolved.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            as_strings,
+            vec![id1.recipient, id2.recipient, id3.recipient]
+        );
+
+        let missing = dir.path().join("missing.txt");
+        assert!(
+            resolve_recipients(&RecipientArgs {
+                recipients: vec![],
+                recipient_files: vec![file_a, missing],
+                recipient_env_var: None,
+            })
+            .is_err(),
+            "missing second recipient file must fail closed"
+        );
+    }
+
+    #[test]
+    fn resolve_recipients_rejects_above_max_recipients() {
+        let over: Vec<String> = (0..=seclusor_core::constants::MAX_RECIPIENTS)
+            .map(|_| seclusor_keyring::generate_identity().recipient)
+            .collect();
+        let err = resolve_recipients(&RecipientArgs {
+            recipients: over,
+            recipient_files: vec![],
+            recipient_env_var: None,
+        })
+        .expect_err("must reject > MAX_RECIPIENTS");
+        assert!(err.to_string().contains("exceeds maximum"));
     }
 }

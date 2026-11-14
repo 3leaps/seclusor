@@ -81,7 +81,7 @@ mod tests {
             value_env: None,
             recipients: RecipientArgs {
                 recipients: vec![],
-                recipient_file: Some(rfile.clone()),
+                recipient_files: vec![rfile.clone()],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {
@@ -113,7 +113,7 @@ mod tests {
             value_env: None,
             recipients: RecipientArgs {
                 recipients: vec![],
-                recipient_file: Some(rfile),
+                recipient_files: vec![rfile],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {
@@ -151,7 +151,7 @@ mod tests {
             value_env: None,
             recipients: RecipientArgs {
                 recipients: vec![],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: Some(var.to_string()),
             },
             identities: IdentityArgs {
@@ -182,7 +182,7 @@ mod tests {
             value_env: None,
             recipients: RecipientArgs {
                 recipients: vec![],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: Some(var.to_string()),
             },
             identities: IdentityArgs {
@@ -224,7 +224,7 @@ mod tests {
             create_project: false,
             recipients: RecipientArgs {
                 recipients: vec![],
-                recipient_file: Some(rfile.clone()),
+                recipient_files: vec![rfile.clone()],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {
@@ -253,7 +253,7 @@ mod tests {
             create_project: false,
             recipients: RecipientArgs {
                 recipients: vec![],
-                recipient_file: Some(rfile),
+                recipient_files: vec![rfile],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {
@@ -289,7 +289,7 @@ mod tests {
             create_project: false,
             recipients: RecipientArgs {
                 recipients: vec![],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: Some(var.to_string()),
             },
             identities: IdentityArgs {
@@ -318,7 +318,7 @@ mod tests {
             create_project: false,
             recipients: RecipientArgs {
                 recipients: vec![],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: Some(var.to_string()),
             },
             identities: IdentityArgs {
@@ -366,7 +366,7 @@ mod tests {
             value_env: None,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {
@@ -403,7 +403,7 @@ mod tests {
             write_recipients: None,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs::default(),
@@ -460,7 +460,7 @@ mod tests {
             value_env: None,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {
@@ -492,7 +492,7 @@ mod tests {
             write_recipients: None,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {
@@ -521,7 +521,7 @@ mod tests {
             write_recipients: None,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs::default(),
@@ -547,7 +547,7 @@ mod tests {
             write_recipients: None,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {
@@ -581,7 +581,7 @@ mod tests {
             output: bundle.clone(),
             recipients: RecipientArgs {
                 recipients: vec![recipient.clone()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
@@ -596,7 +596,7 @@ mod tests {
             write_recipients: None,
             recipients: RecipientArgs {
                 recipients: vec![recipient.clone()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {
@@ -655,7 +655,7 @@ mod tests {
             write_recipients: None,
             recipients: RecipientArgs {
                 recipients: vec![gen.recipient],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {
@@ -696,7 +696,7 @@ mod tests {
             output: bundle.clone(),
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string(), gen_b.recipient],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
@@ -719,7 +719,7 @@ mod tests {
             value_env: None,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {
@@ -751,7 +751,7 @@ mod tests {
             output: bundle.clone(),
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
@@ -774,7 +774,7 @@ mod tests {
                 value_env: None,
                 recipients: RecipientArgs {
                     recipients: vec![gen_c.recipient.clone()],
-                    recipient_file: None,
+                    recipient_files: vec![],
                     recipient_env_var: None,
                 },
                 identities: IdentityArgs {
@@ -827,7 +827,7 @@ mod tests {
             output: bundle.clone(),
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
@@ -845,7 +845,7 @@ mod tests {
             create_project: false,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {
@@ -884,7 +884,7 @@ mod tests {
             output: bundle.clone(),
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
@@ -904,7 +904,7 @@ mod tests {
             create_project: false,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string(), gen2.recipient],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {

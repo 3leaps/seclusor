@@ -77,7 +77,7 @@ mod tests {
             to: StorageCodecArg::Bundle,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {
@@ -95,7 +95,7 @@ mod tests {
             to: StorageCodecArg::Inline,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {
@@ -145,7 +145,7 @@ mod tests {
             to: StorageCodecArg::Inline,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {

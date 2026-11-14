@@ -25,8 +25,8 @@ use crate::handlers::encrypted_write::{
     emit_establishment_notice, emit_self_lockout_warning, emit_write_recipient_policy_notices,
     ensure_inline_stanza_count_matches, inline_establishment_coverage_ok,
     load_inline_full_for_write, recipient_channels_present, recipient_strings,
-    refuse_scrypt_bundle_write, resolve_set_material, resolve_write_recipients, SetMaterial,
-    ValueChannelArgs,
+    refuse_plaintext_recipient_intent, refuse_scrypt_bundle_write, resolve_set_material,
+    resolve_write_recipients, SetMaterial, ValueChannelArgs,
 };
 use crate::io::{
     probe_write_target, read_file_with_limit, read_runtime_document_file,
@@ -52,8 +52,8 @@ pub(crate) fn handle_init(args: InitArgs) -> CliResult<()> {
     // Recipient channels without --codec are never silently ignored.
     if recipient_channels_present(&args.recipients) && args.codec.is_none() {
         return Err(CliError::Message(
-            "recipient flags require --codec bundle on init (or omit recipients for \
-             plaintext init)"
+            "recipient flags require --codec bundle or --codec inline on init (or omit \
+             recipients for plaintext init)"
                 .to_string(),
         ));
     }
@@ -61,12 +61,7 @@ pub(crate) fn handle_init(args: InitArgs) -> CliResult<()> {
     match args.codec {
         None => handle_init_plaintext(args),
         Some(StorageCodecArg::Bundle) => handle_init_bundle(args),
-        Some(StorageCodecArg::Inline) => Err(CliError::Message(
-            "inline encrypted documents are created by encrypting a value — run \
-             `seclusor secrets init` then `set` with --recipient…, or `rekey`; \
-             use --codec bundle for an empty encrypted document"
-                .to_string(),
-        )),
+        Some(StorageCodecArg::Inline) => handle_init_inline(args),
     }
 }
 
@@ -142,6 +137,64 @@ fn handle_init_bundle(args: InitArgs) -> CliResult<()> {
     Ok(())
 }
 
+/// Encrypted init: create-only empty **inline** skeleton (`schema_version`
+/// `v1.1.0` + `recipients` metadata established so subsequent reads/writes
+/// classify the document as `DocumentSource::Inline`).
+fn handle_init_inline(args: InitArgs) -> CliResult<()> {
+    // Existence wins — no classify/mutate of an existing path.
+    if args.file.exists() {
+        return Err(CliError::Message(format!(
+            "encrypted init is create-only: {} already exists. To encrypt an \
+             existing document use `seclusor secrets rekey`; to reset to an empty \
+             encrypted skeleton, remove the file first",
+            args.file.display()
+        )));
+    }
+
+    // Explicit RecipientArgs only — ambient SECLUSOR_RECIPIENTS alone is insufficient.
+    if !recipient_channels_present(&args.recipients) {
+        return Err(CliError::Message(
+            "encrypted init requires at least one explicit --recipient, \
+             --recipient-file, or --recipient-env-var (ambient SECLUSOR_RECIPIENTS \
+             alone is not enough)"
+                .to_string(),
+        ));
+    }
+
+    let recipients = resolve_recipients(&args.recipients)?;
+    let as_strings = recipient_strings(&recipients);
+
+    let mut secrets = SecretsFile::new(&args.project);
+    secrets.env_prefix = args.env_prefix;
+    secrets.description = normalize_description(args.description.as_deref());
+    apply_establishment(&mut secrets, &as_strings)?;
+    validate_strict(&secrets)?;
+    ensure_no_plaintext_credential_values(&secrets)?;
+
+    let mut out = serde_json::to_vec_pretty(&secrets)?;
+    if !out.ends_with(b"\n") {
+        out.push(b'\n');
+    }
+    if out.len() > MAX_SECRETS_DOC_BYTES {
+        return Err(CliError::Core(SeclusorError::DocumentTooLarge {
+            actual: out.len(),
+            max: MAX_SECRETS_DOC_BYTES,
+        }));
+    }
+
+    atomic_write_ciphertext(
+        &args.file,
+        &out,
+        AtomicWriteOptions {
+            expected_prior_bytes: None,
+            create_new: true,
+        },
+    )?;
+    emit_establishment_notice(&as_strings);
+    println!("{}", args.file.display());
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) fn handle_set(args: SetArgs) -> CliResult<()> {
     handle_set_with_policy(args, false)
@@ -165,11 +218,21 @@ pub(crate) fn handle_set_with_policy(
 
     match probe_write_target(&args.file)? {
         WriteTargetProbe::Plaintext { secrets, .. } => {
+            refuse_plaintext_recipient_intent(
+                &args.file,
+                &args.recipients,
+                allow_recipient_mismatch,
+            )?;
             let mut args = args;
             apply_plaintext_set(secrets, &mut args)?;
             Ok(())
         }
         WriteTargetProbe::NotEncrypted(bytes) => {
+            refuse_plaintext_recipient_intent(
+                &args.file,
+                &args.recipients,
+                allow_recipient_mismatch,
+            )?;
             let secrets = secrets_from_bytes(&bytes)?;
             let mut args = args;
             apply_plaintext_set(secrets, &mut args)?;
@@ -478,10 +541,20 @@ fn handle_description_only_set(args: SetArgs, allow_recipient_mismatch: bool) ->
 
     match probe_write_target(&args.file)? {
         WriteTargetProbe::Plaintext { secrets, .. } => {
+            refuse_plaintext_recipient_intent(
+                &args.file,
+                &args.recipients,
+                allow_recipient_mismatch,
+            )?;
             apply_plaintext_description_only(secrets, &args)?;
             Ok(())
         }
         WriteTargetProbe::NotEncrypted(bytes) => {
+            refuse_plaintext_recipient_intent(
+                &args.file,
+                &args.recipients,
+                allow_recipient_mismatch,
+            )?;
             let secrets = secrets_from_bytes(&bytes)?;
             apply_plaintext_description_only(secrets, &args)?;
             Ok(())
@@ -706,26 +779,43 @@ pub(crate) fn handle_unset_with_policy(
             Err(refuse_encrypted_write(&args.file, source))
         }
         WriteTargetProbe::Plaintext { mut secrets, .. } => {
+            refuse_plaintext_recipient_intent(
+                &args.file,
+                &args.recipients,
+                allow_recipient_mismatch,
+            )?;
             unset_strict(&mut secrets, &args)?;
             write_secrets_file(&args.file, &secrets, false)?;
             println!("ok");
             Ok(())
         }
-        WriteTargetProbe::NotEncrypted(bytes) => match secrets_from_bytes(&bytes) {
-            Ok(mut secrets) => {
-                unset_strict(&mut secrets, &args)?;
-                write_secrets_file(&args.file, &secrets, false)?;
-                println!("ok");
-                Ok(())
+        WriteTargetProbe::NotEncrypted(bytes) => {
+            refuse_plaintext_recipient_intent(
+                &args.file,
+                &args.recipients,
+                allow_recipient_mismatch,
+            )?;
+            match secrets_from_bytes(&bytes) {
+                Ok(mut secrets) => {
+                    unset_strict(&mut secrets, &args)?;
+                    write_secrets_file(&args.file, &secrets, false)?;
+                    println!("ok");
+                    Ok(())
+                }
+                Err(err)
+                    if should_use_lenient_unset(
+                        &bytes,
+                        args.project.as_deref(),
+                        &args.key,
+                        &err,
+                    ) =>
+                {
+                    // Same bounded bytes through eligibility and mutation (no path reopen).
+                    handle_unset_lenient_bytes(args, bytes)
+                }
+                Err(err) => Err(err),
             }
-            Err(err)
-                if should_use_lenient_unset(&bytes, args.project.as_deref(), &args.key, &err) =>
-            {
-                // Same bounded bytes through eligibility and mutation (no path reopen).
-                handle_unset_lenient_bytes(args, bytes)
-            }
-            Err(err) => Err(err),
-        },
+        }
     }
 }
 
@@ -952,8 +1042,20 @@ pub(crate) fn handle_import_env_with_policy(
     allow_recipient_mismatch: bool,
 ) -> CliResult<()> {
     match probe_write_target(&args.file)? {
-        WriteTargetProbe::Plaintext { secrets, .. } => apply_import_env_plaintext(secrets, &args),
+        WriteTargetProbe::Plaintext { secrets, .. } => {
+            refuse_plaintext_recipient_intent(
+                &args.file,
+                &args.recipients,
+                allow_recipient_mismatch,
+            )?;
+            apply_import_env_plaintext(secrets, &args)
+        }
         WriteTargetProbe::NotEncrypted(bytes) => {
+            refuse_plaintext_recipient_intent(
+                &args.file,
+                &args.recipients,
+                allow_recipient_mismatch,
+            )?;
             let secrets = secrets_from_bytes(&bytes)?;
             apply_import_env_plaintext(secrets, &args)
         }
@@ -1372,7 +1474,7 @@ mod tests {
             output: bundle.clone(),
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
@@ -1420,7 +1522,7 @@ mod tests {
             output: bundle.clone(),
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
@@ -1459,7 +1561,7 @@ mod tests {
             output: bundle.clone(),
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
@@ -2009,7 +2111,7 @@ mod tests {
             output: bundle.clone(),
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
@@ -2047,7 +2149,7 @@ mod tests {
             output: bundle.clone(),
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
@@ -2090,7 +2192,7 @@ mod tests {
             output: bundle.clone(),
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
@@ -2247,7 +2349,7 @@ mod tests {
             output: bundle.clone(),
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
@@ -2287,7 +2389,7 @@ mod tests {
             output: bundle.clone(),
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
@@ -2379,7 +2481,7 @@ mod tests {
             output: bundle.clone(),
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
@@ -2513,7 +2615,7 @@ mod tests {
             value_env: None,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {
@@ -2564,7 +2666,7 @@ mod tests {
             value_env: None,
             recipients: RecipientArgs {
                 recipients: vec![recipient.clone()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {
@@ -2614,7 +2716,7 @@ mod tests {
             codec: None,
             recipients: RecipientArgs {
                 recipients: vec![],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
@@ -2626,7 +2728,7 @@ mod tests {
     fn empty_recipient_args() -> RecipientArgs {
         RecipientArgs {
             recipients: vec![],
-            recipient_file: None,
+            recipient_files: vec![],
             recipient_env_var: None,
         }
     }
@@ -2648,7 +2750,7 @@ mod tests {
             codec: Some(crate::cli::StorageCodecArg::Bundle),
             recipients: RecipientArgs {
                 recipients: vec![recipient.clone()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
@@ -2693,7 +2795,7 @@ mod tests {
             codec: Some(crate::cli::StorageCodecArg::Bundle),
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
@@ -2708,28 +2810,51 @@ mod tests {
     }
 
     #[test]
-    fn init_codec_inline_refuses() {
+    fn init_inline_create_only_roundtrip() {
         let dir = tempfile::tempdir().expect("temp");
-        let path = dir.path().join("nope.json");
-        let names = list_sibling_names(dir.path());
-        let err = handle_init(InitArgs {
-            file: path.clone(),
-            project: "default".into(),
-            env_prefix: None,
-            description: None,
+        let out = dir.path().join("fresh-inline.json");
+        let id = dir.path().join("id.txt");
+        write_identity_file(&id, TEST_IDENTITY);
+        let recipient = fixture_recipient_string();
+
+        handle_init(InitArgs {
+            file: out.clone(),
+            project: "myapp".into(),
+            env_prefix: Some("APP_".into()),
+            description: Some("demo".into()),
             force: false,
             codec: Some(crate::cli::StorageCodecArg::Inline),
             recipients: RecipientArgs {
-                recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipients: vec![recipient.clone()],
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
-        .expect_err("inline codec");
-        let msg = err.to_string().to_lowercase();
-        assert!(msg.contains("inline"), "{msg}");
-        assert!(!path.exists());
-        assert_eq!(list_sibling_names(dir.path()), names);
+        .expect("inline init");
+
+        assert!(out.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&out).expect("meta").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "fresh inline skeleton must be 0600");
+        }
+
+        let bytes = fs::read(&out).expect("read");
+        assert_eq!(
+            seclusor_codec::classify_document_bytes(&bytes).expect("classify"),
+            seclusor_codec::DocumentSource::Inline
+        );
+        let secrets = seclusor_codec::deserialize_json(&bytes).expect("deserialize");
+        assert_eq!(secrets.schema_version, "v1.1.0");
+        assert_eq!(
+            secrets.recipients.as_deref(),
+            Some(std::slice::from_ref(&recipient))
+        );
+        assert_eq!(secrets.projects[0].project_slug, "myapp");
+        assert_eq!(secrets.env_prefix.as_deref(), Some("APP_"));
+        assert_eq!(secrets.description.as_deref(), Some("demo"));
+        assert!(secrets.projects[0].credentials.is_empty());
     }
 
     #[test]
@@ -2745,7 +2870,7 @@ mod tests {
             codec: Some(crate::cli::StorageCodecArg::Bundle),
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
@@ -2767,7 +2892,7 @@ mod tests {
             codec: None,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
@@ -3092,7 +3217,7 @@ mod tests {
             output: bundle.clone(),
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
@@ -3113,7 +3238,7 @@ mod tests {
             value_env: None,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {
@@ -3157,7 +3282,7 @@ mod tests {
             output: bundle.clone(),
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
@@ -3169,7 +3294,7 @@ mod tests {
             key: "API_KEY".to_string(),
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {
@@ -3664,7 +3789,7 @@ mod tests {
             output: bundle.clone(),
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
@@ -3686,7 +3811,7 @@ mod tests {
             value_env: None,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs::default(),
@@ -3711,7 +3836,7 @@ mod tests {
             output: bundle.clone(),
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
@@ -3732,7 +3857,7 @@ mod tests {
             value_env: None,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {
@@ -3771,7 +3896,7 @@ mod tests {
             output: bundle.clone(),
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
@@ -3798,7 +3923,7 @@ mod tests {
             value_env: None,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string(), r2],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {
@@ -3835,7 +3960,7 @@ mod tests {
             output: bundle.clone(),
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string(), gen_b.recipient.clone()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
@@ -3861,7 +3986,7 @@ mod tests {
             value_env: None,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {
@@ -3892,7 +4017,7 @@ mod tests {
             output: bundle.clone(),
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
@@ -3913,7 +4038,7 @@ mod tests {
             value_env: None,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {
@@ -3971,7 +4096,7 @@ mod tests {
             value_env: None,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {
@@ -4011,7 +4136,7 @@ mod tests {
             value_env: None,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs::default(),
@@ -4228,7 +4353,7 @@ mod tests {
             create_project: false,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {
@@ -4272,7 +4397,7 @@ mod tests {
             create_project: false,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs::default(),
@@ -4298,7 +4423,7 @@ mod tests {
             create_project: false,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {
@@ -4329,7 +4454,7 @@ mod tests {
             output: bundle.clone(),
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
@@ -4347,7 +4472,7 @@ mod tests {
             create_project: false,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {
@@ -4383,7 +4508,7 @@ mod tests {
             create_project: false,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs::default(),
@@ -4409,7 +4534,7 @@ mod tests {
             create_project: false,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {
@@ -4459,7 +4584,7 @@ mod tests {
             value_env: None,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {

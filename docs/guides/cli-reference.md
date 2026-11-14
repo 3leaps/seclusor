@@ -212,12 +212,24 @@ seclusor secrets export-env --file secrets.age \
 layer, so pipes, redirects, glob expansion, and `$VAR` interpolation only work if
 you wrap them explicitly in a shell.
 
+Use `--clean-env` to clear inherited ambient variables down to a minimal OS
+baseline (`PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `LANG`, `LC_ALL`,
+`LC_CTYPE`, `TMPDIR`, `TZ` on Unix; standard system/profile roots plus `PATH`,
+`TEMP`, `TMP`, `USERNAME` on Windows) plus any exact variable names listed via
+repeatable `--env-allow <VAR>`, overlaid with the selected project credentials.
+Named `--passphrase-env` variables and passphrase-equal alias values are still
+refused/scrubbed unconditionally.
+
 ```bash
 # This does NOT work (no shell):
 seclusor secrets run --file secrets.age --identity-file ./identity.txt --project demo -- echo $APP_API_KEY | base64
 
 # This works:
 seclusor secrets run --file secrets.age --identity-file ./identity.txt --project demo -- sh -c 'echo "$APP_API_KEY" | base64'
+
+# Clean child environment with explicit ambient pass-through:
+seclusor secrets run --file secrets.age --identity-file ./identity.txt \
+  --project demo --clean-env --env-allow SSH_AUTH_SOCK -- ./deploy-tool
 
 # Windows:
 seclusor secrets run --file secrets.age --identity-file .\\identity.txt --project demo -- cmd /c "echo %APP_API_KEY%"

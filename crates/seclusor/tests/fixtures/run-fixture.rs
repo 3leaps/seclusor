@@ -11,6 +11,8 @@ fn main() {
 
     match mode.as_str() {
         "dump" => dump(args.collect()),
+        "dump-all" => dump_all(args.collect()),
+        "probe-stdin" => probe_stdin(),
         "exit" => exit_with(args.next()),
         _ => {
             eprintln!("unknown mode: {mode}");
@@ -54,6 +56,52 @@ fn dump(args: Vec<String>) {
         }
     }
     println!("}}}}");
+}
+
+fn dump_all(args: Vec<String>) {
+    let mut env_map = BTreeMap::new();
+    for (key, value) in env::vars() {
+        env_map.insert(key, value);
+    }
+
+    print!("{{\"args\":[");
+    for (idx, arg) in args.iter().enumerate() {
+        if idx > 0 {
+            print!(",");
+        }
+        print!("\"{}\"", escape_json(arg));
+    }
+    print!("],\"env\":{{");
+    for (idx, (key, value)) in env_map.iter().enumerate() {
+        if idx > 0 {
+            print!(",");
+        }
+        print!("\"{}\":\"{}\"", escape_json(key), escape_json(value));
+    }
+    println!("}}}}");
+}
+
+fn probe_stdin() {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    #[cfg(unix)]
+    {
+        use std::io::Seek;
+        use std::os::fd::FromRawFd;
+        // Attempt to rewind FD 0 in case a seekable file backed `--passphrase-stdin`.
+        let mut f = unsafe { std::fs::File::from_raw_fd(0) };
+        let _ = f.rewind();
+        let _ = f.read_to_end(&mut bytes);
+        std::mem::forget(f);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = std::io::stdin().read_to_end(&mut bytes);
+    }
+    print!(
+        "{{\"stdin\":\"{}\"}}",
+        escape_json(&String::from_utf8_lossy(&bytes))
+    );
 }
 
 fn exit_with(code: Option<String>) {

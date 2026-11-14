@@ -72,7 +72,7 @@ pub(crate) fn handle_rekey_with_policy(
         &output_path,
         &identity_paths,
         args.passphrase.passphrase_file.as_deref(),
-        args.recipients.recipient_file.as_deref(),
+        &args.recipients.recipient_files,
     )?;
     let new_recipients = resolve_recipients(&args.recipients)?;
     let new_strings = recipient_strings(&new_recipients);
@@ -356,7 +356,7 @@ fn prepare_recipient_refresh_target(
     output_path: &Path,
     identity_paths: &[PathBuf],
     passphrase_path: Option<&Path>,
-    recipient_input_path: Option<&Path>,
+    recipient_input_paths: &[PathBuf],
 ) -> CliResult<Option<RecipientRefreshTarget>> {
     let Some(path) = path else {
         return Ok(None);
@@ -371,7 +371,7 @@ fn prepare_recipient_refresh_target(
     if let Some(passphrase_path) = passphrase_path {
         reject_recipient_refresh_alias(&path, passphrase_path, "--passphrase-file")?;
     }
-    if let Some(recipient_input_path) = recipient_input_path {
+    for recipient_input_path in recipient_input_paths {
         let exact_input_target = resolve_recipient_refresh_target(recipient_input_path)?;
         let same_resolved_path = normalize_path_for_comparison(&path)?
             == normalize_path_for_comparison(&exact_input_target)?;
@@ -621,7 +621,7 @@ mod tests {
             write_recipients: None,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {
@@ -663,7 +663,7 @@ mod tests {
             write_recipients: None,
             recipients: RecipientArgs {
                 recipients: vec![generated.recipient.clone()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {
@@ -686,7 +686,7 @@ mod tests {
                 write_recipients: None,
                 recipients: RecipientArgs {
                     recipients: vec![generated.recipient.clone()],
-                    recipient_file: None,
+                    recipient_files: vec![],
                     recipient_env_var: None,
                 },
                 identities: IdentityArgs {
@@ -741,7 +741,7 @@ mod tests {
                 write_recipients: Some(recipient_file.clone()),
                 recipients: RecipientArgs {
                     recipients: vec![],
-                    recipient_file: Some(recipient_file.clone()),
+                    recipient_files: vec![recipient_file.clone()],
                     recipient_env_var: None,
                 },
                 identities: IdentityArgs {
@@ -798,7 +798,7 @@ mod tests {
                 write_recipients: Some(recipient_file.clone()),
                 recipients: RecipientArgs {
                     recipients: vec![generated.recipient.clone()],
-                    recipient_file: None,
+                    recipient_files: vec![],
                     recipient_env_var: None,
                 },
                 identities: IdentityArgs {
@@ -850,7 +850,7 @@ mod tests {
                 write_recipients: Some(alias.clone()),
                 recipients: RecipientArgs {
                     recipients: vec![fixture_recipient_string()],
-                    recipient_file: None,
+                    recipient_files: vec![],
                     recipient_env_var: None,
                 },
                 identities: IdentityArgs {
@@ -871,7 +871,7 @@ mod tests {
             write_recipients: Some(output),
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {
@@ -892,7 +892,7 @@ mod tests {
             write_recipients: Some(passphrase_file.clone()),
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {
@@ -924,7 +924,7 @@ mod tests {
             write_recipients: Some(alias),
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {
@@ -954,7 +954,7 @@ mod tests {
             write_recipients: None,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {
@@ -987,7 +987,7 @@ mod tests {
             write_recipients: None,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {
@@ -1020,7 +1020,7 @@ mod tests {
             &dir.path().join("output.json"),
             &[],
             None,
-            Some(&recipient_input),
+            std::slice::from_ref(&recipient_input),
         )
         .expect_err("distinct hardlink alias must refuse");
         assert!(error.to_string().contains("--recipient-file"));
@@ -1055,7 +1055,7 @@ mod tests {
                 write_recipients: Some(recipient_link.clone()),
                 recipients: RecipientArgs {
                     recipients: vec![],
-                    recipient_file: Some(recipient_link.clone()),
+                    recipient_files: vec![recipient_link.clone()],
                     recipient_env_var: None,
                 },
                 identities: IdentityArgs {
@@ -1124,7 +1124,7 @@ mod tests {
             output: bundle.clone(),
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
@@ -1136,7 +1136,7 @@ mod tests {
             write_recipients: None,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {
@@ -1177,7 +1177,7 @@ mod tests {
             write_recipients: None,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {
@@ -1221,7 +1221,7 @@ mod tests {
             write_recipients: None,
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
             identities: IdentityArgs {

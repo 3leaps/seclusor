@@ -77,7 +77,7 @@ mod tests {
             output: output.clone(),
             recipients: RecipientArgs {
                 recipients: vec![recipient.to_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })

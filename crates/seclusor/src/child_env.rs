@@ -24,13 +24,41 @@ use subtle::ConstantTimeEq;
 
 /// How the child base environment is formed.
 ///
-/// `InheritAmbient` is the only policy shipped in 0.2.1. A future clean-base
-/// policy is a separate base-*width* decision (not what provides the exclusion
-/// guarantee).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `InheritAmbient` snapshots ambient − excluded + injected. `Clean` starts
+/// from a minimal platform baseline plus exact caller-named `env_allow`
+/// pass-through keys, still enforcing `excluded` and value-equality checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BasePolicy {
     InheritAmbient,
+    Clean { env_allow: Vec<String> },
 }
+
+#[cfg(unix)]
+const CLEAN_BASELINE_NAMES: &[&str] = &[
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR",
+    "TZ",
+];
+
+#[cfg(windows)]
+const CLEAN_BASELINE_NAMES: &[&str] = &[
+    "SystemRoot",
+    "SystemDrive",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "PATH",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "USERNAME",
+];
+
+#[cfg(not(any(unix, windows)))]
+const CLEAN_BASELINE_NAMES: &[&str] = &["PATH"];
 
 /// Names that must never appear in the child environment.
 ///
@@ -77,6 +105,10 @@ impl ExcludedNames {
 pub(crate) enum ChildEnvError {
     /// An injected store key name equals an excluded passphrase-env name.
     PassphraseVarCollision { name: String },
+    /// A `--env-allow` key name equals an excluded passphrase-env name.
+    PassphraseAllowCollision { name: String },
+    /// Invalid `--env-allow` variable identifier (empty, assignment, glob, or whitespace/control).
+    InvalidEnvAllow { reason: String },
     /// Some effective child env entry's value equals the resolved passphrase.
     PassphraseValueExposure { var_name: String },
     /// Resolved passphrase was empty (must be rejected by resolve channels).
@@ -91,6 +123,12 @@ impl std::fmt::Display for ChildEnvError {
                 "refusing to inject store key `{name}`: name collides with the \
                  identity passphrase environment variable"
             ),
+            Self::PassphraseAllowCollision { name } => write!(
+                f,
+                "refusing to allow environment variable `{name}`: name collides with the \
+                 identity passphrase environment variable"
+            ),
+            Self::InvalidEnvAllow { reason } => write!(f, "invalid --env-allow entry: {reason}"),
             Self::PassphraseValueExposure { var_name } => write!(
                 f,
                 "refusing to run: environment variable `{var_name}` would expose \
@@ -128,6 +166,26 @@ impl std::fmt::Debug for ChildEnv {
 }
 
 impl ChildEnv {
+    /// Validate `base` and `excluded` compatibility before secret/passphrase I/O.
+    ///
+    /// Repeated inside [`ChildEnv::build`] so the chokepoint remains self-contained.
+    pub(crate) fn preflight(
+        base: &BasePolicy,
+        excluded: &ExcludedNames,
+    ) -> Result<(), ChildEnvError> {
+        if let BasePolicy::Clean { env_allow } = base {
+            for raw_name in env_allow {
+                validate_env_allow_name(raw_name)?;
+                if excluded.contains_name(raw_name) {
+                    return Err(ChildEnvError::PassphraseAllowCollision {
+                        name: raw_name.clone(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Build and verify a child environment.
     ///
     /// `excluded` is a required parameter (not `Option`). Use
@@ -135,13 +193,16 @@ impl ChildEnv {
     ///
     /// When `passphrase` is `Some`, performs a terminal value-equality assertion
     /// over the **effective** child environment (snapshotted ambient under
-    /// `InheritAmbient`, after exclusions and injection override precedence).
+    /// `InheritAmbient` or baseline+allowlist under `Clean`, after exclusions
+    /// and injection override precedence).
     pub(crate) fn build(
         base: BasePolicy,
         injected: &[EnvVar],
         excluded: &ExcludedNames,
         passphrase: Option<&SecretString>,
     ) -> Result<Self, ChildEnvError> {
+        Self::preflight(&base, excluded)?;
+
         // Name collision: fail closed before any spawn path exists.
         for env in injected {
             if excluded.contains_name(&env.key) {
@@ -167,6 +228,7 @@ impl ChildEnv {
 
         let entries = match base {
             BasePolicy::InheritAmbient => snapshot_inherit_ambient(injected, excluded),
+            BasePolicy::Clean { ref env_allow } => snapshot_clean(env_allow, injected, excluded),
         };
 
         if let Some(pp) = passphrase {
@@ -243,6 +305,48 @@ fn os_name_matches_injected(name: &OsStr, injected: &[EnvVar]) -> bool {
     }
 }
 
+fn validate_env_allow_name(name: &str) -> Result<(), ChildEnvError> {
+    if name.trim().is_empty() {
+        return Err(ChildEnvError::InvalidEnvAllow {
+            reason: "variable name must not be empty".to_string(),
+        });
+    }
+    // Check `=` before echoing `name` so accidental `KEY=secret` never leaks RHS.
+    if name.contains('=') {
+        return Err(ChildEnvError::InvalidEnvAllow {
+            reason: "expected an exact variable name, not a KEY=VALUE assignment".to_string(),
+        });
+    }
+    if name
+        .chars()
+        .any(|ch| ch.is_whitespace() || ch.is_control() || ch == '\0')
+    {
+        return Err(ChildEnvError::InvalidEnvAllow {
+            reason: "variable name must not contain whitespace or control characters".to_string(),
+        });
+    }
+    if name.contains(['*', '?', '[', ']']) {
+        return Err(ChildEnvError::InvalidEnvAllow {
+            reason: format!(
+                "`{name}` contains glob characters; --env-allow accepts exact variable names only"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn os_name_matches_clean_allowlist(name: &OsStr, env_allow: &[String]) -> bool {
+    let Some(candidate) = name.to_str() else {
+        return false;
+    };
+    CLEAN_BASELINE_NAMES
+        .iter()
+        .any(|baseline| env_names_equal(baseline, candidate))
+        || env_allow
+            .iter()
+            .any(|allowed| env_names_equal(allowed, candidate))
+}
+
 /// Snapshot ambient − excluded + injected into an explicit entry list.
 fn snapshot_inherit_ambient(
     injected: &[EnvVar],
@@ -261,6 +365,37 @@ fn snapshot_inherit_ambient(
         entries.push((key, value));
     }
 
+    append_injected_entries(&mut entries, injected);
+    entries
+}
+
+/// Snapshot (baseline ∪ env_allow) − excluded + injected into an explicit entry list.
+fn snapshot_clean(
+    env_allow: &[String],
+    injected: &[EnvVar],
+    excluded: &ExcludedNames,
+) -> Vec<(OsString, OsString)> {
+    let mut entries: Vec<(OsString, OsString)> = Vec::new();
+
+    for (key, value) in std::env::vars_os() {
+        if excluded.contains_os_name(&key) {
+            continue;
+        }
+        if !os_name_matches_clean_allowlist(&key, env_allow) {
+            continue;
+        }
+        if os_name_matches_injected(&key, injected) {
+            // Injection overrides baseline/allowed; the injected value is added below.
+            continue;
+        }
+        entries.push((key, value));
+    }
+
+    append_injected_entries(&mut entries, injected);
+    entries
+}
+
+fn append_injected_entries(entries: &mut Vec<(OsString, OsString)>, injected: &[EnvVar]) {
     for env in injected {
         // On Windows, drop any residual ambient key that case-matches before insert.
         #[cfg(windows)]
@@ -272,8 +407,6 @@ fn snapshot_inherit_ambient(
         }
         entries.push((OsString::from(&env.key), OsString::from(&env.value)));
     }
-
-    entries
 }
 
 #[cfg(test)]
@@ -679,5 +812,109 @@ mod tests {
         )
         .expect("unix case-sensitive: my_pp != My_Pp");
         assert!(!excluded.contains_name("my_pp"));
+    }
+
+    #[test]
+    fn clean_policy_strips_unlisted_ambient_and_passes_allowed_and_injected() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        std::env::set_var(
+            "SECLUSOR_TEST_UNLISTED_TOKEN",
+            "unlisted-ambient-token-canary",
+        );
+        std::env::set_var("SECLUSOR_TEST_ALLOWED_VAR", "allowed-ambient-val");
+
+        let child = ChildEnv::build(
+            BasePolicy::Clean {
+                env_allow: vec!["SECLUSOR_TEST_ALLOWED_VAR".to_string()],
+            },
+            &[inj("APP_KEY", "injected-secret")],
+            &ExcludedNames::none(),
+            None,
+        )
+        .expect("clean build");
+
+        std::env::remove_var("SECLUSOR_TEST_UNLISTED_TOKEN");
+        std::env::remove_var("SECLUSOR_TEST_ALLOWED_VAR");
+
+        let map: std::collections::BTreeMap<String, String> = child
+            .entries
+            .iter()
+            .filter_map(|(k, v)| Some((k.to_str()?.to_owned(), v.to_str()?.to_owned())))
+            .collect();
+        assert!(!map.contains_key("SECLUSOR_TEST_UNLISTED_TOKEN"));
+        assert_eq!(
+            map.get("SECLUSOR_TEST_ALLOWED_VAR").map(String::as_str),
+            Some("allowed-ambient-val")
+        );
+        assert_eq!(
+            map.get("APP_KEY").map(String::as_str),
+            Some("injected-secret")
+        );
+    }
+
+    #[test]
+    fn clean_policy_rejects_passphrase_allow_collision_and_invalid_names() {
+        let excluded = ExcludedNames::from_names(["SECLUSOR_PP"]);
+        let collision = ChildEnv::build(
+            BasePolicy::Clean {
+                env_allow: vec!["SECLUSOR_PP".to_string()],
+            },
+            &[],
+            &excluded,
+            None,
+        )
+        .expect_err("allow collision must fail closed");
+        assert!(matches!(
+            collision,
+            ChildEnvError::PassphraseAllowCollision { ref name } if name == "SECLUSOR_PP"
+        ));
+
+        for invalid in ["", "   ", "FOO*", "FOO?", "FOO[0]", " FOO", "FOO\tBAR"] {
+            let err = ChildEnv::build(
+                BasePolicy::Clean {
+                    env_allow: vec![invalid.to_string()],
+                },
+                &[],
+                &ExcludedNames::none(),
+                None,
+            )
+            .expect_err("invalid env-allow must fail");
+            assert!(matches!(err, ChildEnvError::InvalidEnvAllow { .. }));
+        }
+
+        let assignment_err = ChildEnv::build(
+            BasePolicy::Clean {
+                env_allow: vec!["API_TOKEN=canary-rhs-must-not-echo".to_string()],
+            },
+            &[],
+            &ExcludedNames::none(),
+            None,
+        )
+        .expect_err("assignment in env-allow must fail");
+        let rendered = assignment_err.to_string();
+        assert!(!rendered.contains("canary-rhs-must-not-echo"), "{rendered}");
+    }
+
+    #[test]
+    fn clean_policy_enforces_passphrase_value_equality_on_allowed_var() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let secret = "unit-test-clean-alias-pp";
+        std::env::set_var("SECLUSOR_TEST_CLEAN_ALIAS", secret);
+        let result = ChildEnv::build(
+            BasePolicy::Clean {
+                env_allow: vec!["SECLUSOR_TEST_CLEAN_ALIAS".to_string()],
+            },
+            &[inj("APP_KEY", "safe")],
+            &ExcludedNames::from_names(["NAMED_PP"]),
+            Some(&pp(secret)),
+        );
+        std::env::remove_var("SECLUSOR_TEST_CLEAN_ALIAS");
+        let err = result.expect_err("allowed alias matching passphrase must fail closed");
+        assert!(matches!(
+            err,
+            ChildEnvError::PassphraseValueExposure { ref var_name }
+                if var_name == "SECLUSOR_TEST_CLEAN_ALIAS"
+        ));
+        assert!(!err.to_string().contains(secret));
     }
 }

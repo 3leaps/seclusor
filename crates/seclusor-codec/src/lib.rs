@@ -549,7 +549,8 @@ pub fn decrypt_bundle_from_file(
 ///
 /// Bundle markers take precedence (fail-closed). Valid JSON is then classified
 /// as [`DocumentSource::Inline`] if any credential value carries the inline
-/// ciphertext prefix, otherwise [`DocumentSource::Plaintext`].
+/// ciphertext prefix or top-level `recipients` metadata is established,
+/// otherwise [`DocumentSource::Plaintext`].
 ///
 /// Classification is not validation: a document may classify as
 /// [`DocumentSource::Inline`] even when inline encodings are malformed. Use
@@ -560,7 +561,7 @@ pub fn classify_document_bytes(input: &[u8]) -> Result<DocumentSource> {
     }
 
     let secrets = deserialize_json(input)?;
-    if secrets.has_inline_ciphertext() {
+    if secrets.has_inline_ciphertext() || secrets.recipients.is_some() {
         Ok(DocumentSource::Inline)
     } else {
         Ok(DocumentSource::Plaintext)
@@ -577,8 +578,10 @@ pub fn classify_document_bytes(input: &[u8]) -> Result<DocumentSource> {
 /// - Bundle with identities → decrypt outer bundle; reject nested inline
 ///   ciphertext ([`CodecError::NestedInlineInBundle`]); else [`LoadMode::Full`]
 /// - Bundle without identities → [`CodecError::BundleIdentityRequired`]
-/// - Plaintext JSON → [`LoadMode::Full`] (nothing to decrypt)
-/// - Inline JSON with identities → decrypt inline values, [`LoadMode::Full`]
+/// - Plaintext JSON (no inline ciphertext and no `recipients` metadata) →
+///   [`LoadMode::Full`] (nothing to decrypt)
+/// - Inline JSON (inline ciphertext or established `recipients` metadata) with
+///   identities → decrypt inline values, [`LoadMode::Full`]
 /// - Inline JSON without identities → validate marker/base64/size for every
 ///   prefixed value (no decrypt), preserve ciphertext, [`LoadMode::StructuralOnly`]
 /// - Mixed plaintext + inline values: accepted; only prefixed values are shape-checked
@@ -599,7 +602,7 @@ pub fn resolve_runtime_document(input: &[u8], identities: &[Identity]) -> Result
 
     let secrets = deserialize_json(input)?;
 
-    if secrets.has_inline_ciphertext() {
+    if secrets.has_inline_ciphertext() || secrets.recipients.is_some() {
         if identities.is_empty() {
             validate_structural_inline_shapes(&secrets)?;
             return Ok(ResolvedDocument {
@@ -1068,8 +1071,9 @@ mod tests {
 
     #[test]
     fn resolve_runtime_document_accepts_v1_1_0_with_recipients() {
-        // Read loaders must accept schema v1.1.0 documents with optional recipients.
-        // Empty credentials: recipients + plaintext values fail closed (Slice 4).
+        // Schema v1.1.0 documents with established `recipients` metadata classify
+        // as Inline even when empty (0 encrypted credentials), so subsequent
+        // `secrets set` / `import-env` / `rekey` encrypt to the established set.
         let mut secrets = fixture_secrets();
         secrets.projects[0].credentials.clear();
         let recipient = fixture_recipient().to_string();
@@ -1077,14 +1081,24 @@ mod tests {
             .establish_recipients(vec![recipient])
             .expect("establish");
         let json = serde_json::to_vec(&secrets).expect("serialize");
-        let resolved = resolve_runtime_document(&json, &[]).expect("v1.1.0 resolve");
-        assert_eq!(resolved.source, DocumentSource::Plaintext);
-        assert_eq!(resolved.mode, LoadMode::Full);
+        assert_eq!(
+            classify_document_bytes(&json).expect("classify empty v1.1.0 inline"),
+            DocumentSource::Inline
+        );
+
+        let resolved = resolve_runtime_document(&json, &[]).expect("v1.1.0 structural resolve");
+        assert_eq!(resolved.source, DocumentSource::Inline);
+        assert_eq!(resolved.mode, LoadMode::StructuralOnly);
         assert_eq!(
             resolved.secrets.schema_version,
             seclusor_core::constants::SCHEMA_VERSION_V1_1_0
         );
         assert!(resolved.secrets.recipients.is_some());
+
+        let full =
+            resolve_runtime_document(&json, &[fixture_identity()]).expect("v1.1.0 full resolve");
+        assert_eq!(full.source, DocumentSource::Inline);
+        assert_eq!(full.mode, LoadMode::Full);
     }
 
     #[test]
