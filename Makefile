@@ -9,15 +9,15 @@
 #   make build      - Build all crates
 
 .PHONY: all help bootstrap bootstrap-prereqs bootstrap-release-tools bootstrap-format-tools bootstrap-rust-tools bootstrap-force tools check check-all test fmt fmt-check lint license-check build build-release clean
-.PHONY: ffi-header build-ffi go-bindings-sync go-bindings-ci go-build go-test go-test-committed ts-build ts-test embed-verify
-.PHONY: precommit prepush pr-final repo-status deny deny-all audit ci-security check-locked-builds check-child-env negative-control-locks parity-check parity-manifest-regen negative-control-parity miri msrv
+.PHONY: ffi-header build-ffi go-bindings-sync go-bindings-ci go-bindings-fetch go-build go-test go-test-committed ts-build ts-test embed-verify
+.PHONY: precommit prepush pr-final repo-status deny deny-all audit ci-security check-locked-builds check-child-env check-workflow-pins workflow-pins-sync negative-control-locks parity-check parity-manifest-regen negative-control-parity miri msrv
 .PHONY: check-windows check-windows-msvc check-windows-gnu
 .PHONY: install dogfood-cli
 .PHONY: version version-patch version-minor version-major version-set version-sync version-check
 .PHONY: ci release-check release-preflight embedded-docs-sync negative-control-embedded-docs
-.PHONY: release-clean release-download release-checksums release-sign release-export-keys
+.PHONY: release-clean release-download release-checksums release-sign release-export-keys release-stage-anchors release-insert-anchors
 .PHONY: release-verify release-verify-checksums release-verify-signatures release-verify-keys
-.PHONY: release-notes release-upload release-upload-all release
+.PHONY: release-notes release-create-draft release-upload release-upload-all release release-tag release-verify-tag release-push-tag release-verify-remote-tag release-guard-signing-env test-release-controls
 .PHONY: update-homebrew-formula update-scoop-manifest
 
 # -----------------------------------------------------------------------------
@@ -30,7 +30,7 @@ VERSION := $(shell cargo metadata --format-version 1 --no-deps 2>/dev/null | \
 BIN_DIR := $(CURDIR)/bin
 
 SFETCH_VERSION ?= v0.4.11
-GONEAT_VERSION ?= v0.5.16
+GONEAT_VERSION ?= v0.6.0
 PRETTIER_VERSION ?= 3.8.3
 BIOME_VERSION ?= 2.4.15
 YAMLFMT_VERSION ?= v0.21.0
@@ -71,6 +71,7 @@ help: ## Show available targets
 	@echo "  build-ffi       Build seclusor-ffi static and shared libraries"
 	@echo "  go-bindings-sync  Sync generated header + static lib into Go bindings"
 	@echo "  go-bindings-ci    Dispatch Go bindings prep workflow for current VERSION"
+	@echo "  go-bindings-fetch Download + verify Go bindings CI bundle into working tree"
 	@echo "  go-build        Build Go bindings module"
 	@echo "  go-test         Run Go bindings tests"
 	@echo "  go-test-committed  Run Go bindings tests against committed prebuilt lib"
@@ -94,23 +95,30 @@ help: ## Show available targets
 	@echo "  deny            Run cargo-deny license checks (offline-safe)"
 	@echo "  deny-all        Run full cargo-deny checks (includes advisories)"
 	@echo "  audit           Run cargo-audit security scan"
+	@echo "  check-workflow-pins Verify workflow SHA-256 pins and read-only policy"
 	@echo "  check-windows   Run Windows target cargo checks (no link)"
 	@echo ""
 	@echo "Release:"
 	@echo "  release-preflight  Verify all pre-tag requirements (REQUIRED before tagging)"
+	@echo "  release-insert-anchors  Generate public-key fingerprint anchors (maintainer only)"
+	@echo "  release-tag       Create both signed release tags locally (maintainer only)"
+	@echo "  release-verify-tag Verify both local signed tags"
+	@echo "  release-push-tag  Push both signed tags after the cue (maintainer only)"
+	@echo "  release-verify-remote-tag  Check both GitHub Verified tags"
 	@echo "  release-check      Version consistency + package check"
 	@echo "  embedded-docs-sync Refresh the packaged embedded-doc snapshot"
 	@echo "  negative-control-embedded-docs Prove embedded-doc fail-closed checks"
-	@echo "  release-clean      Remove dist/release contents"
-	@echo "  release-download   Download release assets from GitHub"
+	@echo "  release-clean      Remove dist/release contents and anchor state"
+	@echo "  release-download   Download + verify CI release bundle from GitHub Actions"
 	@echo "  release-checksums  Generate SHA256SUMS and SHA512SUMS"
 	@echo "  release-sign       Sign checksum manifests (minisign + PGP)"
 	@echo "  release-export-keys Export public signing keys"
 	@echo "  release-verify     Verify checksums, signatures, and keys"
-	@echo "  release-notes      Copy release notes to dist"
-	@echo "  release-upload     Upload provenance (checksums, signatures, keys, notes)"
-	@echo "  release-upload-all Upload all assets including platform binaries"
-	@echo "  release            Full signing workflow (clean -> upload)"
+	@echo "  release-notes      Extract release notes to dist"
+	@echo "  release-create-draft Create verified draft release on GitHub"
+	@echo "  release-upload     Upload provenance to an existing draft release"
+	@echo "  release-upload-all Upload all assets to an existing draft release"
+	@echo "  release            Full local signing + draft creation workflow"
 	@echo "  update-homebrew-formula  Update homebrew-tap formula (requires sibling)"
 	@echo "  update-scoop-manifest   Update scoop-bucket manifest (requires sibling)"
 	@echo ""
@@ -361,7 +369,7 @@ tools: ## Verify external tools are available
 # Quality Gates
 # -----------------------------------------------------------------------------
 
-check: fmt-check lint test deny license-check check-child-env ## Run all quality checks
+check: fmt-check lint test deny license-check check-child-env check-workflow-pins ## Run all quality checks
 	@echo "[ok] All quality checks passed"
 
 check-all: check ## Back-compat alias for older docs/tools
@@ -521,6 +529,13 @@ check-child-env: ## Static guard: child env mutations only at ChildEnv chokepoin
 	@echo "Proving the child-env guard rejects bypasses..."
 	./scripts/negative-control-child-env-guard.sh
 
+check-workflow-pins: ## Verify workflow SHA-256 pins and read-only policy
+	@echo "Checking workflow pins and read-only policy..."
+	python3 -B -E scripts/release-workflow-pin.py check
+
+workflow-pins-sync: ## Recompute config/release/release-workflow.sha256 after workflow edits
+	python3 -B -E scripts/release-workflow-pin.py write
+
 negative-control-locks: ## Prove the real build entrypoints fail on a stale lock (EPR-0001 conformance; resolves the graph, needs the registry index)
 	@echo "Running lockfile-enforcement negative controls..."
 	./scripts/negative-control-locks.sh
@@ -590,6 +605,9 @@ go-bindings-ci: ## Dispatch Go bindings prep workflow for current VERSION
 	@echo "Dispatching Go bindings prep workflow for v$(VERSION)..."
 	@gh workflow run go-bindings.yml -f version=$(VERSION)
 	@echo "[ok] Workflow dispatched"
+
+go-bindings-fetch: ## Download + verify Go bindings CI bundle into working tree
+	./scripts/go-bindings-fetch-ci-artifacts.sh
 
 go-build: go-bindings-sync ## Build Go bindings
 	@echo "Building Go bindings..."
@@ -800,7 +818,7 @@ version-check: ## Validate version consistency across files
 # CI/CD
 # -----------------------------------------------------------------------------
 
-ci: fmt-check lint test deny license-check version-check check-child-env negative-control-embedded-docs ## Run exactly what CI runs
+ci: fmt-check lint test deny license-check version-check check-child-env check-workflow-pins negative-control-embedded-docs test-release-controls ## Run exactly what CI runs
 	@echo "[ok] CI checks passed"
 
 release-check: version-check ## Version consistency + package check
@@ -816,10 +834,10 @@ release-check: version-check ## Version consistency + package check
 	@echo ""
 	@echo "Next steps:"
 	@echo "  1. make release-preflight"
-	@echo "  2. git tag v$$(cat $(VERSION_FILE))"
-	@echo "  3. git push origin v$$(cat $(VERSION_FILE))"
-	@echo "  4. Wait for CI + release workflow"
-	@echo "  5. make release (sign + upload)"
+	@echo "  2. make release-tag && make release-verify-tag"
+	@echo "  3. After the cue: make release-push-tag && make release-verify-remote-tag"
+	@echo "  4. Wait for read-only CI + release workflow"
+	@echo "  5. RELEASE_RUN_ID=<id> RELEASE_RUN_ATTEMPT=<n> make release (download + sign + create draft)"
 
 embedded-docs-sync: ## Refresh the packaged embedded-doc snapshot
 	@SECLUSOR_UPDATE_EMBEDDED_DOCS=1 $(CARGO) check -p seclusor
@@ -834,34 +852,63 @@ negative-control-embedded-docs: ## Prove embedded-doc fail-closed checks
 #
 # Workflow:
 # 1. Pre-tag: make release-preflight
-# 2. Tag and push: git tag vX.Y.Z && git push origin vX.Y.Z
-# 3. Wait for GitHub Actions release workflow to create draft release
-# 4. Sign locally: make release (or individual steps below)
+# 2. The maintainer creates and verifies both signed tags, then pushes on cue
+# 3. Wait for read-only GitHub Actions release workflow to stage artifact bundle
+# 4. Sign and create draft locally: RELEASE_RUN_ID=<id> RELEASE_RUN_ATTEMPT=<n> make release
 #
-# Environment variables (source ~/devsecops/vars/3leaps-seclusor-cicd.sh):
+# Environment variables (configured by the release signer):
 #   SECLUSOR_MINISIGN_KEY  - Path to minisign secret key (required)
-#   SECLUSOR_MINISIGN_PUB  - Path to minisign public key (optional, derived from KEY)
-#   SECLUSOR_PGP_KEY_ID    - PGP key ID for GPG signing (optional)
-#   SECLUSOR_GPG_HOMEDIR   - Custom GPG home directory (optional)
+#   SECLUSOR_MINISIGN_PUB  - Path to minisign public key (required)
+#   SECLUSOR_RELEASE_COMMIT - Literal lowercase 40-hex reviewed release commit
+#   SECLUSOR_PGP_KEY_ID    - Exact signing subkey selector (hex + !)
+#   SECLUSOR_GPG_HOMEDIR   - GPG home outside any Git worktree
+#   SECLUSOR_GPG_SIGNING_FINGERPRINT - Authorized 40-hex primary fingerprint
+#   SECLUSOR_TAGGER_NAME / SECLUSOR_TAGGER_EMAIL - Infosec tagger identity
+#   SECLUSOR_DECERNOR_BIN - Absolute path to tag-built decernor >= 0.1.8
 #
 # --- Bindings release workflow ---
 # Go bindings:
-#   Before tagging, run go-bindings.yml workflow (manual dispatch).
-#   Workflow builds FFI for all platforms and creates PR with prebuilt libs.
-#   Merge the PR, then tag the merge commit.
+#   Before tagging, run go-bindings.yml workflow (manual dispatch, read-only).
+#   Fetch and digest-verify the staged FFI bundle locally via make go-bindings-fetch,
+#   open a reviewed PR with the prebuilt libs, merge, then tag the merge commit.
 #
 # TypeScript bindings:
 #   After tagging and signing, run typescript-napi-prebuilds.yml on the tag.
 #   Then run typescript-npm-publish.yml with OIDC trusted publishing.
 
 DIST_RELEASE := dist/release
-SECLUSOR_RELEASE_TAG ?= $(shell git describe --tags --abbrev=0 2>/dev/null || echo v$(VERSION))
+SECLUSOR_RELEASE_TAG ?= v$(VERSION)
+SECLUSOR_RELEASE_COMMIT ?=
 
 # Signing keys (set via environment or vars file)
 SECLUSOR_MINISIGN_KEY ?=
 SECLUSOR_MINISIGN_PUB ?=
 SECLUSOR_PGP_KEY_ID ?=
 SECLUSOR_GPG_HOMEDIR ?=
+
+release-guard-signing-env: ## Validate signing identity and exact release checkout
+	@SECLUSOR_RELEASE_TAG="$(SECLUSOR_RELEASE_TAG)" SECLUSOR_RELEASE_COMMIT="$(SECLUSOR_RELEASE_COMMIT)" ./scripts/release-guard-signing-env.sh
+
+release-tag: ## Create both signed tags locally; does not push
+	@SECLUSOR_RELEASE_TAG="$(SECLUSOR_RELEASE_TAG)" SECLUSOR_RELEASE_COMMIT="$(SECLUSOR_RELEASE_COMMIT)" ./scripts/release-tag.sh
+
+release-verify-tag: ## Verify both local signed tags
+	@SECLUSOR_RELEASE_TAG="$(SECLUSOR_RELEASE_TAG)" SECLUSOR_RELEASE_COMMIT="$(SECLUSOR_RELEASE_COMMIT)" ./scripts/release-verify-tag.sh
+
+release-push-tag: ## Push both signed tags atomically on maintainer cue
+	@SECLUSOR_RELEASE_TAG="$(SECLUSOR_RELEASE_TAG)" SECLUSOR_RELEASE_COMMIT="$(SECLUSOR_RELEASE_COMMIT)" ./scripts/release-push-tag.sh
+
+release-verify-remote-tag: ## Verify both GitHub tag objects and signatures
+	@SECLUSOR_RELEASE_TAG="$(SECLUSOR_RELEASE_TAG)" SECLUSOR_RELEASE_COMMIT="$(SECLUSOR_RELEASE_COMMIT)" ./scripts/release-verify-remote-tag.sh
+
+release-insert-anchors: ## Generate and verify committed public-key anchors (maintainer only)
+	@./scripts/insert-expected-fingerprints.sh
+
+release-stage-anchors: ## Stage committed anchors into the signed checksum set
+	@./scripts/stage-release-anchors.sh $(DIST_RELEASE)
+
+test-release-controls: ## Hermetic synthetic-key release control checks
+	@./scripts/test-release-controls.sh
 
 release-preflight: ## Verify all pre-tag requirements (REQUIRED before tagging)
 	@echo "Running release preflight checks..."
@@ -873,7 +920,7 @@ release-preflight: ## Verify all pre-tag requirements (REQUIRED before tagging)
 		exit 1; \
 	fi
 	@echo "[ok] Working tree is clean"
-	@# Check 2: Prepush quality gates
+	@# Check 2: Prepush quality gates (includes check-workflow-pins)
 	@$(MAKE) prepush --silent
 	@echo "[ok] Prepush checks passed"
 	@# Check 3: Version sync (full check: VERSION, Cargo.toml)
@@ -887,6 +934,14 @@ release-preflight: ## Verify all pre-tag requirements (REQUIRED before tagging)
 		exit 1; \
 	fi
 	@echo "[ok] Release notes exist"
+	@if [ ! -s keys/expected-fingerprints.txt ] || [ ! -s keys/expected-fingerprints.ndjson ] || \
+		[ ! -s docs/security/release-signing-keys.asc ] || [ ! -s docs/security/seclusor-minisign.pub ] || \
+		[ ! -s config/release/signing-subkey.txt ] || [ ! -s config/release/tagger-identity.txt ]; then \
+		echo "[!!] Public signing pins or anchors are missing; run make release-insert-anchors"; exit 1; \
+	fi
+	@echo "[ok] Committed public signing pins and anchors exist"
+	@$(MAKE) check-workflow-pins --silent
+	@echo "[ok] Workflow SHA-256 pins verified"
 	@# Check 5: Local/remote sync
 	@echo "[..] Verifying local/remote sync..."; \
 	git fetch origin >/dev/null 2>&1; \
@@ -906,19 +961,19 @@ release-preflight: ## Verify all pre-tag requirements (REQUIRED before tagging)
 	@echo ""
 	@echo "[ok] All preflight checks passed - ready to tag"
 	@version_file=$$(cat $(VERSION_FILE) 2>/dev/null); \
-	echo "    Next: git tag \"v$$version_file\" -m \"Release $$version_file\""
+	echo "    Next: make release-tag, then make release-verify-tag"
 
-release-clean: ## Remove dist/release contents
+release-clean: ## Remove dist/release contents and anchor state
 	@echo "Cleaning release directory..."
-	rm -rf $(DIST_RELEASE)
+	rm -rf $(DIST_RELEASE) $(DIST_RELEASE).anchor
 	@echo "[ok] Release directory cleaned"
 
-release-download: ## Download release assets from GitHub
+release-download: ## Download + verify CI release bundle from GitHub Actions
 	@if [ -z "$(SECLUSOR_RELEASE_TAG)" ] || [ "$(SECLUSOR_RELEASE_TAG)" = "v" ]; then \
 		echo "Error: No release tag found. Set SECLUSOR_RELEASE_TAG=vX.Y.Z"; \
 		exit 1; \
 	fi
-	./scripts/download-release-assets.sh $(SECLUSOR_RELEASE_TAG) $(DIST_RELEASE)
+	SECLUSOR_RELEASE_TAG="$(SECLUSOR_RELEASE_TAG)" SECLUSOR_RELEASE_COMMIT="$(SECLUSOR_RELEASE_COMMIT)" ./scripts/release-fetch-ci-artifacts.sh $(DIST_RELEASE)
 
 release-checksums: ## Generate SHA256SUMS and SHA512SUMS
 	./scripts/generate-checksums.sh $(DIST_RELEASE)
@@ -927,20 +982,12 @@ release-sign: ## Sign checksum manifests (requires SECLUSOR_MINISIGN_KEY)
 	@if [ -z "$(SECLUSOR_MINISIGN_KEY)" ]; then \
 		echo "Error: SECLUSOR_MINISIGN_KEY not set"; \
 		echo ""; \
-		echo "Source the vars file:"; \
-		echo "  source ~/devsecops/vars/3leaps-seclusor-cicd.sh"; \
+		echo "Configure the release signing environment"; \
 		exit 1; \
 	fi
-	SECLUSOR_MINISIGN_KEY=$(SECLUSOR_MINISIGN_KEY) \
-	SECLUSOR_PGP_KEY_ID=$(SECLUSOR_PGP_KEY_ID) \
-	SECLUSOR_GPG_HOMEDIR=$(SECLUSOR_GPG_HOMEDIR) \
 	./scripts/sign-release-assets.sh $(SECLUSOR_RELEASE_TAG) $(DIST_RELEASE)
 
 release-export-keys: ## Export public signing keys
-	SECLUSOR_MINISIGN_KEY=$(SECLUSOR_MINISIGN_KEY) \
-	SECLUSOR_MINISIGN_PUB=$(SECLUSOR_MINISIGN_PUB) \
-	SECLUSOR_PGP_KEY_ID=$(SECLUSOR_PGP_KEY_ID) \
-	SECLUSOR_GPG_HOMEDIR=$(SECLUSOR_GPG_HOMEDIR) \
 	./scripts/export-release-keys.sh $(DIST_RELEASE)
 
 release-verify-checksums: ## Verify checksums match artifacts
@@ -957,16 +1004,38 @@ release-verify-keys: ## Verify exported keys are public-only
 release-verify: release-verify-checksums release-verify-signatures release-verify-keys ## Run all release verification
 	@echo "[ok] All release verifications passed"
 
-release-notes: ## Copy release notes to dist
-	@src="docs/releases/$(SECLUSOR_RELEASE_TAG).md"; \
-	if [ -f "$$src" ]; then \
-		cp "$$src" "$(DIST_RELEASE)/release-notes-$(SECLUSOR_RELEASE_TAG).md"; \
-		echo "[ok] Copied release notes"; \
+release-notes: ## Extract release notes to dist
+	@mkdir -p "$(DIST_RELEASE)"; \
+	if [ -f "$(DIST_RELEASE).anchor" ]; then \
+		commit="$$(awk -F= '$$1 == "commit" { print $$2; exit }' "$(DIST_RELEASE).anchor")"; \
+		if ! printf '%s' "$$commit" | grep -Eq '^[0-9a-f]{40}$$'; then \
+			echo "[!!] $(DIST_RELEASE).anchor has missing or malformed commit"; exit 1; \
+		fi; \
+		if ! git cat-file -e "$$commit:docs/releases/$(SECLUSOR_RELEASE_TAG).md" 2>/dev/null; then \
+			echo "[!!] Missing release notes at $$commit:docs/releases/$(SECLUSOR_RELEASE_TAG).md"; exit 1; \
+		fi; \
+		git cat-file blob "$$commit:docs/releases/$(SECLUSOR_RELEASE_TAG).md" > "$(DIST_RELEASE)/release-notes-$(SECLUSOR_RELEASE_TAG).md"; \
+		echo "[ok] Extracted release notes from anchored commit $$commit"; \
 	else \
-		echo "[--] No release notes found at $$src"; \
+		src="docs/releases/$(SECLUSOR_RELEASE_TAG).md"; \
+		if [ -f "$$src" ]; then \
+			cp "$$src" "$(DIST_RELEASE)/release-notes-$(SECLUSOR_RELEASE_TAG).md"; \
+			echo "[ok] Copied release notes"; \
+		else \
+			echo "[--] No release notes found at $$src"; \
+		fi; \
 	fi
 
-release-upload: release-verify release-notes ## Upload provenance only (checksums, signatures, keys, notes)
+release-create-draft: release-verify release-notes ## Create verified draft release on GitHub
+	SECLUSOR_RELEASE_TAG="$(SECLUSOR_RELEASE_TAG)" SECLUSOR_RELEASE_COMMIT="$(SECLUSOR_RELEASE_COMMIT)" ./scripts/release-create-draft.sh $(DIST_RELEASE)
+	@echo ""
+	@echo "Next steps:"
+	@echo "  1. Complete four-eyes review on the draft release"
+	@echo "  2. Undraft the release on GitHub"
+	@echo "  3. make update-homebrew-formula"
+	@echo "  4. make update-scoop-manifest"
+
+release-upload: release-verify release-notes ## Upload provenance only (checksums, signatures, keys, notes) to existing draft
 	./scripts/upload-release-assets.sh $(SECLUSOR_RELEASE_TAG) $(DIST_RELEASE)
 	@echo ""
 	@echo "Next steps:"
@@ -974,7 +1043,7 @@ release-upload: release-verify release-notes ## Upload provenance only (checksum
 	@echo "  2. make update-homebrew-formula"
 	@echo "  3. make update-scoop-manifest"
 
-release-upload-all: release-verify release-notes ## Upload all assets including platform binaries
+release-upload-all: release-verify release-notes ## Upload all assets including platform binaries to existing draft
 	./scripts/upload-release-assets.sh $(SECLUSOR_RELEASE_TAG) $(DIST_RELEASE) --all
 	@echo ""
 	@echo "Next steps:"
@@ -1064,5 +1133,5 @@ update-scoop-manifest: ## Update scoop-bucket manifest (requires sibling ../scoo
 		echo "  4. Push:    cd $(SCOOP_BUCKET_DIR) && git push"; \
 	fi
 
-release: release-clean release-download release-checksums release-sign release-export-keys release-upload ## Full signing workflow (after CI build)
-	@echo "[ok] Release $(SECLUSOR_RELEASE_TAG) complete"
+release: release-clean release-download release-stage-anchors release-checksums release-sign release-export-keys release-create-draft ## Full local signing + draft creation workflow (after read-only CI build)
+	@echo "[ok] Draft release $(SECLUSOR_RELEASE_TAG) created and verified"

@@ -18,15 +18,19 @@ jobs:
   rust-quality:
     if: github.event_name != 'workflow_dispatch'
     name: Rust Quality (Linux)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     container:
-      image: ghcr.io/fulmenhq/goneat-tools-runner-glibc:v0.5.1
+      image: ghcr.io/fulmenhq/goneat-tools-runner-glibc:v0.5.6@sha256:afcffa00283c765928dfef40966c282f2ca190653cf4443f634cb8f67c1d51ab
       options: --user root
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.94.0
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772  # v1
+        with:
+          toolchain: "1.94.0"
       - name: Bootstrap pinned non-cargo tools
         shell: bash
         run: |
@@ -55,12 +59,12 @@ jobs:
           set -euo pipefail
           make ci
       - name: Cache cargo-audit binary
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: /opt/cargo/bin/cargo-audit
           # Bump the image tag in this key whenever the runner image changes, so a
           # cargo-audit compiled against a different glibc is never restored.
-          key: cargo-audit-0.22.2-goneat-tools-runner-glibc-v0.5.1
+          key: cargo-audit-0.22.2-goneat-tools-runner-glibc-v0.5.6
       - name: Security advisories (deny advisories + cargo-audit)
         shell: bash
         run: |
@@ -100,12 +104,39 @@ jobs:
         run: |
           set -euo pipefail
           make ts-test
-  # Native cargo clippy + test on every supported OS/arch. Custom runner labels
-  # (ubuntu-latest-arm64-s, windows-latest-arm64-s) are declared in
-  # .github/actionlint.yaml for the 3leaps org.
-  #
-  # Platform matrix (5):
-  #   Linux x64 / arm64, macOS arm64, Windows x64 / arm64
+  release-controls:
+    if: github.event_name != 'workflow_dispatch'
+    name: Release & Provenance Controls
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install PyYAML and minisign
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y -q python3-yaml minisign
+          python3 -B -E -c 'import yaml'
+          minisign -v
+      - name: Install pinned decernor
+        shell: bash
+        run: |
+          set -euo pipefail
+          tool_dir="$(mktemp -d "$RUNNER_TEMP/decernor.XXXXXX")"
+          SECLUSOR_DECERNOR_BIN="$(./scripts/ci-install-decernor.sh "$tool_dir")"
+          echo "SECLUSOR_DECERNOR_BIN=$SECLUSOR_DECERNOR_BIN" >> "$GITHUB_ENV"
+      - name: Verify workflow pins and synthetic signed-tag controls
+        shell: bash
+        env:
+          SECLUSOR_REQUIRE_PYYAML: "1"
+        run: |
+          set -euo pipefail
+          make check-workflow-pins
+          make test-release-controls
+  # Native cargo clippy + test on GitHub-hosted standard runners (runs on all PRs).
   native-test:
     if: github.event_name != 'workflow_dispatch'
     name: Test (${{ matrix.name }})
@@ -114,21 +145,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             name: linux-amd64
-          - os: ubuntu-latest-arm64-s
-            name: linux-arm64
           - os: macos-15
             name: darwin-arm64
-          - os: windows-latest
+          - os: windows-2025
             name: windows-amd64
-          - os: windows-latest-arm64-s
-            name: windows-arm64
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.94.0
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772  # v1
+        with:
+          toolchain: "1.94.0"
       - name: Clippy and test (Unix)
         if: runner.os != 'Windows'
         shell: bash
@@ -145,10 +176,50 @@ jobs:
           # still runs ReplaceFileW / CAS / DACL unit tests in seclusor CLI.
           cargo clippy --workspace --all-targets --all-features --exclude seclusor-ffi -- -D warnings
           cargo test --workspace --all-features --exclude seclusor-ffi
+  # Native arm64 larger runners (ubuntu-latest-arm64-s, windows-latest-arm64-s,
+  # declared in .github/actionlint.yaml). Guarded against untrusted fork PRs.
+  native-test-arm64:
+    if: |
+      github.event_name != 'workflow_dispatch' &&
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository)
+    name: Test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest-arm64-s
+            name: linux-arm64
+          - os: windows-latest-arm64-s
+            name: windows-arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772  # v1
+        with:
+          toolchain: "1.94.0"
+      - name: Clippy and test (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          cargo test --workspace --all-features
+      - name: Clippy and test (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy --workspace --all-targets --all-features --exclude seclusor-ffi -- -D warnings
+          cargo test --workspace --all-features --exclude seclusor-ffi
   windows-cross-check:
     if: github.event_name != 'workflow_dispatch'
     name: Cross-check (Windows)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -157,10 +228,13 @@ jobs:
           - aarch64-pc-windows-msvc
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.94.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
+          persist-credentials: false
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772  # v1
+        with:
+          toolchain: "1.94.0"
           targets: ${{ matrix.target }}
       - name: Type-check Windows target
         shell: bash
@@ -172,14 +246,17 @@ jobs:
           cargo check --workspace --exclude seclusor-ffi --target ${{ matrix.target }}
   sbom:
     name: SBOM
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
+          persist-credentials: false
           ref: ${{ inputs.source_ref || github.sha }}
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.94.0
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772  # v1
+        with:
+          toolchain: "1.94.0"
       - name: Install cargo-cyclonedx
         shell: bash
         run: |
@@ -193,7 +270,7 @@ jobs:
           git rev-parse HEAD
           cargo cyclonedx --all --format json
       - name: Upload SBOM
-        uses: actions/upload-artifact@v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: sbom-cyclonedx
           path: "**/*.cdx.json"
@@ -201,12 +278,14 @@ jobs:
   dependency-parity:
     if: github.event_name != 'workflow_dispatch'
     name: Crypto-graph parity
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
         with:
           python-version: "3.12"
       - name: Crypto-graph parity + negative controls

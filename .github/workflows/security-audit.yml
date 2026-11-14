@@ -19,23 +19,27 @@ env:
 jobs:
   audit:
     name: Advisory + audit sweep (scheduled)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     container:
-      image: ghcr.io/fulmenhq/goneat-tools-runner-glibc:v0.5.1
+      image: ghcr.io/fulmenhq/goneat-tools-runner-glibc:v0.5.6@sha256:afcffa00283c765928dfef40966c282f2ca190653cf4443f634cb8f67c1d51ab
       options: --user root
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.94.0
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772  # v1
+        with:
+          toolchain: "1.94.0"
       - name: Cache cargo-audit binary
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: /opt/cargo/bin/cargo-audit
           # Bump the image tag in this key whenever the runner image changes, so a
           # cargo-audit compiled against a different glibc is never restored.
           # Keep in lockstep with the same key in ci.yml.
-          key: cargo-audit-0.22.2-goneat-tools-runner-glibc-v0.5.1
+          key: cargo-audit-0.22.2-goneat-tools-runner-glibc-v0.5.6
       - name: Advisory + audit gates (root + TS-native locks)
         shell: bash
         run: |
