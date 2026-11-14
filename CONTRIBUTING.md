@@ -80,8 +80,8 @@ Follow [3leaps commit style](https://crucible.3leaps.dev/repository/commit-style
 
 <body>
 
-Co-Authored-By: <Model> <noreply@3leaps.net>
 Role: <role>
+Co-authored-by: <Model> <noreply@3leaps.net>
 Committer-of-Record: @3leapsdave
 ```
 

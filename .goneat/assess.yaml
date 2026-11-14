@@ -15,6 +15,13 @@ lint:
       - ".github/workflows/**/*.yaml"
       - ".goneat/**/*.yaml"
     ignore: []
+  # Go linting/security note:
+  # goneat runs golangci-lint and govulncheck from the repo root. To support
+  # that while keeping Go bindings in a submodule, the repo includes:
+  # - a minimal root go.mod
+  # - a root go.work referencing bindings/go/seclusor
+  # - a placeholder internal/gowork package so repo-root ./... resolves
+  # Makefile Go targets run with GOWORK=off to preserve standalone module tests.
   # Shell script linting
   shell:
     shfmt:

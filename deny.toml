@@ -9,16 +9,14 @@ all-features = true
 [advisories]
 db-path = "target/advisory-dbs"
 db-urls = ["https://github.com/RustSec/advisory-db"]
-# RUSTSEC-2026-0173 (proc-macro-error2 unmaintained). Decision of record:
-# docs/decisions/SDR-0003-rustsec-2026-0173-advisory-acceptance.md (source of truth
-# for rationale, affected graphs, owner, revisit + removal conditions). Terse
-# enforcement summary: compile-time-only transitive via age → i18n-embed-fl, not in
-# any shipped runtime binary; no safe upgrade path; revisit by v0.2.1 or 2026-10-13.
-# This is the ONLY permitted advisory ignore — a new advisory must not hide behind
-# it, which is why CI runs `cargo audit --deny warnings --ignore RUSTSEC-2026-0173`
-# (both locks) alongside `cargo deny check advisories`.
+# Accepted build-time-only proc-macro unmaintained residuals via age -> i18n-embed*:
+# - RUSTSEC-2026-0173 (proc-macro-error2): docs/decisions/SDR-0003-rustsec-2026-0173-advisory-acceptance.md
+# - RUSTSEC-2026-0374 (basic-toml): docs/decisions/SDR-0004-rustsec-2026-0374-advisory-acceptance.md
+# Revisit at v0.3.0 (age 0.12) or by 2027-02-13. CI runs matching ID-pinned
+# `cargo audit --deny warnings --ignore ...` on both locks alongside `cargo deny check advisories`.
 ignore = [
-  { id = "RUSTSEC-2026-0173", reason = "accepted per SDR-0003: unmaintained compile-time-only transitive (age → i18n-embed-fl); no safe upgrade; revisit by v0.2.1 or 2026-10-13" },
+  { id = "RUSTSEC-2026-0173", reason = "accepted per SDR-0003: unmaintained compile-time-only transitive (age → i18n-embed-fl); no safe upgrade in age 0.11; revisit by v0.3.0 or 2027-02-13" },
+  { id = "RUSTSEC-2026-0374", reason = "accepted per SDR-0004: unmaintained compile-time-only transitive (age → i18n-embed* → i18n-config → basic-toml); no safe upgrade in age 0.11; revisit by v0.3.0 or 2027-02-13" },
 ]
 
 [licenses]

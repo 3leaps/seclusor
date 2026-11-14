@@ -145,8 +145,10 @@ still resolve to identical upstream source versions across the two locks.
     `private:true` and ships no per-platform artifact in the 0.2.0 cut, while the
     CLI/Go release builds are `--locked` on every target.
 - **Audit** — `make ci-security` scans **both** locks (`cargo audit --file …`) with
-  the same single accepted advisory (RUSTSEC-2026-0173, decision of record
-  [SDR-0003](docs/decisions/SDR-0003-rustsec-2026-0173-advisory-acceptance.md)). It
+  the exact ID-pinned accepted advisories (`RUSTSEC-2026-0173` per
+  [SDR-0003](docs/decisions/SDR-0003-rustsec-2026-0173-advisory-acceptance.md) and
+  `RUSTSEC-2026-0374` per
+  [SDR-0004](docs/decisions/SDR-0004-rustsec-2026-0374-advisory-acceptance.md)). It
   runs on every PR (ci.yml) **and daily on a schedule** (`security-audit.yml`) so an
   advisory disclosed against an unchanged pin is still caught.
 - **Parity** — `make parity-check` asserts, keyed by full `(name, version, source,

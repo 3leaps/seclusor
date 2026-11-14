@@ -46,18 +46,15 @@ make go-test
 make go-test-committed
 ```
 
-`go-bindings-sync` copies:
+`go-bindings-sync` copies (and strips embedded compiler bitcode sections from):
 
 - `crates/seclusor-ffi/seclusor.h` -> `bindings/go/seclusor/include/seclusor.h`
 - `target/release/libseclusor_ffi.a` -> `bindings/go/seclusor/lib/local/<platform>/libseclusor_ffi.a`
 
-The platform-specific `cgo_*.go` files search both paths in order:
+The platform-specific `cgo_*.go` files select between the committed release archive and the local build via the `seclusor_local` build tag:
 
-- `bindings/go/seclusor/lib/local/<platform>/` for local developer builds
-- `bindings/go/seclusor/lib/<platform>/` for CI-generated, committed release libs
-
-`make go-test-committed` temporarily hides the local override for the host platform
-so the Go module links against the committed release archive instead.
+- Default (`!seclusor_local`, used by external module consumers and `make go-test-committed`): links `bindings/go/seclusor/lib/<platform>/`
+- `-tags seclusor_local` (used by `make go-build` and `make go-test`): links `bindings/go/seclusor/lib/local/<platform>/`
 
 Committed release-lib target folders for v0.1.1:
 
