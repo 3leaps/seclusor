@@ -1,8 +1,18 @@
-use seclusor_codec::{decrypt_inline, encrypt_inline, project_plaintext_at_rest};
+use std::io::{self, Read, Write};
+use std::path::Path;
+
+use seclusor_codec::{
+    decrypt_inline, encrypt_inline, ensure_no_plaintext_credential_values,
+    project_plaintext_at_rest,
+};
+use seclusor_core::constants::MAX_SECRETS_DOC_BYTES;
+use seclusor_core::validate::validate_strict;
+use seclusor_core::{SeclusorError, SecretsFile};
+use zeroize::Zeroizing;
 
 use crate::cli::{InlineDecryptArgs, InlineEncryptArgs, InlineSubcommand};
-use crate::error::CliResult;
-use crate::io::{read_secrets_file, write_secrets_file};
+use crate::error::{CliError, CliResult};
+use crate::io::{read_secrets_file, secrets_from_bytes, write_secrets_file};
 use crate::resolve::{resolve_identities, resolve_recipients};
 
 pub(crate) fn handle_inline_command(command: InlineSubcommand) -> CliResult<()> {
@@ -13,12 +23,56 @@ pub(crate) fn handle_inline_command(command: InlineSubcommand) -> CliResult<()> 
 }
 
 pub(crate) fn handle_inline_encrypt(args: InlineEncryptArgs) -> CliResult<()> {
-    let secrets = read_secrets_file(&args.input)?;
+    // Resolve recipients before consuming stdin or reading input files so
+    // invalid/missing recipient options fail fast without blocking on a pipe.
     let recipients = resolve_recipients(&args.recipients)?;
+    let secrets = if args.input == Path::new("-") {
+        read_secrets_stdin_bounded()?
+    } else {
+        read_secrets_file(&args.input)?
+    };
     let encrypted = encrypt_inline(&secrets, &recipients)?;
-    write_secrets_file(&args.output, &encrypted, false)?;
-    println!("{}", args.output.display());
+    validate_strict(&encrypted)?;
+    ensure_no_plaintext_credential_values(&encrypted)?;
+
+    if args.output == Path::new("-") {
+        let mut out = serde_json::to_vec_pretty(&encrypted)?;
+        if !out.ends_with(b"\n") {
+            out.push(b'\n');
+        }
+        if out.len() > MAX_SECRETS_DOC_BYTES {
+            return Err(CliError::Core(SeclusorError::DocumentTooLarge {
+                actual: out.len(),
+                max: MAX_SECRETS_DOC_BYTES,
+            }));
+        }
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(&out)?;
+        stdout.flush()?;
+    } else {
+        write_secrets_file(&args.output, &encrypted, false)?;
+        println!("{}", args.output.display());
+    }
     Ok(())
+}
+
+fn read_secrets_stdin_bounded() -> CliResult<SecretsFile> {
+    let mut reader = io::stdin().lock();
+    read_secrets_reader_bounded(&mut reader)
+}
+
+fn read_secrets_reader_bounded<R: Read>(reader: &mut R) -> CliResult<SecretsFile> {
+    let mut buf = Zeroizing::new(Vec::new());
+    reader
+        .take((MAX_SECRETS_DOC_BYTES as u64) + 1)
+        .read_to_end(&mut buf)?;
+    if buf.len() > MAX_SECRETS_DOC_BYTES {
+        return Err(CliError::Core(SeclusorError::DocumentTooLarge {
+            actual: buf.len(),
+            max: MAX_SECRETS_DOC_BYTES,
+        }));
+    }
+    secrets_from_bytes(&buf)
 }
 
 pub(crate) fn handle_inline_decrypt(args: InlineDecryptArgs) -> CliResult<()> {
@@ -63,7 +117,7 @@ mod tests {
             output: inline.clone(),
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
@@ -119,7 +173,7 @@ mod tests {
             output: inline.clone(),
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })

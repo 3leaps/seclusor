@@ -225,9 +225,8 @@ pub(crate) struct InitArgs {
     #[arg(
         long,
         value_enum,
-        help = "Create an encrypted secrets document. Only 'bundle' is supported \
-                (create-only; path must not exist). Inline encrypted documents are \
-                created by encrypting a value via set/import-env/rekey"
+        help = "Create an encrypted secrets document ('bundle' or 'inline'; \
+                create-only, path must not exist; requires at least one recipient)"
     )]
     pub(crate) codec: Option<StorageCodecArg>,
     #[command(flatten)]
@@ -507,6 +506,22 @@ pub(crate) struct RunArgs {
     pub(crate) allow: Vec<String>,
     #[arg(long = "deny", help = "Glob pattern for keys to exclude (repeatable)")]
     pub(crate) deny: Vec<String>,
+    #[arg(
+        long = "clean-env",
+        default_value_t = false,
+        help = "Clear inherited environment except a minimal safe OS baseline \
+                (plus --env-allow variables) before injecting credentials"
+    )]
+    pub(crate) clean_env: bool,
+    #[arg(
+        long = "env-allow",
+        value_name = "NAME",
+        requires = "clean_env",
+        help = "Exact parent environment variable name to pass through when \
+                --clean-env is set (repeatable; globs and --passphrase-env names \
+                are rejected)"
+    )]
+    pub(crate) env_allow: Vec<String>,
     #[command(flatten)]
     pub(crate) identities: IdentityArgs,
     #[command(flatten)]
@@ -563,9 +578,15 @@ pub(crate) enum InlineSubcommand {
 
 #[derive(Debug, Parser)]
 pub(crate) struct InlineEncryptArgs {
-    #[arg(long, help = "Path to plaintext secrets file")]
+    #[arg(
+        long,
+        help = "Path to plaintext secrets file, or '-' to read from stdin"
+    )]
     pub(crate) input: PathBuf,
-    #[arg(long, help = "Path for inline-encrypted output")]
+    #[arg(
+        long,
+        help = "Path for inline-encrypted output, or '-' to write JSON to stdout"
+    )]
     pub(crate) output: PathBuf,
     #[command(flatten)]
     pub(crate) recipients: RecipientArgs,
@@ -648,9 +669,9 @@ pub(crate) struct RecipientArgs {
     pub(crate) recipients: Vec<String>,
     #[arg(
         long = "recipient-file",
-        help = "Path to a file containing age recipients (one per line, # comments allowed)"
+        help = "Path to a file containing age recipients (one per line, # comments allowed); repeatable"
     )]
-    pub(crate) recipient_file: Option<PathBuf>,
+    pub(crate) recipient_files: Vec<PathBuf>,
     #[arg(
         long = "recipient-env-var",
         help = "Environment variable containing age recipients (comma or newline separated)"
@@ -901,6 +922,73 @@ mod tests {
                 "--echo-value must conflict with {}",
                 conflicting[0]
             );
+        }
+    }
+
+    #[test]
+    fn env_allow_requires_clean_env_and_repeats() {
+        let missing_clean = Cli::try_parse_from([
+            "seclusor",
+            "secrets",
+            "run",
+            "--env-allow",
+            "CUSTOM_VAR",
+            "--",
+            "true",
+        ]);
+        assert!(missing_clean.is_err(), "--env-allow requires --clean-env");
+
+        let parsed = Cli::try_parse_from([
+            "seclusor",
+            "secrets",
+            "run",
+            "--clean-env",
+            "--env-allow",
+            "FOO",
+            "--env-allow",
+            "BAR",
+            "--",
+            "true",
+        ])
+        .expect("clean-env with repeatable env-allow");
+        match parsed.command {
+            TopLevelCommand::Secrets(cmd) => match cmd.command {
+                SecretsSubcommand::Run(args) => {
+                    assert!(args.clean_env);
+                    assert_eq!(args.env_allow, vec!["FOO".to_string(), "BAR".to_string()]);
+                }
+                _ => panic!("expected run"),
+            },
+            _ => panic!("expected secrets"),
+        }
+    }
+
+    #[test]
+    fn recipient_file_is_repeatable() {
+        let parsed = Cli::try_parse_from([
+            "seclusor",
+            "secrets",
+            "init",
+            "--codec",
+            "inline",
+            "--recipient-file",
+            "a.txt",
+            "--recipient-file",
+            "b.txt",
+        ])
+        .expect("repeatable --recipient-file");
+        match parsed.command {
+            TopLevelCommand::Secrets(cmd) => match cmd.command {
+                SecretsSubcommand::Init(args) => {
+                    assert_eq!(args.codec, Some(StorageCodecArg::Inline));
+                    assert_eq!(
+                        args.recipients.recipient_files,
+                        vec![PathBuf::from("a.txt"), PathBuf::from("b.txt")]
+                    );
+                }
+                _ => panic!("expected init"),
+            },
+            _ => panic!("expected secrets"),
         }
     }
 }

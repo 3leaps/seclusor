@@ -1,4 +1,4 @@
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::child_env::{BasePolicy, ChildEnv, ExcludedNames};
 use crate::cli::RunArgs;
@@ -8,10 +8,27 @@ use crate::io::read_runtime_secrets_file;
 use crate::resolve::{resolve_identities_with_passphrase, resolve_passphrase_for_guard};
 
 pub(crate) fn handle_run(args: RunArgs) -> CliResult<()> {
+    // Exclusion names come only from the explicit `--passphrase-env` channel.
+    let excluded = match &args.passphrase.passphrase_env {
+        Some(name) => ExcludedNames::from_names([name.clone()]),
+        None => ExcludedNames::none(),
+    };
+    let base_policy = if args.clean_env {
+        BasePolicy::Clean {
+            env_allow: args.env_allow.clone(),
+        }
+    } else {
+        BasePolicy::InheritAmbient
+    };
+    // Validate `--env-allow` identifiers and `--passphrase-env` collisions
+    // before prompting for passphrases or reading secret files.
+    ChildEnv::preflight(&base_policy, &excluded).map_err(|e| CliError::Message(e.to_string()))?;
+
     // Resolve identities once. Unlock passphrase is retained when identities
     // were protected; otherwise try guard-only resolve for `--passphrase-env`.
     let (identities, unlock_passphrase) =
         resolve_identities_with_passphrase(&args.identities, &args.passphrase, false)?;
+    let stdin_carried_unlock = args.passphrase.passphrase_stdin && unlock_passphrase.is_some();
     // Guard value-equality needs the passphrase whenever `--passphrase-env` is
     // set — even if no identity was passphrase-protected. Unset env ⇒ None (no-op).
     // Does not read stdin/file or prompt (see resolve_passphrase_for_guard).
@@ -29,18 +46,8 @@ pub(crate) fn handle_run(args: RunArgs) -> CliResult<()> {
         &args.deny,
     )?;
 
-    // Exclusion names come only from the explicit `--passphrase-env` channel.
-    let excluded = match &args.passphrase.passphrase_env {
-        Some(name) => ExcludedNames::from_names([name.clone()]),
-        None => ExcludedNames::none(),
-    };
-    let child_env = ChildEnv::build(
-        BasePolicy::InheritAmbient,
-        &env_vars,
-        &excluded,
-        passphrase.as_ref(),
-    )
-    .map_err(|e| CliError::Message(e.to_string()))?;
+    let child_env = ChildEnv::build(base_policy, &env_vars, &excluded, passphrase.as_ref())
+        .map_err(|e| CliError::Message(e.to_string()))?;
     // Drop the resolved passphrase after env verification. Identities and
     // injected credential values necessarily remain until spawn.
     drop(passphrase);
@@ -51,6 +58,13 @@ pub(crate) fn handle_run(args: RunArgs) -> CliResult<()> {
     // Apply freezes the verified snapshot (env_clear + explicit sets); does not
     // re-inherit a live ambient that could change after build.
     child_env.apply(&mut command);
+    // When FD 0 was consumed to unlock a protected identity (`--passphrase-stdin`),
+    // rebind child stdin to null so the child cannot read trailing bytes or
+    // `lseek` a seekable stdin file/here-string back to offset 0 (while keeping
+    // child stdin intact on all-unprotected runs where stdin was not an unlock stream).
+    if stdin_carried_unlock {
+        command.stdin(Stdio::null());
+    }
 
     let status = command.status()?;
     if !status.success() {
@@ -97,6 +111,8 @@ mod tests {
             emit_ref: false,
             allow: vec![],
             deny: vec![],
+            clean_env: false,
+            env_allow: vec![],
             identities: IdentityArgs::default(),
             passphrase: PassphraseArgs::default(),
             command,
@@ -120,7 +136,7 @@ mod tests {
             output: bundle.clone(),
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
@@ -146,6 +162,8 @@ mod tests {
             emit_ref: false,
             allow: vec!["APP_API_KEY".to_string()],
             deny: vec![],
+            clean_env: false,
+            env_allow: vec![],
             identities: IdentityArgs {
                 identity_files: vec![identity_file],
                 identity_public_key: None,
@@ -172,7 +190,7 @@ mod tests {
             output: bundle.clone(),
             recipients: RecipientArgs {
                 recipients: vec![fixture_recipient_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
@@ -190,6 +208,8 @@ mod tests {
             emit_ref: false,
             allow: vec!["APP_API_KEY".to_string()],
             deny: vec![],
+            clean_env: false,
+            env_allow: vec![],
             identities: IdentityArgs {
                 identity_files: vec![wrong_identity_file],
                 identity_public_key: None,
@@ -220,6 +240,8 @@ mod tests {
             emit_ref: true,
             allow: vec![],
             deny: vec![],
+            clean_env: false,
+            env_allow: vec![],
             identities: IdentityArgs {
                 identity_files: vec![identity_file],
                 identity_public_key: None,
@@ -247,6 +269,8 @@ mod tests {
             emit_ref: false,
             allow: vec![],
             deny: vec![],
+            clean_env: false,
+            env_allow: vec![],
             identities: IdentityArgs::default(),
             passphrase: PassphraseArgs::default(),
             command,

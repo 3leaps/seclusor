@@ -37,7 +37,28 @@ pub(crate) struct ResolvedWriteRecipients {
 
 /// Whether any of the three explicit recipient channels is present on the CLI.
 pub(crate) fn recipient_channels_present(args: &RecipientArgs) -> bool {
-    !args.recipients.is_empty() || args.recipient_file.is_some() || args.recipient_env_var.is_some()
+    !args.recipients.is_empty()
+        || !args.recipient_files.is_empty()
+        || args.recipient_env_var.is_some()
+}
+
+/// Fail closed when recipient flags or `--allow-recipient-mismatch` are passed
+/// against an unencrypted plaintext secrets file on an ordinary write verb.
+pub(crate) fn refuse_plaintext_recipient_intent(
+    path: &Path,
+    recipients: &RecipientArgs,
+    allow_recipient_mismatch: bool,
+) -> CliResult<()> {
+    if recipient_channels_present(recipients) || allow_recipient_mismatch {
+        return Err(CliError::Message(format!(
+            "refusing to modify unencrypted plaintext secrets file at {} when recipient \
+             options are supplied; initialize an encrypted document (--codec bundle or \
+             --codec inline) or convert explicitly via `seclusor secrets rekey`, \
+             `seclusor secrets inline encrypt`, or `seclusor secrets bundle encrypt`",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Resolve the canonical recipient set for an encrypting write.
@@ -577,7 +598,21 @@ fn validate_set_value_input_flags_with_other(
             "--echo-value may only be used with --value-stdin".to_string(),
         ));
     }
-    classify_stdin_value_mode(value_stdin, echo_value, stdin_is_terminal())
+    let mode = classify_stdin_value_mode(value_stdin, echo_value, stdin_is_terminal())?;
+    #[cfg(unix)]
+    if echo_value {
+        // SAFETY: `tcgetpgrp` and `getpgrp` read process-group IDs on `STDIN_FILENO`
+        // without side effects; rejects background process groups before `read(0)` can
+        // stop the process with `SIGTTIN`.
+        let (fg_pgid, self_pgid) =
+            unsafe { (libc::tcgetpgrp(libc::STDIN_FILENO), libc::getpgrp()) };
+        if fg_pgid <= 0 || fg_pgid != self_pgid {
+            return Err(CliError::Message(
+                "--echo-value requires a foreground controlling terminal".to_string(),
+            ));
+        }
+    }
+    Ok(mode)
 }
 
 /// Read set material from mutually exclusive channels.
@@ -800,7 +835,7 @@ mod tests {
         let other = "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p".to_string();
         let args = RecipientArgs {
             recipients: vec![other],
-            recipient_file: None,
+            recipient_files: vec![],
             recipient_env_var: None,
         };
         let err = resolve_write_recipients(Some(&meta), &args, true, false).expect_err("mismatch");
@@ -827,7 +862,7 @@ mod tests {
         let other = "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p";
         let args = RecipientArgs {
             recipients: vec![other.to_string()],
-            recipient_file: None,
+            recipient_files: vec![],
             recipient_env_var: None,
         };
 

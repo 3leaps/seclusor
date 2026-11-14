@@ -18,16 +18,20 @@ inline-encrypted JSON. That closes the plaintext-on-disk window for mutations.
 
 ## 2. Command map
 
-| Command                          | Plaintext                                                    | Inline encrypted                                                                       | Bundle encrypted                                                                             |
-| -------------------------------- | ------------------------------------------------------------ | -------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `secrets set` (value/ref)        | mutate                                                       | Full decrypt; encrypt only changed values; recipients rules                            | Full decrypt→mutate→re-encrypt                                                               |
-| `secrets set --description` only | mutate                                                       | Structural-only (no identity)                                                          | Encrypting write                                                                             |
-| `secrets unset`                  | mutate                                                       | Structural-only (no identity)                                                          | Encrypting write                                                                             |
-| `secrets import-env`             | mutate                                                       | Full encrypting write                                                                  | Full encrypting write                                                                        |
-| `secrets rekey`                  | Encrypt values + establish recipients (preserve credentials) | Normalize all fields + recipients                                                      | Same                                                                                         |
-| `secrets init`                   | Fresh skeleton JSON                                          | **Not via empty init** — create by encrypting a value (`set` / `import-env` / `rekey`) | **Create-only** empty skeleton: `--codec bundle` + explicit recipients on an **absent** path |
+| Command                          | Plaintext                                                                     | Inline encrypted                                                                        | Bundle encrypted                                                                             |
+| -------------------------------- | ----------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `secrets set` (value/ref)        | mutate (refuses if `--recipient*` / `--allow-recipient-mismatch` is supplied) | Full decrypt; encrypt only changed values; recipients rules                             | Full decrypt→mutate→re-encrypt                                                               |
+| `secrets set --description` only | mutate (refuses if `--recipient*` / `--allow-recipient-mismatch` is supplied) | Structural-only (no identity)                                                           | Encrypting write                                                                             |
+| `secrets unset`                  | mutate (refuses if `--recipient*` / `--allow-recipient-mismatch` is supplied) | Structural-only (no identity)                                                           | Encrypting write                                                                             |
+| `secrets import-env`             | mutate (refuses if `--recipient*` / `--allow-recipient-mismatch` is supplied) | Full encrypting write                                                                   | Full encrypting write                                                                        |
+| `secrets rekey`                  | Encrypt values + establish recipients (preserve credentials)                  | Normalize all fields + recipients                                                       | Same                                                                                         |
+| `secrets init`                   | Fresh skeleton JSON (values remain plaintext)                                 | **Create-only** empty skeleton: `--codec inline` + explicit recipients on absent target | **Create-only** empty skeleton: `--codec bundle` + explicit recipients on an **absent** path |
 
 Recipient **set changes** never ride on `set` / `import-env` — use **`rekey`**.
+Supplying `--recipient`, `--recipient-file`, `--recipient-env-var`, or
+`--allow-recipient-mismatch` against an unencrypted plaintext document on
+`set`, `import-env`, or `unset` fails closed without modifying the file; use
+`init --codec bundle|inline`, `rekey`, `inline encrypt`, or `bundle encrypt`.
 
 ---
 
@@ -58,7 +62,7 @@ documented safe path.
 
 Encrypting writes resolve recipients as:
 
-1. Explicit `--recipient` / `--recipient-file` / `--recipient-env-var`, else
+1. Explicit `--recipient` (repeatable) / `--recipient-file` (repeatable) / `--recipient-env-var`, else
 2. Document `recipients` metadata (schema v1.1.0), else
 3. Fail closed
 
@@ -96,7 +100,7 @@ or removed; `rekey` may not open them until fixed.
 
 ---
 
-## 5. Encrypted init (bundle create-only)
+## 5. Encrypted init (`--codec bundle` or `--codec inline`, create-only)
 
 ```bash
 # Plaintext skeleton (unchanged)
@@ -105,12 +109,16 @@ seclusor secrets init --file secrets.json --project myapp
 # Empty encrypted bundle (create-only; path must not exist)
 seclusor secrets init --file secrets.age --codec bundle \
   --recipient age1... --project myapp
+
+# Empty inline-encrypted skeleton (create-only; establishes v1.1.0 recipients)
+seclusor secrets init --file secrets-inline.json --codec inline \
+  --recipient-file team-a.txt --recipient-file team-b.txt --project myapp
 ```
 
 Rules:
 
-- **`--codec bundle` only** for encrypted init; requires at least one
-  **explicit** recipient channel (ambient `SECLUSOR_RECIPIENTS` alone is not
+- **`--codec bundle` or `--codec inline`** for encrypted init; requires at least
+  one **explicit** recipient channel (ambient `SECLUSOR_RECIPIENTS` alone is not
   enough).
 - Target path must be **absent**. Existing files: use `rekey` to encrypt
   existing credentials, or remove the file for a fresh empty encrypted skeleton.
@@ -122,8 +130,9 @@ Rules:
   guaranteed (directory guidance applies).
 - stdout = path; establishment notice on stderr.
 
-Inline encrypted documents: plaintext `init` then `set`/`import-env` with
-recipients, or `rekey` from plaintext.
+To seal an inline document directly from a stream without writing plaintext to
+disk, `seclusor secrets inline encrypt --input - --output <path|->` also accepts
+bounded JSON on stdin.
 
 ---
 

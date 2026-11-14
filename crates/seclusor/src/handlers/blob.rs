@@ -116,7 +116,7 @@ mod tests {
             allow_large: false,
             recipients: RecipientArgs {
                 recipients: vec![recipient.to_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
@@ -172,7 +172,7 @@ mod tests {
             allow_large: false,
             recipients: RecipientArgs {
                 recipients: vec![recipient.to_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
@@ -209,7 +209,7 @@ mod tests {
             allow_large: false,
             recipients: RecipientArgs {
                 recipients: vec![recipient.to_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
@@ -246,7 +246,7 @@ mod tests {
             allow_large: false,
             recipients: RecipientArgs {
                 recipients: vec![recipient.to_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
@@ -270,7 +270,7 @@ mod tests {
             allow_large: true,
             recipients: RecipientArgs {
                 recipients: vec![recipient.to_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         });
@@ -294,7 +294,7 @@ mod tests {
             allow_large: false,
             recipients: RecipientArgs {
                 recipients: vec![recipient.to_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
@@ -332,7 +332,7 @@ mod tests {
             allow_large: false,
             recipients: RecipientArgs {
                 recipients: vec![r1.to_string(), r2.to_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
@@ -387,7 +387,7 @@ mod tests {
             allow_large: false,
             recipients: RecipientArgs {
                 recipients: vec![recipient.to_string()],
-                recipient_file: None,
+                recipient_files: vec![],
                 recipient_env_var: None,
             },
         })
