@@ -13,7 +13,7 @@ The command prints the public recipient to stdout.
 Encryption accepts recipients from:
 
 - `--recipient` (repeatable)
-- `--recipient-file`
+- `--recipient-file` (repeatable)
 - `--recipient-env-var`
 
 ## Rekeying

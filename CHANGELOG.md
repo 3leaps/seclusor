@@ -8,6 +8,77 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-11-14
+
+Hardening and release-provenance update: encrypted pack-sealing guards,
+`secrets run --clean-env`, macOS extended-ACL checks on private files,
+signed dual-tag and `decernor` release-provenance controls, control-plane
+decision records (`ADR-0013` and `DDR-0006`), Go 1.27+ FFI bitcode stripping,
+and dependency lock refreshes. Document formats and Rust, Go, TypeScript, and
+C-ABI contracts are unchanged.
+
+### Added
+
+- `secrets run --clean-env` and repeatable `--env-allow <VAR>` to scrub ambient
+  parent environment variables down to a minimal OS baseline before overlaying
+  project credentials. The `v0.2.1` `--passphrase-env` exclusion and
+  passphrase-value equality checks still apply unconditionally, and child
+  `stdin` is rebound to null when `--passphrase-stdin` unlocks a protected
+  identity.
+- `secrets init --codec inline` for creating an empty inline-encrypted skeleton
+  with established schema `v1.1.0` recipient metadata on an absent target path,
+  plus `-` stream support on `secrets inline encrypt --input` and `--output`.
+- Repeatable `--recipient-file <path>` across recipient-taking CLI commands with
+  first-seen public-key deduplication and recipient-count bounds.
+- OpenPGP-signed dual release-tag helpers (`vX.Y.Z` and
+  `bindings/go/seclusor/vX.Y.Z`), public release-signing pins
+  (`docs/security/release-signing-keys.asc`,
+  `docs/security/seclusor-minisign.pub`, `config/release/signing-subkey.txt`,
+  `config/release/tagger-identity.txt`), `decernor` fingerprint anchors
+  (`keys/expected-fingerprints.{txt,ndjson}`), and read-only SHA-pinned GitHub
+  Actions workflow verification (`scripts/release-workflow-pin.py`,
+  `scripts/test-release-controls.sh`).
+- `ADR-0013` (control-plane secret-isolation and value-free invariant for MCP
+  and graphical inspection surfaces), `DDR-0006` (`Proposed` dual native Rust
+  and pure-Go implementation and conformance layout for `v0.3.0`), and
+  `SDR-0004` (`RUSTSEC-2026-0374` advisory evaluation).
+
+### Fixed
+
+- `secrets set`, `secrets unset`, and `secrets import-env` now fail closed
+  without modifying the target file when `--recipient`, `--recipient-file`,
+  `--recipient-env-var`, or `--allow-recipient-mismatch` is passed against an
+  unencrypted plaintext document (previously, `secrets set` with
+  `--recipient-file` against a plaintext document created via `secrets init`
+  without `--codec bundle` ignored the recipient flag and wrote the credential
+  value in plaintext).
+- On macOS, private file creation (age identities, Ed25519 signing keys, and
+  decrypted plaintext outputs) clears inherited extended ACLs before writing
+  private bytes and rejects parent directories whose ACL grants non-owner write,
+  `add_file`, or `delete_child` access. Loading an existing private file on
+  macOS warns on `stderr` when a non-owner extended ACL grant is present
+  (`ls -le` / `chmod -N <path>`) and fails closed if ACL inspection fails. Linux
+  retains its `0600` mode check; Windows remains outside POSIX/macOS ACL
+  preflight.
+- Plaintext file writers across the CLI and bindings enforce owner-only (`0600`)
+  Unix permissions before writing and refuse symlink or multi-hardlink targets.
+- Interactive passphrase and echoed value prompts on Unix now require a
+  foreground controlling terminal and fail fast in non-interactive runners
+  instead of hanging.
+
+### Changed
+
+- Refreshed root and TypeScript native `Cargo.lock` dependency graphs (including
+  `rustix 1.1.6` for `RUSTSEC-2026-0486`) and updated the cross-workspace
+  crypto parity manifest.
+- Stripped LLVM bitcode and compiler command-line sections from prebuilt CGo
+  `libseclusor_ffi.a` archives (`scripts/strip-ffi-bitcode.sh`) for Go 1.27+
+  linker compatibility, and separated local development CGo linking behind the
+  `seclusor_local` build tag.
+- Aligned `LICENSE-MIT`, `LICENSE-APACHE`, and `NOTICE` (`3 Leaps, LLC`, North
+  Carolina) across the workspace root, Go module, and TypeScript package,
+  enforced via `make license-check`.
+
 ## [0.2.2] - 2026-08-17
 
 Compatibility release: hidden terminal value entry, consistent line-oriented
@@ -342,25 +413,5 @@ See `docs/releases/v0.1.2.md` for full notes.
 - Ed25519 signing is Rust-native only in v0.1.1. Go and TypeScript signing bindings are intentionally deferred to v0.1.2 (tracked as D11B) to allow a deliberate FFI design pass before binding the signing contract to the stable v0.1.x ABI.
 
 See `docs/releases/v0.1.1.md` for detailed release notes.
-
-## [0.1.0] - 2026-03-13
-
-### Added
-
-- Complete Rust rewrite as library-first project with six-crate workspace
-- Two storage codecs (bundle + inline) with conversion support
-- Secure CLI including `secrets run` for safe secret injection
-- First-class Go and TypeScript bindings via FFI/NAPI
-- Embedded documentation system (`seclusor docs`)
-- Comprehensive security documentation, app notes, and responsible disclosure policy
-- Release engineering, SBOM, and signing infrastructure
-
-### Security
-
-- Enforced fail-closed validation, size limits, and stdout purity
-- Hardened secret input channels per SDR-0002
-- Added key rekeying, compromise response, and integrity guidance
-
-See `docs/releases/v0.1.0.md` for detailed release notes.
 
 _(Older entries archived in `docs/releases/`)_
