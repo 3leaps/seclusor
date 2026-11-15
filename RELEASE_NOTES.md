@@ -2,6 +2,27 @@
 
 **Content policy**: This file contains the most recent 3 releases (reverse chronological). Older releases are archived in `docs/releases/vX.Y.Z.md`.
 
+## v0.2.3 (November 2026)
+
+**Encrypted pack sealing, clean child environments, macOS ACL guards, and signed release provenance** — Fail-closed recipient flags on unencrypted targets, `secrets run --clean-env` ambient environment scrubbing, macOS extended-ACL protection for private files, and OpenPGP-signed dual release tags with `decernor` fingerprint anchors. Document formats and Rust, Go, TypeScript, and C-ABI contracts are unchanged.
+
+- **Pack-sealing guard:** `secrets set`, `secrets unset`, and `secrets import-env` now fail closed without modifying the file when `--recipient`, `--recipient-file`, `--recipient-env-var`, or `--allow-recipient-mismatch` is passed against an unencrypted plaintext document (previously, `secrets set` with `--recipient-file` against a plaintext document created via `secrets init` without `--codec bundle` ignored the recipient flag and wrote the credential value in plaintext). `secrets init --codec inline` and `-` stream support on `secrets inline encrypt` are now supported, and `--recipient-file` is repeatable across recipient-taking commands
+- **`secrets run --clean-env`:** scrubs inherited ambient environment variables down to a minimal OS baseline plus repeatable `--env-allow <VAR>`, while preserving the v0.2.1 `--passphrase-env` exclusion and passphrase-value equality guard and rebinding child `stdin` to null after `--passphrase-stdin` unlock
+- **macOS private-file ACLs:** creating identity files, signing keys, or decrypted outputs on macOS clears inherited extended ACLs before writing private bytes and refuses parent directories whose ACL grants non-owner write, `add_file`, or `delete_child` access; loading an existing private file on macOS warns on `stderr` when a non-owner ACL grant is present (`ls -le` / `chmod -N <path>`) and fails closed if ACL inspection fails. Linux keeps its `0600` mode check; Windows is not covered by POSIX/macOS ACL preflight
+- **Signed release provenance & Go 1.27+:** v0.2.3 is the first release published with OpenPGP-signed dual annotated tags (`v0.2.3` and `bindings/go/seclusor/v0.2.3`), committed public signing pins (`docs/security/`), `decernor` fingerprint anchors (`keys/expected-fingerprints.{txt,ndjson}`), read-only SHA-pinned workflows, and LLVM bitcode stripping on prebuilt Go FFI archives
+
+**Upgrade cue:** if a macOS load prints an extended-ACL warning, inspect the file with `ls -le <path>` and clear the ACL with `chmod -N <path>`. If a script passed `--recipient*` to `secrets set` against a plaintext file, initialize with `secrets init --codec bundle` or `secrets init --codec inline` (or convert with `secrets rekey` / `inline encrypt` / `bundle encrypt`) and re-encrypt any value that was previously written in plaintext.
+
+If you are still on v0.2.0 or earlier, this release also includes the v0.2.1 `secrets run` fix:
+[GHSA-2w88-3q86-736g](https://github.com/3leaps/seclusor/security/advisories/GHSA-2w88-3q86-736g).
+This release does not reopen that advisory.
+
+**Install** (after the GitHub release is published):
+`brew upgrade seclusor` · `scoop update seclusor`
+
+See `docs/releases/v0.2.3.md` for full notes and `docs/releases/v0.2.3-announce.md`
+for a short announcement.
+
 ## v0.2.2 (August 2026)
 
 **Type a secret without it showing on screen** — Hidden terminal value entry,
@@ -65,34 +86,5 @@ writes.
 `brew upgrade seclusor` · `scoop update seclusor`
 
 See `docs/releases/v0.2.1.md` for full notes, ranges, residuals, and workarounds.
-
-## v0.2.0 (August 2026)
-
-**Encrypted documents you can live in** — Inspect, mutate, and rekey bundle and
-inline secrets without a plaintext-on-disk edit cycle; sign release assets with
-fail-closed verification; publish from locked, audited dependency graphs.
-
-- Read and validate plaintext, inline-encrypted, and bundle documents through a
-  common auto-detected command path
-- Mutate encrypted documents with `set`, `unset`, and `import-env`; use `rekey`
-  as the explicit recipient-membership operation
-- Prefer `--value-stdin` / `--value-file` / `--value-env` for secret input
-  (legacy `--value` still works, with a warning)
-- Create detached `seclusor.signature.v1` asset signatures with age-protected
-  Ed25519 signing keys and expected-key verification by default
-- Optional schema v1.1.0 recipient metadata with fail-closed handling of
-  plaintext credential values—and fail-closed older strict readers
-- Locked dependency graphs for published CLI and Go artifacts, with scheduled
-  audits, parity checks, and negative controls
-
-**Upgrade cue**: if documents will carry `recipients` metadata, upgrade writers
-and readers together. Documents without `recipients` stay readable on older
-binaries.
-
-**Install** (after the GitHub release is published):
-`brew install 3leaps/tap/seclusor` ·
-`scoop bucket add 3leaps https://github.com/3leaps/scoop-bucket && scoop install seclusor`
-
-See `docs/releases/v0.2.0.md` for full notes and upgrade guidance.
 
 _(Older releases archived in `docs/releases/`. This file is kept short per project convention.)_

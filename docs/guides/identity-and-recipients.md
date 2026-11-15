@@ -35,7 +35,11 @@ On **Unix** (Linux, macOS), identity files must have mode `0600` (read/write
 for owner only) **and** be owned by the current user. Seclusor enforces both
 checks before loading — wrong mode or ownership fails with a clear error
 that never includes key material. Generated identity files are created with
-`0600` atomically.
+`0600` atomically. On **macOS**, seclusor also clears inherited extended ACLs
+before writing new private files, rejects parent directories whose ACL grants
+non-owner write/`add_file`/`delete_child` access, and warns on `stderr` (`ls -le`
+/ `chmod -N <path>`) if an existing identity file carries a non-owner extended
+ACL grant.
 
 On **Windows**, there is no equivalent mode/ownership preflight. Protect
 identity files using NTFS ACLs or by storing them in a user-only directory.
@@ -175,7 +179,8 @@ Recipients can come from three sources:
 | From a file     | `--recipient-file`    | `--recipient-file recipients.txt`         |
 | From an env var | `--recipient-env-var` | `--recipient-env-var SECLUSOR_RECIPIENTS` |
 
-Multiple `--recipient` flags can be specified for multi-recipient encryption.
+Multiple `--recipient` and `--recipient-file` flags can be specified for
+multi-recipient encryption; recipients are deduplicated in first-seen order.
 Any holder of any listed identity can decrypt the result.
 
 Recipient files use the same format as identity files: one key per line,
@@ -296,11 +301,11 @@ partial-success state.
 
 ## Platform notes
 
-| Platform | Permission enforcement | Notes                                |
-| -------- | ---------------------- | ------------------------------------ |
-| Linux    | `0600` enforced        | `chmod 600 identity.txt`             |
-| macOS    | `0600` enforced        | Same as Linux                        |
-| Windows  | Not enforced           | Use NTFS ACLs or user-only directory |
+| Platform | Permission enforcement              | Notes                                                       |
+| -------- | ----------------------------------- | ----------------------------------------------------------- |
+| Linux    | `0600` enforced                     | `chmod 600 identity.txt`                                    |
+| macOS    | `0600` enforced + extended ACL scan | Clears inherited ACLs on create; warns on load (`chmod -N`) |
+| Windows  | Not enforced                        | Use NTFS ACLs or user-only directory                        |
 
 ## Troubleshooting protected identities
 

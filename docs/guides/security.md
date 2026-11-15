@@ -13,7 +13,9 @@ Seclusor is a security-sensitive library and tool for managing encrypted secrets
 - Stdout purity: data on stdout, diagnostics and prompts on stderr
 - Secret key material blocked from CLI arguments (see SDR-0002)
 - Ciphertext prefix validation (`sec:age:v1:`)
-- Identity file permission checks (0600 on Unix)
+- Identity file permission checks (`0600` and current-user ownership on Unix;
+  on macOS, inherited extended ACLs are cleared on create and non-owner ACL
+  grants warn on load)
 - Asset signature verification is fail-closed by default: callers must provide
   an expected public key or fingerprint unless they explicitly opt into
   embedded-key self-consistency checks.
@@ -73,8 +75,9 @@ CI, but:
 - the named variable is excluded from the **child** environment (v0.2.1+);
 - the passphrase still resides in the **parent** `seclusor` process environment
   for the lifetime of that invocation;
-- `--allow` / `--deny` filter injected store keys only — they never controlled
-  ambient environment pass-through.
+- `--allow` / `--deny` filter injected store keys only — to scrub ambient
+  parent environment variables from the child process, pass `--clean-env` (with
+  optional repeatable `--env-allow <VAR>` pass-through keys).
 
 Do not treat `--passphrase-env` as equivalent to file or stdin channels.
 

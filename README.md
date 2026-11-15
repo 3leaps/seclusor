@@ -9,7 +9,7 @@ Seclusor is a library-first Rust project that lets developers, DevSecOps enginee
 
 **Important**: While armored secrets _can_ be stored in git, this is not always advisable. See [App Note 01: Git Storage of Armored Secrets](docs/appnotes/01-git-armored-storage.md) for the risk continuum and guidance by sensitivity level.
 
-**Lifecycle Phase**: `alpha` | Current version: **v0.2.2** (hidden terminal secret entry; drop-in for scripts) | See [VERSION](VERSION), [CHANGELOG.md](CHANGELOG.md), and [v0.2.2 notes](docs/releases/v0.2.2.md)
+**Lifecycle Phase**: `alpha` | Current version: **v0.2.3** (encrypted pack sealing, `secrets run --clean-env`, macOS ACL guards, signed release provenance) | See [VERSION](VERSION), [CHANGELOG.md](CHANGELOG.md), and [v0.2.3 notes](docs/releases/v0.2.3.md)
 
 ## The Problem
 
@@ -66,7 +66,7 @@ scoop update seclusor
 Platform binaries, checksums, and detached signatures are published on the
 [GitHub Releases](https://github.com/3leaps/seclusor/releases) page. Prefer
 verifying release assets with an expected public key or fingerprint
-(`seclusor assets verify`). See [v0.2.2 announcement](docs/releases/v0.2.2-announce.md)
+(`seclusor assets verify`). See [v0.2.3 announcement](docs/releases/v0.2.3-announce.md)
 for the current-release one-pager.
 
 ## Quick Start
