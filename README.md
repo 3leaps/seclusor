@@ -65,9 +65,11 @@ scoop update seclusor
 
 Platform binaries, checksums, and detached signatures are published on the
 [GitHub Releases](https://github.com/3leaps/seclusor/releases) page. Prefer
-verifying release assets with an expected public key or fingerprint
-(`seclusor assets verify`). See [v0.2.3 announcement](docs/releases/v0.2.3-announce.md)
-for the current-release one-pager.
+verifying GitHub release tags, public keys, and signed checksum manifests
+against the committed `decernor` fingerprint anchors (see
+[Release Signing and Verification](docs/security/README.md)). See
+[v0.2.3 announcement](docs/releases/v0.2.3-announce.md) for the current-release
+one-pager.
 
 ## Quick Start
 
