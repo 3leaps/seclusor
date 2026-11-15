@@ -20,6 +20,13 @@ if [ "${#artifacts[@]}" -eq 0 ]; then
     echo "error: no distributable assets found in ${release_dir}" >&2
     exit 1
 fi
+for anchor in expected-fingerprints.txt expected-fingerprints.ndjson; do
+    if [ ! -s "${release_dir}/${anchor}" ]; then
+        echo "error: staged release anchor is missing: ${anchor}" >&2
+        exit 1
+    fi
+    artifacts+=("${release_dir}/${anchor}")
+done
 
 (
     cd "$release_dir"

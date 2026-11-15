@@ -7,8 +7,8 @@
 - Node.js 20+ (for TypeScript bindings)
 - `cargo-deny` (`cargo install cargo-deny`)
 - `cargo-audit` (`cargo install cargo-audit`)
-- `goneat` v0.5.16+ (for formatting and linting; CI bootstraps this pin into
-  fulmen-toolbox `goneat-tools-runner-glibc:v0.5.1`, which supplies ruff)
+- `goneat` v0.6.0+ (for formatting and linting; CI bootstraps this pin into
+  fulmen-toolbox `goneat-tools-runner-glibc:v0.5.6`, which supplies ruff)
 - `cbindgen` (for FFI header generation)
 
 ## Building

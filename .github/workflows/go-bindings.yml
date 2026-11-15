@@ -2,44 +2,64 @@ name: Go Bindings (Prep)
 # NOTE: Windows arm64 is NOT supported for Go bindings.
 # MinGW does not support the arm64 target, and Go's CGo requires MinGW on Windows.
 # The release workflow builds windows-arm64 with MSVC for the CLI binary only.
+#
+# Read-only workflow: builds and bitcode-strips FFI static libraries across all
+# 5 Go targets, validates Linux cgo tests, and uploads `go-bindings-vX.Y.Z` as a
+# workflow artifact. The maintainer fetches, digest-verifies, and opens a
+# reviewed PR locally via `make go-bindings-fetch`.
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version (e.g. 0.1.1)"
+        description: "Release version (e.g. 0.2.3)"
         required: true
         type: string
 permissions:
   contents: read
-  actions: write
 env:
   CARGO_TERM_COLOR: always
 jobs:
   validate:
     name: Validate Inputs
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.version.outputs.version }}
+      commit: ${{ steps.version.outputs.commit }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
       - name: Validate version matches VERSION file
         id: version
         shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          input_version="${{ inputs.version }}"
-          file_version="$(cat VERSION)"
-          if [ "$input_version" != "$file_version" ]; then
-            echo "ERROR: input version=$input_version does not match VERSION file=$file_version"
+          case "$INPUT_VERSION" in
+            *[!0-9A-Za-z.-]*|"")
+              echo "ERROR: invalid version input" >&2
+              exit 1
+              ;;
+          esac
+          file_version="$(tr -d ' \t\r\n' < VERSION)"
+          if [ "$INPUT_VERSION" != "$file_version" ]; then
+            echo "ERROR: input version=$INPUT_VERSION does not match VERSION file=$file_version"
             echo "Update VERSION first, or rerun with the correct input."
             exit 1
           fi
-          echo "version=$file_version" >> "$GITHUB_OUTPUT"
+          make version-check
+          commit_sha="$(git rev-parse HEAD)"
+          {
+            echo "version=$file_version"
+            echo "commit=$commit_sha"
+          } >> "$GITHUB_OUTPUT"
   build-linux:
     name: Build FFI (Linux)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     container:
-      image: ghcr.io/fulmenhq/goneat-tools-runner-glibc:v0.5.1
+      image: ghcr.io/fulmenhq/goneat-tools-runner-glibc:v0.5.6@sha256:afcffa00283c765928dfef40966c282f2ca190653cf4443f634cb8f67c1d51ab
       options: --user root
     needs: validate
     strategy:
@@ -52,7 +72,17 @@ jobs:
             glibc: "2.17"
             artifact_suffix: linux-arm64
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772  # v1
+        with:
+          toolchain: "1.94.0"
+          targets: ${{ matrix.target }}
+          components: llvm-tools
       - name: Ensure Rust target is installed
         shell: bash
         run: rustup target add ${{ matrix.target }}
@@ -62,7 +92,7 @@ jobs:
           set -euo pipefail
           # artifact-callsite: gobindings-ffi-linux
           ./scripts/cargo-artifact-build.sh zigbuild --target "${{ matrix.target }}.${{ matrix.glibc }}" -p seclusor-ffi
-      - name: Package FFI
+      - name: Package and strip FFI bitcode
         shell: bash
         run: |
           set -euo pipefail
@@ -88,23 +118,33 @@ jobs:
 
           target_dir="$(resolve_target libseclusor_ffi.a)"
           mkdir -p "dist/ffi/${{ matrix.artifact_suffix }}"
-          cp "target/${target_dir}/release/libseclusor_ffi.a" "dist/ffi/${{ matrix.artifact_suffix }}/"
+          cp "target/${target_dir}/release/libseclusor_ffi.a" "dist/ffi/${{ matrix.artifact_suffix }}/libseclusor_ffi.a"
+          ./scripts/strip-ffi-bitcode.sh "dist/ffi/${{ matrix.artifact_suffix }}/libseclusor_ffi.a"
       - name: Upload FFI artifact
-        uses: actions/upload-artifact@v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: ffi-${{ matrix.artifact_suffix }}
           path: dist/ffi/${{ matrix.artifact_suffix }}
+          if-no-files-found: error
+          retention-days: 30
   build-macos:
     name: Build FFI (macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     needs: validate
     env:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.94.0
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772  # v1
+        with:
+          toolchain: "1.94.0"
           targets: x86_64-apple-darwin,aarch64-apple-darwin
+          components: llvm-tools
       - name: Ensure Rust targets are installed
         shell: bash
         run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
@@ -116,41 +156,54 @@ jobs:
           ./scripts/cargo-artifact-build.sh build --target x86_64-apple-darwin -p seclusor-ffi
           # artifact-callsite: gobindings-ffi-darwin-arm64
           ./scripts/cargo-artifact-build.sh build --target aarch64-apple-darwin -p seclusor-ffi
-      - name: Package FFI
+      - name: Package and strip FFI bitcode
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist/ffi/darwin-amd64 dist/ffi/darwin-arm64
-          cp target/x86_64-apple-darwin/release/libseclusor_ffi.a dist/ffi/darwin-amd64/
-          cp target/aarch64-apple-darwin/release/libseclusor_ffi.a dist/ffi/darwin-arm64/
+          cp target/x86_64-apple-darwin/release/libseclusor_ffi.a dist/ffi/darwin-amd64/libseclusor_ffi.a
+          cp target/aarch64-apple-darwin/release/libseclusor_ffi.a dist/ffi/darwin-arm64/libseclusor_ffi.a
+          ./scripts/strip-ffi-bitcode.sh dist/ffi/darwin-amd64/libseclusor_ffi.a
+          ./scripts/strip-ffi-bitcode.sh dist/ffi/darwin-arm64/libseclusor_ffi.a
       - name: Upload FFI artifact (darwin-amd64)
-        uses: actions/upload-artifact@v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: ffi-darwin-amd64
           path: dist/ffi/darwin-amd64
+          if-no-files-found: error
+          retention-days: 30
       - name: Upload FFI artifact (darwin-arm64)
-        uses: actions/upload-artifact@v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: ffi-darwin-arm64
           path: dist/ffi/darwin-arm64
+          if-no-files-found: error
+          retention-days: 30
   build-windows:
     name: Build FFI (Windows GNU)
-    runs-on: windows-latest
+    runs-on: windows-2025
     needs: validate
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.94.0
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772  # v1
+        with:
+          toolchain: "1.94.0"
           targets: x86_64-pc-windows-gnu
+          components: llvm-tools
       - name: Ensure Rust target is installed
         shell: bash
         run: rustup target add x86_64-pc-windows-gnu
       - name: Install MinGW
-        uses: msys2/setup-msys2@v2
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884  # v2.32.0
         with:
           msystem: MINGW64
           update: true
-          install: mingw-w64-x86_64-gcc
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-binutils
           path-type: inherit
       - name: Build FFI (GNU target)
         shell: msys2 {0}
@@ -158,122 +211,117 @@ jobs:
           set -euo pipefail
           # artifact-callsite: gobindings-ffi-windows-gnu
           ./scripts/cargo-artifact-build.sh build --target x86_64-pc-windows-gnu -p seclusor-ffi
-      - name: Package FFI
-        shell: bash
+      - name: Package and strip FFI bitcode
+        shell: msys2 {0}
         run: |
           set -euo pipefail
           mkdir -p dist/ffi/windows-amd64
-          cp target/x86_64-pc-windows-gnu/release/libseclusor_ffi.a dist/ffi/windows-amd64/
+          cp target/x86_64-pc-windows-gnu/release/libseclusor_ffi.a dist/ffi/windows-amd64/libseclusor_ffi.a
+          ./scripts/strip-ffi-bitcode.sh dist/ffi/windows-amd64/libseclusor_ffi.a
       - name: Upload FFI artifact
-        uses: actions/upload-artifact@v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: ffi-windows-amd64
           path: dist/ffi/windows-amd64
+          if-no-files-found: error
+          retention-days: 30
   cbindgen:
     name: Generate C Header
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     container:
-      image: ghcr.io/fulmenhq/goneat-tools-runner-glibc:v0.5.1
+      image: ghcr.io/fulmenhq/goneat-tools-runner-glibc:v0.5.6@sha256:afcffa00283c765928dfef40966c282f2ca190653cf4443f634cb8f67c1d51ab
       options: --user root
     needs: validate
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
       - name: Generate C header
         shell: bash
         run: |
           set -euo pipefail
           cbindgen --config cbindgen.toml --crate seclusor-ffi --output seclusor.h
       - name: Upload header
-        uses: actions/upload-artifact@v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: c-header
           path: seclusor.h
-  update-go-bindings:
-    name: Create Go Bindings PR
-    runs-on: ubuntu-latest
+          if-no-files-found: error
+          retention-days: 30
+  package-go-bindings:
+    name: Stage Go Bindings Bundle
+    runs-on: ubuntu-24.04
     needs: [validate, build-linux, build-macos, build-windows, cbindgen]
     permissions:
-      contents: write
-      pull-requests: write
-      actions: read
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          fetch-depth: 0
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+      - name: Setup Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v6.5.0
+        with:
+          go-version-file: bindings/go/seclusor/go.mod
       - name: Download all FFI artifacts
-        uses: actions/download-artifact@v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
           pattern: ffi-*
           path: ffi-libs
       - name: Download C header
-        uses: actions/download-artifact@v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
           name: c-header
           path: ffi-libs
-      - name: Update Go bindings directory
+      - name: Populate and validate Go bindings bundle
         shell: bash
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          COMMIT: ${{ needs.validate.outputs.commit }}
         run: |
           set -euo pipefail
           header_path="$(find ffi-libs -maxdepth 2 -name seclusor.h | head -n 1)"
-          if [ -z "$header_path" ]; then
-            echo "ERROR: seclusor.h not found in downloaded artifacts"
+          if [ -z "$header_path" ] || [ ! -s "$header_path" ]; then
+            echo "ERROR: seclusor.h not found in downloaded artifacts" >&2
             exit 1
           fi
 
+          mkdir -p dist/go-bindings/include
           cp "$header_path" bindings/go/seclusor/include/seclusor.h
+          cp "$header_path" dist/go-bindings/include/seclusor.h
 
-          for dir in ffi-libs/ffi-*/; do
-            platform="${dir#ffi-libs/ffi-}"
-            platform="${platform%/}"
-            mkdir -p "bindings/go/seclusor/lib/$platform"
-            cp "$dir/libseclusor_ffi.a" "bindings/go/seclusor/lib/$platform/"
+          for platform in darwin-amd64 darwin-arm64 linux-amd64 linux-arm64 windows-amd64; do
+            src="ffi-libs/ffi-${platform}/libseclusor_ffi.a"
+            if [ ! -f "$src" ] || [ ! -s "$src" ]; then
+              echo "ERROR: missing or empty $src" >&2
+              exit 1
+            fi
+            mkdir -p "bindings/go/seclusor/lib/${platform}" "dist/go-bindings/lib/${platform}"
+            cp "$src" "bindings/go/seclusor/lib/${platform}/libseclusor_ffi.a"
+            cp "$src" "dist/go-bindings/lib/${platform}/libseclusor_ffi.a"
           done
 
-          ls -la bindings/go/seclusor/lib/*/
-      - name: Validate committed Go bindings on runner platform
-        shell: bash
-        run: |
-          set -euo pipefail
           make go-test-committed
-      - name: Create Pull Request
-        uses: peter-evans/create-pull-request@v6
+
+          printf '{"version":"%s","commit":"%s"}\n' "$VERSION" "$COMMIT" \
+            > dist/go-bindings/go-bindings-identity.json
+          (
+            cd dist/go-bindings
+            shasum -a 256 \
+              include/seclusor.h \
+              lib/darwin-amd64/libseclusor_ffi.a \
+              lib/darwin-arm64/libseclusor_ffi.a \
+              lib/linux-amd64/libseclusor_ffi.a \
+              lib/linux-arm64/libseclusor_ffi.a \
+              lib/windows-amd64/libseclusor_ffi.a > SHA256SUMS
+          )
+      - name: Upload Go bindings bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          base: main
-          branch: go-bindings/v${{ needs.validate.outputs.version }}
-          title: "feat(bindings): update Go prebuilt libs for v${{ needs.validate.outputs.version }}"
-          body: |
-            ## Go Bindings Update
-
-            This PR updates the prebuilt FFI libraries for the Go bindings to:
-            v${{ needs.validate.outputs.version }}
-
-            Merge this PR before tagging so the release tags include
-            the prebuilt libs and `go get` works for external consumers.
-
-            ### Platforms Updated
-            - linux-amd64 (glibc)
-            - linux-arm64 (glibc)
-            - darwin-amd64
-            - darwin-arm64
-            - windows-amd64
-
-            ### Testing
-            After merging:
-            ```bash
-            cd bindings/go/seclusor
-            go test -v ./...
-            ```
-
-            ### Release Follow-up
-            Push both release tags from the merge commit:
-            ```bash
-            VERSION=$(cat VERSION)
-            git tag -a "v${VERSION}" -m "v${VERSION}"
-            git tag -a "bindings/go/seclusor/v${VERSION}" -m "bindings/go/seclusor/v${VERSION}"
-            ```
-
-            ---
-            Auto-generated by Go bindings prep workflow for v${{ needs.validate.outputs.version }}
-          commit-message: "feat(bindings): update Go prebuilt libs for v${{ needs.validate.outputs.version }}"
-          delete-branch: true
+          name: go-bindings-v${{ needs.validate.outputs.version }}
+          path: dist/go-bindings/*
+          if-no-files-found: error
+          retention-days: 30
