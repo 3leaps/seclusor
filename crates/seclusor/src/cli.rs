@@ -620,8 +620,17 @@ pub(crate) enum BlobSubcommand {
 pub(crate) struct BlobEncryptArgs {
     #[arg(long, help = "Path to input file (any format)")]
     pub(crate) input: PathBuf,
-    #[arg(long, help = "Path for encrypted .age output")]
+    #[arg(
+        long,
+        help = "Path for encrypted .age output (must not exist unless --force; 0600 on Unix)"
+    )]
     pub(crate) output: PathBuf,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Overwrite an existing output file atomically"
+    )]
+    pub(crate) force: bool,
     #[arg(long, default_value_t = false, help = "Allow files larger than 10 MB")]
     pub(crate) allow_large: bool,
     #[command(flatten)]

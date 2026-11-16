@@ -19,8 +19,10 @@ seclusor secrets blob encrypt \
   --recipient age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p
 ```
 
-The `.age` output is opaque ciphertext. The original file format, name, and
-contents are not visible.
+The `.age` output is opaque ciphertext written atomically (`0600` permissions on
+Unix). The original file format, name, and contents are not visible. If the
+output path already exists, `blob encrypt` refuses to overwrite it unless
+`--force` is supplied.
 
 ## 2. Transfer or store
 

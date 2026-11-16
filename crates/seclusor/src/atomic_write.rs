@@ -24,6 +24,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
 
+use zeroize::Zeroizing;
+
 use crate::error::{CliError, CliResult};
 
 /// Options for an atomic ciphertext replace of `path` with `content`.
@@ -37,6 +39,15 @@ pub(crate) struct AtomicWriteOptions {
     pub expected_prior_bytes: Option<Vec<u8>>,
     /// When true, refuse if `path` already exists (no-clobber commit).
     pub create_new: bool,
+}
+
+/// Snapshot of an existing output target captured before a `--force` or
+/// in-place private ciphertext replace.
+#[derive(Debug, Clone)]
+pub(crate) struct PrivateCiphertextPriorSnapshot {
+    pub bytes: Zeroizing<Vec<u8>>,
+    #[cfg(unix)]
+    pub identity: (u64, u64, u32),
 }
 
 /// Test-only fault injection points for durability seams.
@@ -84,7 +95,32 @@ pub(crate) fn atomic_write_ciphertext(
     content: &[u8],
     options: AtomicWriteOptions,
 ) -> CliResult<()> {
-    atomic_write_with_permissions(path, content, options, PermissionPolicy::Ciphertext)
+    atomic_write_with_permissions(path, content, options, None, PermissionPolicy::Ciphertext)
+}
+
+/// Atomically write **private ciphertext** `content` to `path`, tightening
+/// any existing group/other permission bits on rewrite and clearing inherited
+/// or existing extended ACLs on the temporary file before writing.
+///
+/// If an existing target had group or other permissions set (`mode & 0o077 != 0`),
+/// its mode is tightened to `mode & !0o077` (preserving stricter owner-only
+/// modes such as `0400`) and a notice is emitted on `stderr` after the commit
+/// succeeds.
+pub(crate) fn atomic_write_private_ciphertext(
+    path: &Path,
+    content: &[u8],
+    prior: Option<PrivateCiphertextPriorSnapshot>,
+) -> CliResult<()> {
+    atomic_write_with_permissions(
+        path,
+        content,
+        AtomicWriteOptions {
+            expected_prior_bytes: None,
+            create_new: prior.is_none(),
+        },
+        prior,
+        PermissionPolicy::CiphertextTightenPrivate,
+    )
 }
 
 /// Atomically write integrity-sensitive **public** data.
@@ -97,12 +133,13 @@ pub(crate) fn atomic_write_public_data(
     content: &[u8],
     options: AtomicWriteOptions,
 ) -> CliResult<()> {
-    atomic_write_with_permissions(path, content, options, PermissionPolicy::PublicData)
+    atomic_write_with_permissions(path, content, options, None, PermissionPolicy::PublicData)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PermissionPolicy {
     Ciphertext,
+    CiphertextTightenPrivate,
     PublicData,
 }
 
@@ -110,6 +147,7 @@ fn atomic_write_with_permissions(
     path: &Path,
     content: &[u8],
     options: AtomicWriteOptions,
+    prior_snapshot: Option<PrivateCiphertextPriorSnapshot>,
     permission_policy: PermissionPolicy,
 ) -> CliResult<()> {
     let parent = path
@@ -117,7 +155,11 @@ fn atomic_write_with_permissions(
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
 
-    if options.create_new && path.exists() {
+    if permission_policy == PermissionPolicy::CiphertextTightenPrivate {
+        seclusor_crypto::acl::reject_writable_directory_acl(parent).map_err(CliError::Io)?;
+    }
+
+    if options.create_new && fs::symlink_metadata(path).is_ok() {
         return Err(CliError::Message(format!(
             "refusing to create {}: path already exists",
             path.display()
@@ -133,16 +175,20 @@ fn atomic_write_with_permissions(
     {
         use std::os::unix::fs::PermissionsExt;
         let fresh_mode = match permission_policy {
-            PermissionPolicy::Ciphertext => 0o600,
+            PermissionPolicy::Ciphertext | PermissionPolicy::CiphertextTightenPrivate => 0o600,
             PermissionPolicy::PublicData => 0o644,
         };
         builder.permissions(fs::Permissions::from_mode(fresh_mode));
     }
-    #[cfg(not(unix))]
-    let _ = permission_policy;
     let mut temp = builder.tempfile_in(parent).map_err(CliError::Io)?;
 
-    preserve_existing_permissions(path, temp.as_file())?;
+    let tightened_mode = apply_target_permissions(
+        path,
+        temp.as_file(),
+        temp.path(),
+        prior_snapshot.as_ref(),
+        permission_policy,
+    )?;
 
     #[cfg(test)]
     if take_fault() == Some(AtomicFault::BeforeWrite) {
@@ -165,8 +211,15 @@ fn atomic_write_with_permissions(
         return Err(CliError::Message("fault: after sync before replace".into()));
     }
 
-    // CAS: fresh open + bounded full-content compare (not a retained fd).
-    if let Some(expected) = options.expected_prior_bytes.as_ref() {
+    // CAS: fresh open + bounded full-content compare, holding an advisory
+    // exclusive lock on the target descriptor across `commit_replace` on Unix
+    // and an exclusive sibling lockfile across check-and-replace on Windows
+    // so cooperating writers serialize across the check-and-replace window.
+    let expected_slice = prior_snapshot
+        .as_ref()
+        .map(|s| s.bytes.as_slice())
+        .or(options.expected_prior_bytes.as_deref());
+    let _cas_guard = if let Some(expected) = expected_slice {
         #[cfg(test)]
         if take_fault() == Some(AtomicFault::ForceCasMismatch) {
             return Err(CliError::ConcurrentModification {
@@ -174,19 +227,39 @@ fn atomic_write_with_permissions(
             });
         }
 
-        if !path_matches_expected(path, expected)? {
-            return Err(CliError::ConcurrentModification {
-                path: path.display().to_string(),
-            });
+        match verify_and_lock_expected_target(
+            path,
+            expected,
+            #[cfg(unix)]
+            prior_snapshot.as_ref().map(|s| s.identity),
+        )? {
+            Some(guard) => Some(guard),
+            None => {
+                return Err(CliError::ConcurrentModification {
+                    path: path.display().to_string(),
+                });
+            }
         }
-    }
+    } else {
+        None
+    };
 
     #[cfg(test)]
     if take_fault() == Some(AtomicFault::ReplaceFail) {
         return Err(CliError::Message("fault: replace fail".into()));
     }
 
-    commit_replace(temp, path, options.create_new)?;
+    commit_replace(temp, path, options.create_new, expected_slice.is_some())?;
+    drop(_cas_guard);
+
+    if let Some((old_mode, new_mode)) = tightened_mode {
+        eprintln!(
+            "warning: tightened permissions on {} from {:04o} to {:04o}",
+            path.display(),
+            old_mode,
+            new_mode
+        );
+    }
 
     #[cfg(unix)]
     {
@@ -202,36 +275,358 @@ fn atomic_write_with_permissions(
     Ok(())
 }
 
-fn preserve_existing_permissions(target: &Path, temp: &File) -> CliResult<()> {
+fn apply_target_permissions(
+    target: &Path,
+    temp: &File,
+    temp_path: &Path,
+    prior_snapshot: Option<&PrivateCiphertextPriorSnapshot>,
+    permission_policy: PermissionPolicy,
+) -> CliResult<Option<(u32, u32)>> {
+    #[cfg(unix)]
+    let mut tightened = None;
+    #[cfg(not(unix))]
+    let tightened = None;
     #[cfg(unix)]
     {
-        if target.exists() {
-            let meta = fs::metadata(target).map_err(CliError::Io)?;
-            temp.set_permissions(meta.permissions())
-                .map_err(CliError::Io)?;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        match permission_policy {
+            PermissionPolicy::CiphertextTightenPrivate => {
+                if let Some(snapshot) = prior_snapshot {
+                    let meta = match fs::symlink_metadata(target) {
+                        Ok(m) => m,
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                            return Err(CliError::ConcurrentModification {
+                                path: target.display().to_string(),
+                            });
+                        }
+                        Err(err) => return Err(CliError::Io(err)),
+                    };
+                    if meta.file_type().is_symlink() {
+                        return Err(CliError::Message(format!(
+                            "refusing to overwrite symlink output path {}",
+                            target.display()
+                        )));
+                    }
+                    if !meta.is_file() {
+                        return Err(CliError::Message(format!(
+                            "output path {} must be a regular file",
+                            target.display()
+                        )));
+                    }
+                    let (expected_dev, expected_ino, old_mode) = snapshot.identity;
+                    if meta.dev() != expected_dev
+                        || meta.ino() != expected_ino
+                        || (meta.permissions().mode() & 0o777) != old_mode
+                    {
+                        return Err(CliError::ConcurrentModification {
+                            path: target.display().to_string(),
+                        });
+                    }
+                    if old_mode & 0o077 != 0 {
+                        let new_mode = old_mode & !0o077;
+                        temp.set_permissions(fs::Permissions::from_mode(new_mode))
+                            .map_err(CliError::Io)?;
+                        tightened = Some((old_mode, new_mode));
+                    } else {
+                        temp.set_permissions(fs::Permissions::from_mode(old_mode))
+                            .map_err(CliError::Io)?;
+                    }
+                }
+            }
+            PermissionPolicy::Ciphertext | PermissionPolicy::PublicData => {
+                match fs::symlink_metadata(target) {
+                    Ok(meta) => {
+                        if meta.file_type().is_symlink() {
+                            let target_meta = fs::metadata(target).map_err(CliError::Io)?;
+                            temp.set_permissions(target_meta.permissions())
+                                .map_err(CliError::Io)?;
+                        } else {
+                            temp.set_permissions(meta.permissions())
+                                .map_err(CliError::Io)?;
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(CliError::Io(err)),
+                }
+            }
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = (target, temp);
+        if permission_policy == PermissionPolicy::CiphertextTightenPrivate
+            && prior_snapshot.is_some()
+        {
+            match fs::symlink_metadata(target) {
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() {
+                        return Err(CliError::Message(format!(
+                            "refusing to overwrite symlink output path {}",
+                            target.display()
+                        )));
+                    }
+                    if !meta.is_file() {
+                        return Err(CliError::Message(format!(
+                            "output path {} must be a regular file",
+                            target.display()
+                        )));
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(CliError::ConcurrentModification {
+                        path: target.display().to_string(),
+                    });
+                }
+                Err(err) => return Err(CliError::Io(err)),
+            }
+        }
         // Windows: fresh-file ACL inherits parent directory defaults (documented
         // residual). ReplaceFileW preserves target DACL on rewrite.
     }
-    Ok(())
+
+    if permission_policy == PermissionPolicy::CiphertextTightenPrivate {
+        seclusor_crypto::acl::prepare_private_file(temp, temp_path).map_err(CliError::Io)?;
+    }
+
+    Ok(tightened)
+}
+
+struct LockedTargetGuard {
+    file: File,
+}
+
+#[cfg(unix)]
+impl Drop for LockedTargetGuard {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `file` is an open file descriptor owned by `self`.
+        unsafe {
+            let _ = libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for LockedTargetGuard {
+    fn drop(&mut self) {
+        use std::os::windows::io::AsRawHandle;
+
+        #[repr(C)]
+        struct Overlapped {
+            internal: usize,
+            internal_high: usize,
+            offset: u32,
+            offset_high: u32,
+            event: *mut core::ffi::c_void,
+        }
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn UnlockFileEx(
+                hFile: *mut core::ffi::c_void,
+                dwReserved: u32,
+                nNumberOfBytesToUnlockLow: u32,
+                nNumberOfBytesToUnlockHigh: u32,
+                lpOverlapped: *mut Overlapped,
+            ) -> i32;
+        }
+
+        let mut overlapped = Overlapped {
+            internal: 0,
+            internal_high: 0,
+            offset: u32::MAX,
+            offset_high: u32::MAX,
+            event: core::ptr::null_mut(),
+        };
+        // SAFETY: `self.file` is an open file handle owned by `self` and
+        // `overlapped` is valid for the duration of the `UnlockFileEx` call.
+        unsafe {
+            let _ = UnlockFileEx(self.file.as_raw_handle(), 0, 1, 0, &mut overlapped);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn lock_windows_target_handle(file: &File) -> CliResult<bool> {
+    use std::os::windows::io::AsRawHandle;
+
+    #[repr(C)]
+    struct Overlapped {
+        internal: usize,
+        internal_high: usize,
+        offset: u32,
+        offset_high: u32,
+        event: *mut core::ffi::c_void,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LockFileEx(
+            hFile: *mut core::ffi::c_void,
+            dwFlags: u32,
+            dwReserved: u32,
+            nNumberOfBytesToLockLow: u32,
+            nNumberOfBytesToLockHigh: u32,
+            lpOverlapped: *mut Overlapped,
+        ) -> i32;
+    }
+
+    const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x0000_0001;
+    const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+
+    // Lock the sentinel byte at offset u64::MAX so reads of [0, expected.len()]
+    // on the same handle succeed while competing writers on any alias of the
+    // same underlying file fail immediately.
+    let mut overlapped = Overlapped {
+        internal: 0,
+        internal_high: 0,
+        offset: u32::MAX,
+        offset_high: u32::MAX,
+        event: core::ptr::null_mut(),
+    };
+    // SAFETY: `file` is a valid open file handle and `overlapped` lives for the call.
+    let ok = unsafe {
+        LockFileEx(
+            file.as_raw_handle(),
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            &mut overlapped,
+        )
+    };
+    if ok != 0 {
+        return Ok(true);
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(ERROR_LOCK_VIOLATION)
+        || err.kind() == std::io::ErrorKind::WouldBlock
+    {
+        return Ok(false);
+    }
+    Err(CliError::Io(err))
 }
 
 /// Fresh open + bounded compare: read at most `expected.len() + 1` bytes.
 ///
 /// Missing path always fails (including when `expected` is empty — an empty
-/// file was loaded and must still exist).
-fn path_matches_expected(path: &Path, expected: &[u8]) -> CliResult<bool> {
-    let mut file = match OpenOptions::new().read(true).open(path) {
-        Ok(f) => f,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+/// file was loaded and must still exist). Acquires a non-blocking exclusive
+/// lock on the opened target handle (`flock` on Unix; `LockFileEx` on Windows
+/// opened with `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`) and
+/// holds it across `commit_replace` so cooperating writers serialize across the
+/// check-and-replace window without creating sidecar files.
+fn verify_and_lock_expected_target(
+    path: &Path,
+    expected: &[u8],
+    #[cfg(unix)] expected_prior_identity: Option<(u64, u64, u32)>,
+) -> CliResult<Option<LockedTargetGuard>> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(CliError::Io(err)),
     };
+    if !meta.is_file() {
+        return Ok(None);
+    }
 
-    let mut buf = vec![0u8; expected.len().saturating_add(1)];
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_ALL: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options
+            .share_mode(FILE_SHARE_ALL)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = match options.open(path) {
+        Ok(f) => f,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        #[cfg(unix)]
+        Err(err) if err.raw_os_error() == Some(libc::ELOOP) => return Ok(None),
+        Err(err) => return Err(CliError::Io(err)),
+    };
+    let open_meta = file.metadata().map_err(CliError::Io)?;
+    if !open_meta.is_file() || open_meta.file_type().is_symlink() {
+        return Ok(None);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: `file` is a valid open regular-file descriptor.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock
+                || err.raw_os_error() == Some(libc::EWOULDBLOCK)
+            {
+                return Ok(None);
+            }
+            return Err(CliError::Io(err));
+        }
+        // Re-stat path after acquiring the lock so an unlink/replace that raced
+        // before flock acquisition is detected before byte comparison.
+        let locked_path_meta = match fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(CliError::Io(err)),
+        };
+        if !locked_path_meta.is_file()
+            || open_meta.dev() != meta.dev()
+            || open_meta.ino() != meta.ino()
+            || locked_path_meta.dev() != open_meta.dev()
+            || locked_path_meta.ino() != open_meta.ino()
+        {
+            return Ok(None);
+        }
+    }
+    #[cfg(windows)]
+    {
+        if !lock_windows_target_handle(&file)? {
+            return Ok(None);
+        }
+        // Re-check that `path` still resolves to the same underlying file after
+        // acquiring `LockFileEx` so a replace/delete race before lock
+        // acquisition is caught before byte comparison.
+        let locked_path_meta = match fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(CliError::Io(err)),
+        };
+        if !locked_path_meta.is_file() || locked_path_meta.file_type().is_symlink() {
+            return Ok(None);
+        }
+        let Ok(same) = same_file::Handle::from_path(path).and_then(|path_handle| {
+            let locked_ref = file.try_clone()?;
+            let locked_handle = same_file::Handle::from_file(locked_ref)?;
+            Ok(path_handle == locked_handle)
+        }) else {
+            return Ok(None);
+        };
+        if !same {
+            return Ok(None);
+        }
+    }
+    #[cfg(unix)]
+    if let Some((expected_dev, expected_ino, expected_mode)) = expected_prior_identity {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let refreshed_meta = file.metadata().map_err(CliError::Io)?;
+        if refreshed_meta.dev() != expected_dev
+            || refreshed_meta.ino() != expected_ino
+            || (refreshed_meta.permissions().mode() & 0o777) != expected_mode
+        {
+            return Ok(None);
+        }
+    }
+
+    let mut buf = Zeroizing::new(vec![0u8; expected.len().saturating_add(1)]);
     let mut total = 0usize;
     while total < buf.len() {
         match file.read(&mut buf[total..]) {
@@ -241,16 +636,27 @@ fn path_matches_expected(path: &Path, expected: &[u8]) -> CliResult<bool> {
         }
     }
 
-    if total != expected.len() {
-        return Ok(false);
+    if total != expected.len() || &buf[..total] != expected {
+        return Ok(None);
     }
-    Ok(&buf[..total] == expected)
+    Ok(Some(LockedTargetGuard { file }))
 }
 
-fn commit_replace(temp: tempfile::NamedTempFile, path: &Path, create_new: bool) -> CliResult<()> {
+fn commit_replace(
+    temp: tempfile::NamedTempFile,
+    path: &Path,
+    create_new: bool,
+    has_expected_prior: bool,
+) -> CliResult<()> {
+    #[cfg(not(windows))]
+    let _ = has_expected_prior;
+
     #[cfg(windows)]
     {
-        if path.exists() {
+        if has_expected_prior {
+            return windows_replace_file(temp, path);
+        }
+        if fs::symlink_metadata(path).is_ok() {
             if create_new {
                 return Err(CliError::Message(format!(
                     "refusing to create {}: path already exists",
@@ -281,7 +687,14 @@ fn windows_replace_file(temp: tempfile::NamedTempFile, path: &Path) -> CliResult
     let result = replace_file_w(&source, path);
     // Always try to clean the source temp; ignore cleanup errors.
     let _ = fs::remove_file(&source);
-    result
+    match result {
+        Err(CliError::Io(ref err)) if err.kind() == std::io::ErrorKind::NotFound => {
+            Err(CliError::ConcurrentModification {
+                path: path.display().to_string(),
+            })
+        }
+        other => other,
+    }
 }
 
 #[cfg(windows)]
@@ -725,6 +1138,167 @@ mod tests {
         assert_eq!(mode, 0o600);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn private_ciphertext_rewrite_tightens_group_and_other_bits_and_preserves_stricter_mode() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        inject_fault(None);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("blob.age");
+        fs::write(&path, b"v1").expect("seed");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("set 0644");
+        let meta1 = fs::metadata(&path).expect("meta1");
+
+        atomic_write_private_ciphertext(
+            &path,
+            b"v2",
+            Some(PrivateCiphertextPriorSnapshot {
+                bytes: Zeroizing::new(b"v1".to_vec()),
+                identity: (meta1.dev(), meta1.ino(), meta1.permissions().mode() & 0o777),
+            }),
+        )
+        .expect("tighten 0644 -> 0600");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).expect("set 0400");
+        let meta2 = fs::metadata(&path).expect("meta2");
+        atomic_write_private_ciphertext(
+            &path,
+            b"v3",
+            Some(PrivateCiphertextPriorSnapshot {
+                bytes: Zeroizing::new(b"v2".to_vec()),
+                identity: (meta2.dev(), meta2.ino(), meta2.permissions().mode() & 0o777),
+            }),
+        )
+        .expect("preserve 0400");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+
+        // If the target mode or inode changes between snapshot and permission
+        // selection (or if the target vanishes after a snapshot was taken),
+        // atomic_write_private_ciphertext must fail closed with ConcurrentModification.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("change mode");
+        let err_mode = atomic_write_private_ciphertext(
+            &path,
+            b"v4",
+            Some(PrivateCiphertextPriorSnapshot {
+                bytes: Zeroizing::new(b"v3".to_vec()),
+                identity: (meta2.dev(), meta2.ino(), 0o400),
+            }),
+        )
+        .expect_err("snapshot mode mismatch must fail closed");
+        assert!(matches!(err_mode, CliError::ConcurrentModification { .. }));
+        assert_eq!(fs::read(&path).unwrap(), b"v3");
+
+        fs::remove_file(&path).expect("remove target");
+        let err_missing = atomic_write_private_ciphertext(
+            &path,
+            b"v4",
+            Some(PrivateCiphertextPriorSnapshot {
+                bytes: Zeroizing::new(b"v3".to_vec()),
+                identity: (meta2.dev(), meta2.ino(), 0o644),
+            }),
+        )
+        .expect_err("vanished target after snapshot must fail closed");
+        assert!(matches!(
+            err_missing,
+            CliError::ConcurrentModification { .. }
+        ));
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cas_refuses_when_competing_writer_holds_exclusive_flock() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        inject_fault(None);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("blob.age");
+        fs::write(&path, b"v1").expect("seed");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("mode");
+        let meta = fs::metadata(&path).expect("meta");
+
+        let lock_file = fs::File::open(&path).expect("open for lock");
+        // SAFETY: `lock_file` is a valid open file descriptor.
+        let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(rc, 0, "test must acquire exclusive flock");
+
+        let err = atomic_write_private_ciphertext(
+            &path,
+            b"v2",
+            Some(PrivateCiphertextPriorSnapshot {
+                bytes: Zeroizing::new(b"v1".to_vec()),
+                identity: (meta.dev(), meta.ino(), meta.permissions().mode() & 0o777),
+            }),
+        )
+        .expect_err("competing exclusive flock must fail closed as ConcurrentModification");
+        assert!(matches!(err, CliError::ConcurrentModification { .. }));
+        assert_eq!(fs::read(&path).expect("unchanged"), b"v1");
+
+        drop(lock_file);
+
+        atomic_write_private_ciphertext(
+            &path,
+            b"v2",
+            Some(PrivateCiphertextPriorSnapshot {
+                bytes: Zeroizing::new(b"v1".to_vec()),
+                identity: (meta.dev(), meta.ino(), meta.permissions().mode() & 0o777),
+            }),
+        )
+        .expect("write succeeds after competing flock is released");
+        assert_eq!(fs::read(&path).expect("updated"), b"v2");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn private_ciphertext_clears_inherited_acl_and_refuses_writable_dir_acl() {
+        use std::process::Command;
+
+        fn chmod_add_acl(path: &Path, entry: &str) {
+            let status = Command::new("/bin/chmod")
+                .arg("+a")
+                .arg(entry)
+                .arg(path)
+                .status()
+                .expect("run /bin/chmod +a");
+            assert!(
+                status.success(),
+                "/bin/chmod +a failed on {}",
+                path.display()
+            );
+        }
+
+        inject_fault(None);
+        let dir = tempfile::tempdir().expect("tempdir");
+        chmod_add_acl(dir.path(), "user:root allow read,file_inherit");
+
+        let path = dir.path().join("blob.age");
+        atomic_write_private_ciphertext(&path, b"age-encryption.org/v1\n", None)
+            .expect("create private ciphertext");
+        assert!(
+            !seclusor_crypto::acl::has_non_owner_file_acl(&path).expect("check ACL"),
+            "inherited ACL must be cleared on private ciphertext"
+        );
+
+        let writable_dir = tempfile::tempdir().expect("writable dir");
+        chmod_add_acl(writable_dir.path(), "user:root allow delete_child");
+        let bad_path = writable_dir.path().join("bad.age");
+        let err = atomic_write_private_ciphertext(&bad_path, b"age-encryption.org/v1\n", None)
+            .expect_err("writable dir ACL must be refused");
+        assert!(matches!(
+            err,
+            CliError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+        assert!(!bad_path.exists());
+    }
+
     fn assert_no_sentinel_in_dir(dir: &Path) {
         for entry in fs::read_dir(dir).unwrap().flatten() {
             let data = fs::read(entry.path()).unwrap_or_default();
@@ -878,6 +1452,49 @@ mod tests {
             fs::write(dir.path().join(".seclusor-orphan"), b"ct").expect("orphan");
             diagnose_orphan_temps(dir.path());
             assert!(dir.path().join(".seclusor-orphan").exists());
+        }
+
+        #[test]
+        fn cas_refuses_when_competing_writer_holds_windows_cas_lock() {
+            use std::os::windows::fs::OpenOptionsExt;
+
+            inject_fault(None);
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("blob.age");
+            fs::write(&path, b"v1").expect("seed");
+
+            let mut opts = OpenOptions::new();
+            opts.read(true)
+                .share_mode(0x0000_0001 | 0x0000_0002 | 0x0000_0004);
+            let locked_file = opts.open(&path).expect("open target");
+            assert!(
+                lock_windows_target_handle(&locked_file).expect("lock target"),
+                "test must acquire exclusive byte-range lock on target"
+            );
+            let _guard = LockedTargetGuard { file: locked_file };
+
+            let err = atomic_write_private_ciphertext(
+                &path,
+                b"v2",
+                Some(PrivateCiphertextPriorSnapshot {
+                    bytes: Zeroizing::new(b"v1".to_vec()),
+                }),
+            )
+            .expect_err("competing Windows target lock must fail closed as ConcurrentModification");
+            assert!(matches!(err, CliError::ConcurrentModification { .. }));
+            assert_eq!(fs::read(&path).expect("unchanged"), b"v1");
+
+            drop(_guard);
+
+            atomic_write_private_ciphertext(
+                &path,
+                b"v2",
+                Some(PrivateCiphertextPriorSnapshot {
+                    bytes: Zeroizing::new(b"v1".to_vec()),
+                }),
+            )
+            .expect("write succeeds after competing Windows target lock is released");
+            assert_eq!(fs::read(&path).expect("updated"), b"v2");
         }
     }
 }

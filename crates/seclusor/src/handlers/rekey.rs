@@ -518,14 +518,28 @@ fn classify_rekey_output(input: &Path, explicit_output: Option<&Path>) -> CliRes
     Ok(false)
 }
 
-fn paths_alias(a: &Path, b: &Path) -> CliResult<bool> {
+pub(crate) fn paths_alias(a: &Path, b: &Path) -> CliResult<bool> {
     if a == b {
         return Ok(true);
     }
-    match same_file::is_same_file(a, b) {
-        Ok(is_same) => return Ok(is_same),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(CliError::Io(error)),
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (fs::metadata(a), fs::metadata(b)) {
+            (Ok(meta_a), Ok(meta_b)) => {
+                return Ok(meta_a.dev() == meta_b.dev() && meta_a.ino() == meta_b.ino());
+            }
+            (Err(err), _) | (_, Err(err)) if err.kind() == std::io::ErrorKind::NotFound => {}
+            (Err(err), _) | (_, Err(err)) => return Err(CliError::Io(err)),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match same_file::is_same_file(a, b) {
+            Ok(is_same) => return Ok(is_same),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(CliError::Io(error)),
+        }
     }
 
     Ok(normalize_path_for_comparison(a)? == normalize_path_for_comparison(b)?)

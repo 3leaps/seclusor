@@ -8,6 +8,15 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+### Changed
+
+- `secrets blob encrypt` now writes output atomically (`0600` on Unix with macOS
+  extended-ACL clearing) and refuses to overwrite an existing `--output` path
+  unless `--force` is supplied. When overwriting an existing file with
+  `--force`, group and other permission bits are tightened to owner-only with a
+  `stderr` notice while stricter owner-only modes are preserved, and path
+  aliasing against `--input` or `--recipient-file` is rejected.
+
 ## [0.2.3] - 2026-11-14
 
 Hardening and release-provenance update: encrypted pack-sealing guards,
