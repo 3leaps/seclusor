@@ -21,7 +21,9 @@ rpassword = "7"
 same-file = "1"
 tempfile = "3"
 secrecy = "0.10"
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+sha2 = { workspace = true, features = ["zeroize"] }
 subtle = { workspace = true }
 thiserror = { workspace = true }
 zeroize = { workspace = true }

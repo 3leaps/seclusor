@@ -20,6 +20,7 @@ use seclusor_core::constants::{
     INLINE_CIPHERTEXT_PREFIX, MAX_BUNDLE_PLAINTEXT_BYTES, MAX_DECRYPT_PLAINTEXT_BYTES,
     MAX_INLINE_CIPHERTEXT_BYTES, MAX_INLINE_PLAINTEXT_BYTES,
 };
+use zeroize::Zeroizing;
 
 const MAX_IDENTITY_FILE_BYTES: u64 = 1024 * 1024;
 
@@ -168,6 +169,12 @@ pub fn decrypt(ciphertext: &[u8], identities: &[Identity]) -> Result<Vec<u8>> {
     decrypt_with_limit(ciphertext, identities, MAX_DECRYPT_PLAINTEXT_BYTES)
 }
 
+/// Decrypt ciphertext with one or more identities into a preallocated
+/// [`Zeroizing`] buffer without intermediate `Vec` growth reallocations.
+pub fn decrypt_zeroizing(ciphertext: &[u8], identities: &[Identity]) -> Result<Zeroizing<Vec<u8>>> {
+    decrypt_with_limit_zeroizing(ciphertext, identities, MAX_DECRYPT_PLAINTEXT_BYTES)
+}
+
 /// Return true when `ciphertext` is a passphrase (scrypt) age file.
 ///
 /// Accepts both binary age files and ASCII-armored age files. Armored input is
@@ -189,6 +196,15 @@ pub fn is_scrypt_ciphertext(ciphertext: &[u8]) -> Result<bool> {
 /// Scrypt-only files return `0` X25519 stanzas (callers should refuse those
 /// via [`is_scrypt_ciphertext`] before treating count as canonical).
 pub fn count_x25519_recipient_stanzas(ciphertext: &[u8]) -> Result<usize> {
+    Ok(count_recipient_stanzas(ciphertext)?.0)
+}
+
+/// Count `(x25519_stanzas, non_x25519_recipient_stanzas)` in an age ciphertext header.
+///
+/// Accepts binary and ASCII-armored age files. Age v1 random grease stanzas
+/// (`-> <tag>-grease ...`, RFC / C2SP age v1 specification) are ignored by all
+/// compliant recipients and are not counted as recipient stanzas.
+pub fn count_recipient_stanzas(ciphertext: &[u8]) -> Result<(usize, usize)> {
     // Normalize armored → binary stream for a single scan path.
     let mut normalized = Vec::new();
     {
@@ -200,17 +216,24 @@ pub fn count_x25519_recipient_stanzas(ciphertext: &[u8]) -> Result<usize> {
     // Age v1 headers list recipient stanzas as ASCII lines beginning with "-> TAG ".
     // X25519 is the only recipient type seclusor writes for data documents.
     // Scan bytes (payload after --- is binary and not UTF-8).
-    let mut count = 0usize;
+    let mut x25519_count = 0usize;
+    let mut other_count = 0usize;
     for line in normalized.split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.starts_with(b"-> X25519 ") || line == b"-> X25519" {
-            count = count.saturating_add(1);
+            x25519_count = x25519_count.saturating_add(1);
+        } else if let Some(rest) = line.strip_prefix(b"-> ") {
+            let tag = rest.split(|&b| b == b' ').next().unwrap_or(rest);
+            if !tag.ends_with(b"-grease") {
+                other_count = other_count.saturating_add(1);
+            }
         }
         // Header ends at the MAC line; stop so payload bytes cannot inflate count.
         if line.starts_with(b"---") {
             break;
         }
     }
-    Ok(count)
+    Ok((x25519_count, other_count))
 }
 
 /// Count X25519 stanzas in a `sec:age:v1:<base64>` inline ciphertext value.
@@ -254,7 +277,13 @@ pub fn decrypt_with_passphrase(ciphertext: &[u8], passphrase: &str) -> Result<Ve
     let mut reader = decryptor
         .decrypt(std::iter::once(&passphrase_identity as &dyn age::Identity))
         .map_err(|_| CryptoError::DecryptionFailed)?;
-    read_to_vec_with_limit(&mut reader, MAX_DECRYPT_PLAINTEXT_BYTES, "plaintext")
+    let mut out = read_to_vec_with_limit_zeroizing(
+        &mut reader,
+        MAX_DECRYPT_PLAINTEXT_BYTES,
+        ciphertext.len(),
+        "plaintext",
+    )?;
+    Ok(std::mem::take(&mut *out))
 }
 
 /// Encrypt a single inline value into `sec:age:v1:<base64>`.
@@ -308,17 +337,27 @@ fn decrypt_with_limit(
     identities: &[Identity],
     max_plaintext: usize,
 ) -> Result<Vec<u8>> {
+    let mut out = decrypt_with_limit_zeroizing(ciphertext, identities, max_plaintext)?;
+    Ok(std::mem::take(&mut *out))
+}
+
+fn decrypt_with_limit_zeroizing(
+    ciphertext: &[u8],
+    identities: &[Identity],
+    max_plaintext: usize,
+) -> Result<Zeroizing<Vec<u8>>> {
     if identities.is_empty() {
         return Err(CryptoError::MissingIdentities);
     }
 
+    let armored_reader = age::armor::ArmoredReader::new(ciphertext);
     let decryptor =
-        age::Decryptor::new_buffered(ciphertext).map_err(|_| CryptoError::DecryptionFailed)?;
+        age::Decryptor::new_buffered(armored_reader).map_err(|_| CryptoError::DecryptionFailed)?;
     let mut reader = decryptor
         .decrypt(identities.iter().map(|i| i as &dyn age::Identity))
         .map_err(|_| CryptoError::DecryptionFailed)?;
 
-    read_to_vec_with_limit(&mut reader, max_plaintext, "plaintext")
+    read_to_vec_with_limit_zeroizing(&mut reader, max_plaintext, ciphertext.len(), "plaintext")
 }
 
 fn decode_inline_ciphertext(ciphertext: &str) -> Result<Vec<u8>> {
@@ -349,26 +388,44 @@ fn max_base64_encoded_len(max_decoded_len: usize) -> usize {
     max_decoded_len.div_ceil(3) * 4
 }
 
-fn read_to_vec_with_limit<R: Read>(
+fn read_to_vec_with_limit_zeroizing<R: Read>(
     reader: &mut R,
     max: usize,
+    ciphertext_len_hint: usize,
     kind: &'static str,
-) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut buf = [0_u8; 8192];
-    loop {
-        let n = reader.read(&mut buf).map_err(CryptoError::Io)?;
+) -> Result<Zeroizing<Vec<u8>>> {
+    // Age ciphertext is always larger than the plaintext it wraps, so
+    // `ciphertext_len_hint.min(max + 1)` preallocates the exact upper bound in
+    // one allocation, avoiding intermediate `Vec` growth reallocations and
+    // wiping all decrypted bytes if an authentication or size error occurs.
+    let cap = ciphertext_len_hint.min(max.saturating_add(1)).max(1);
+    let mut out = Zeroizing::new(vec![0u8; cap]);
+    let mut total = 0usize;
+    while total < out.len() {
+        let n = reader.read(&mut out[total..]).map_err(CryptoError::Io)?;
         if n == 0 {
-            break;
+            out.truncate(total);
+            return Ok(out);
         }
-        out.extend_from_slice(&buf[..n]);
-        if out.len() > max {
+        total += n;
+        if total > max {
             return Err(CryptoError::SizeLimitExceeded {
                 kind,
-                actual: out.len(),
+                actual: total,
                 max,
             });
         }
+    }
+    out.truncate(total);
+
+    let mut probe = Zeroizing::new([0u8; 1]);
+    let extra = reader.read(&mut probe[..]).map_err(CryptoError::Io)?;
+    if extra > 0 {
+        return Err(CryptoError::SizeLimitExceeded {
+            kind,
+            actual: total.saturating_add(extra),
+            max,
+        });
     }
     Ok(out)
 }

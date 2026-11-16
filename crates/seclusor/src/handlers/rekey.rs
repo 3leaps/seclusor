@@ -338,19 +338,19 @@ fn write_new_ciphertext_file(path: &Path, content: &[u8]) -> CliResult<()> {
 const MAX_PRIOR_RECIPIENT_FILE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug)]
-struct RecipientRefreshPlan {
+pub(crate) struct RecipientRefreshPlan {
     path: PathBuf,
     content: Vec<u8>,
     prior_bytes: Option<Vec<u8>>,
 }
 
 #[derive(Debug)]
-struct RecipientRefreshTarget {
+pub(crate) struct RecipientRefreshTarget {
     path: PathBuf,
     prior_bytes: Option<Vec<u8>>,
 }
 
-fn prepare_recipient_refresh_target(
+pub(crate) fn prepare_recipient_refresh_target(
     path: Option<&Path>,
     input_path: &Path,
     output_path: &Path,
@@ -358,18 +358,44 @@ fn prepare_recipient_refresh_target(
     passphrase_path: Option<&Path>,
     recipient_input_paths: &[PathBuf],
 ) -> CliResult<Option<RecipientRefreshTarget>> {
+    prepare_recipient_refresh_target_with_flag(
+        path,
+        input_path,
+        "--file",
+        output_path,
+        identity_paths,
+        passphrase_path,
+        recipient_input_paths,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_recipient_refresh_target_with_flag(
+    path: Option<&Path>,
+    input_path: &Path,
+    input_flag: &str,
+    output_path: &Path,
+    identity_paths: &[PathBuf],
+    passphrase_path: Option<&Path>,
+    recipient_input_paths: &[PathBuf],
+    prior_recipient_paths: &[PathBuf],
+) -> CliResult<Option<RecipientRefreshTarget>> {
     let Some(path) = path else {
         return Ok(None);
     };
     let path = resolve_recipient_refresh_target(path)?;
 
-    reject_recipient_refresh_alias(&path, input_path, "--file")?;
+    reject_recipient_refresh_alias(&path, input_path, input_flag)?;
     reject_recipient_refresh_alias(&path, output_path, "--output")?;
     for identity_path in identity_paths {
         reject_recipient_refresh_alias(&path, identity_path, "identity source")?;
     }
     if let Some(passphrase_path) = passphrase_path {
         reject_recipient_refresh_alias(&path, passphrase_path, "--passphrase-file")?;
+    }
+    for prior_recipient_path in prior_recipient_paths {
+        reject_recipient_refresh_alias(&path, prior_recipient_path, "--prior-recipient-file")?;
     }
     for recipient_input_path in recipient_input_paths {
         let exact_input_target = resolve_recipient_refresh_target(recipient_input_path)?;
@@ -389,7 +415,7 @@ fn prepare_recipient_refresh_target(
     Ok(Some(RecipientRefreshTarget { path, prior_bytes }))
 }
 
-fn prepare_recipient_refresh(
+pub(crate) fn prepare_recipient_refresh(
     target: Option<RecipientRefreshTarget>,
     recipients: &[String],
 ) -> CliResult<Option<RecipientRefreshPlan>> {
@@ -465,7 +491,7 @@ fn read_optional_recipient_file(path: &Path) -> CliResult<Option<Vec<u8>>> {
     Ok(Some(bytes))
 }
 
-fn commit_recipient_refresh(
+pub(crate) fn commit_recipient_refresh(
     plan: Option<&RecipientRefreshPlan>,
     output_path: &Path,
 ) -> CliResult<()> {
@@ -494,22 +520,31 @@ fn commit_recipient_refresh(
     })
 }
 
-fn emit_recipient_refresh_notice(plan: Option<&RecipientRefreshPlan>) {
+pub(crate) fn emit_recipient_refresh_notice(plan: Option<&RecipientRefreshPlan>) {
     if let Some(plan) = plan {
         eprintln!("wrote recipient set to {}", plan.path.display());
     }
 }
 
 fn classify_rekey_output(input: &Path, explicit_output: Option<&Path>) -> CliResult<bool> {
+    classify_rekey_output_with_flag(input, explicit_output, "--file")
+}
+
+pub(crate) fn classify_rekey_output_with_flag(
+    input: &Path,
+    explicit_output: Option<&Path>,
+    input_flag: &str,
+) -> CliResult<bool> {
     let Some(output) = explicit_output else {
         return Ok(true);
     };
-    if normalize_absolute_lexically(input)? == normalize_absolute_lexically(output)? {
+    let same_alias = paths_alias(input, output)?;
+    if same_alias && normalize_absolute_lexically(input)? == normalize_absolute_lexically(output)? {
         return Ok(true);
     }
-    if paths_alias(input, output)? {
+    if same_alias {
         return Err(CliError::Message(format!(
-            "--output path {} aliases --file path {}; use the same path spelling for an \
+            "--output path {} aliases {input_flag} path {}; use the same path spelling for an \
              in-place rekey or choose a separate output",
             output.display(),
             input.display()
