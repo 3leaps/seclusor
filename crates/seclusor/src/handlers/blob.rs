@@ -195,12 +195,20 @@ fn read_existing_output_for_cas(path: &Path) -> CliResult<Option<PrivateCipherte
         )));
     }
 
+    let (pre_id, _) = path_identity_and_nlink_nofollow(path).map_err(CliError::Io)?;
+
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
     let mut file = match options.open(path) {
         Ok(file) => file,
@@ -215,20 +223,17 @@ fn read_existing_output_for_cas(path: &Path) -> CliResult<Option<PrivateCipherte
         Err(err) => return Err(CliError::Io(err)),
     };
     let open_meta = file.metadata().map_err(CliError::Io)?;
-    if !open_meta.is_file() {
+    if !open_meta.is_file() || is_symlink_or_reparse_point(&open_meta) {
         return Err(CliError::Message(format!(
             "output path {} must be a regular file",
             path.display()
         )));
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if open_meta.dev() != meta.dev() || open_meta.ino() != meta.ino() {
-            return Err(CliError::ConcurrentModification {
-                path: path.display().to_string(),
-            });
-        }
+    let (open_id, _) = file_identity_and_nlink(&file).map_err(CliError::Io)?;
+    if open_id != pre_id {
+        return Err(CliError::ConcurrentModification {
+            path: path.display().to_string(),
+        });
     }
 
     let hint_len = open_meta.len();
@@ -264,13 +269,11 @@ fn read_existing_output_for_cas(path: &Path) -> CliResult<Option<PrivateCipherte
         bytes: buf,
         #[cfg(unix)]
         identity: {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
-            (
-                open_meta.dev(),
-                open_meta.ino(),
-                open_meta.permissions().mode() & 0o777,
-            )
+            use std::os::unix::fs::PermissionsExt;
+            (open_id.0, open_id.1, open_meta.permissions().mode() & 0o777)
         },
+        #[cfg(windows)]
+        file_id: open_id,
     }))
 }
 
@@ -516,6 +519,8 @@ fn read_blob_input_for_rekey_with_id(
                     use std::os::unix::fs::PermissionsExt;
                     (open_id.0, open_id.1, open_meta.permissions().mode() & 0o777)
                 },
+                #[cfg(windows)]
+                file_id: open_id,
             },
             open_id,
         ));
@@ -528,6 +533,8 @@ fn read_blob_input_for_rekey_with_id(
             bytes,
             #[cfg(unix)]
             identity: (0, 0, 0),
+            #[cfg(windows)]
+            file_id: (0, 0),
         },
         (0, 0),
     ))
@@ -2561,6 +2568,12 @@ fn collect_dir_candidates(
     }
     let (pre_dir_id, _) = path_identity_and_nlink_nofollow(dir).map_err(CliError::Io)?;
     let canon_dir = fs::canonicalize(dir).map_err(CliError::Io)?;
+    if canon_dir.to_str().is_none() {
+        return Err(CliError::Message(format!(
+            "refusing non-UTF-8 --dir path {}; batch paths must be valid UTF-8",
+            canon_dir.display()
+        )));
+    }
     reject_symlink_traversal_in_user_path(&canon_dir, "--dir")?;
     let (canon_dir_id, _) = path_identity_and_nlink_nofollow(&canon_dir).map_err(CliError::Io)?;
     if canon_dir_id != pre_dir_id {
@@ -2577,8 +2590,13 @@ fn collect_dir_candidates(
 
     for entry in entries {
         let file_name = entry.file_name();
-        let name_str = file_name.to_string_lossy();
-        if is_skipped_dir_entry_name(&name_str) {
+        let Some(name_str) = file_name.to_str() else {
+            return Err(CliError::Message(format!(
+                "refusing non-UTF-8 directory entry {}; batch paths must be valid UTF-8",
+                entry.path().display()
+            )));
+        };
+        if is_skipped_dir_entry_name(name_str) {
             continue;
         }
         let path = entry.path();
@@ -2593,7 +2611,7 @@ fn collect_dir_candidates(
             }
             continue;
         }
-        if file_type.is_file() && filename_glob_matches(glob_pattern, &name_str) {
+        if file_type.is_file() && filename_glob_matches(glob_pattern, name_str) {
             out.push(path);
         }
     }
@@ -2619,6 +2637,12 @@ fn collect_batch_files(args: &BlobRekeyBatchArgs) -> CliResult<Vec<SelectedBatch
 
     let mut raw_candidates: Vec<PathBuf> = Vec::new();
     for file in &args.files {
+        if file.to_str().is_none() {
+            return Err(CliError::Message(format!(
+                "refusing non-UTF-8 input path {}; batch paths must be valid UTF-8",
+                file.display()
+            )));
+        }
         reject_symlink_traversal_in_user_path(file, "input")?;
         let meta = fs::symlink_metadata(file).map_err(|err| {
             CliError::Message(format!(
@@ -2642,12 +2666,24 @@ fn collect_batch_files(args: &BlobRekeyBatchArgs) -> CliResult<Vec<SelectedBatch
     }
 
     if let Some(dir) = &args.dir {
+        if dir.to_str().is_none() {
+            return Err(CliError::Message(format!(
+                "refusing non-UTF-8 --dir path {}; batch paths must be valid UTF-8",
+                dir.display()
+            )));
+        }
         reject_symlink_traversal_in_user_path(dir, "--dir")?;
         collect_dir_candidates(dir, &args.glob, args.recursive, &mut raw_candidates)?;
     }
 
     let mut selected_files: Vec<SelectedBatchFile> = Vec::with_capacity(raw_candidates.len());
     for candidate in raw_candidates {
+        if candidate.to_str().is_none() {
+            return Err(CliError::Message(format!(
+                "refusing non-UTF-8 input path {}; batch paths must be valid UTF-8",
+                candidate.display()
+            )));
+        }
         reject_symlink_traversal_in_user_path(&candidate, "input")?;
         let pre_meta = fs::symlink_metadata(&candidate).map_err(CliError::Io)?;
         if is_symlink_or_reparse_point(&pre_meta) || !pre_meta.is_file() {
@@ -2666,6 +2702,12 @@ fn collect_batch_files(args: &BlobRekeyBatchArgs) -> CliResult<Vec<SelectedBatch
             )));
         }
         let canon = fs::canonicalize(&candidate).map_err(CliError::Io)?;
+        if canon.to_str().is_none() {
+            return Err(CliError::Message(format!(
+                "refusing non-UTF-8 canonical input path {}; batch paths must be valid UTF-8",
+                canon.display()
+            )));
+        }
         reject_symlink_traversal_in_user_path(&canon, "input")?;
         let post_meta = fs::symlink_metadata(&candidate).map_err(CliError::Io)?;
         let canon_meta = fs::symlink_metadata(&canon).map_err(CliError::Io)?;
@@ -2814,6 +2856,58 @@ fn validate_windows_owner_and_dacl_sids(
     Ok(())
 }
 
+#[cfg(any(windows, test))]
+const WINDOWS_DANGEROUS_DIR_WRITE_MASK: u32 =
+    0x0002 | 0x0004 | 0x0040 | 0x0001_0000 | 0x0004_0000 | 0x0008_0000 | 0x4000_0000 | 0x1000_0000;
+
+/// Validate a Windows parent directory's ownership and DACL entries.
+///
+/// - The directory owner (`owner_is_trusted`) must be a trusted principal
+///   (current user SID, `SYSTEM`, or `Administrators`); a foreign unprivileged
+///   owner has implicit `WRITE_DAC` and could grant itself directory write
+///   rights after inspection.
+/// - Every ACE in the DACL must be a standard `ACCESS_ALLOWED_ACE_TYPE` (`0x00`);
+///   non-basic ACE types (such as callback or object ACEs) are rejected
+///   fail-closed.
+/// - Any ACE whose access mask overlaps `WINDOWS_DANGEROUS_DIR_WRITE_MASK`
+///   (`FILE_ADD_FILE`, `FILE_ADD_SUBDIRECTORY`, `FILE_DELETE_CHILD`, `DELETE`,
+///   `WRITE_DAC`, `WRITE_OWNER`, `GENERIC_WRITE`, `GENERIC_ALL`) must be bound
+///   to a trusted principal (`sid_is_trusted`).
+#[cfg(any(windows, test))]
+fn validate_windows_directory_owner_and_dacl(
+    owner_is_trusted: bool,
+    control: u16,
+    aces: &[(u8, u32, bool)],
+) -> std::io::Result<()> {
+    if !owner_is_trusted {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "private file directory on Windows is not owned by a trusted principal (current user, SYSTEM, or Administrators)",
+        ));
+    }
+    if (control & WINDOWS_SE_DACL_PRESENT) == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "private file directory on Windows has no DACL (unrestricted access)",
+        ));
+    }
+    for (ace_type, mask, sid_is_trusted) in aces {
+        if *ace_type != WINDOWS_ACCESS_ALLOWED_ACE_TYPE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "private file directory DACL on Windows contains unsupported ACE type; only standard ACCESS_ALLOWED_ACE entries are permitted",
+            ));
+        }
+        if (*mask & WINDOWS_DANGEROUS_DIR_WRITE_MASK) != 0 && !*sid_is_trusted {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "private file directory DACL on Windows grants non-owner write, delete, or ACL-edit access",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 mod windows_dacl {
     use std::fs::{self, File};
@@ -2828,8 +2922,9 @@ mod windows_dacl {
 
     use super::{
         is_symlink_or_reparse_point, validate_windows_ace_header,
-        validate_windows_owner_and_dacl_sids, StateJournalSnapshot, MAX_STATE_JOURNAL_BYTES,
-        WINDOWS_SE_DACL_PRESENT, WINDOWS_SE_DACL_PROTECTED,
+        validate_windows_directory_owner_and_dacl, validate_windows_owner_and_dacl_sids,
+        StateJournalSnapshot, MAX_STATE_JOURNAL_BYTES, WINDOWS_SE_DACL_PRESENT,
+        WINDOWS_SE_DACL_PROTECTED,
     };
 
     #[repr(C)]
@@ -3076,23 +3171,10 @@ mod windows_dacl {
     const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
     const GENERIC_READ: u32 = 0x8000_0000;
     const GENERIC_WRITE: u32 = 0x4000_0000;
-    const GENERIC_ALL: u32 = 0x1000_0000;
-    const DELETE: u32 = 0x0001_0000;
     const READ_CONTROL: u32 = 0x0002_0000;
     const WRITE_DAC: u32 = 0x0004_0000;
     const WRITE_OWNER: u32 = 0x0008_0000;
     const FILE_READ_ATTRIBUTES: u32 = 0x0080;
-    const FILE_ADD_FILE: u32 = 0x0002;
-    const FILE_ADD_SUBDIRECTORY: u32 = 0x0004;
-    const FILE_DELETE_CHILD: u32 = 0x0040;
-    const DANGEROUS_DIR_WRITE_MASK: u32 = FILE_ADD_FILE
-        | FILE_ADD_SUBDIRECTORY
-        | FILE_DELETE_CHILD
-        | DELETE
-        | WRITE_DAC
-        | WRITE_OWNER
-        | GENERIC_WRITE
-        | GENERIC_ALL;
     const FILE_SHARE_READ: u32 = 0x0000_0001;
     const FILE_SHARE_WRITE: u32 = 0x0000_0002;
     const FILE_SHARE_DELETE: u32 = 0x0000_0004;
@@ -3303,9 +3385,17 @@ mod windows_dacl {
                 "private file directory on Windows has no DACL (unrestricted access)",
             ));
         }
+        let owner_is_trusted = !owner_sid.is_null()
+            && unsafe {
+                IsValidSid(owner_sid) != 0
+                    && (EqualSid(owner_sid, user_sid) != 0
+                        || IsWellKnownSid(owner_sid, WIN_LOCAL_SYSTEM_SID) != 0
+                        || IsWellKnownSid(owner_sid, WIN_BUILTIN_ADMINISTRATORS_SID) != 0)
+            };
 
         // SAFETY: `dacl` is non-null and points into `sd`.
         let ace_count = unsafe { (*dacl).ace_count };
+        let mut parsed_aces: Vec<(u8, u32, bool)> = Vec::with_capacity(ace_count as usize);
         for idx in 0..(ace_count as u32) {
             let mut ace_ptr: *mut AceHeader = core::ptr::null_mut();
             // SAFETY: `dacl` is valid and `idx < ace_count`.
@@ -3315,16 +3405,10 @@ mod windows_dacl {
             // SAFETY: `ace_ptr` points to a valid `AceHeader`.
             let ace_type = unsafe { (*ace_ptr).ace_type };
             let ace_size = unsafe { (*ace_ptr).ace_size };
-            if ace_type != super::WINDOWS_ACCESS_ALLOWED_ACE_TYPE {
-                continue;
-            }
             validate_windows_ace_header(ace_type, ace_size, None)?;
             let allowed_ptr = ace_ptr.cast::<AccessAllowedAcePrefix>();
-            // SAFETY: `ace_size >= 12` was validated above.
+            // SAFETY: `ace_size >= 12` and `ace_type == WINDOWS_ACCESS_ALLOWED_ACE_TYPE` were validated above.
             let mask = unsafe { (*allowed_ptr).mask };
-            if (mask & DANGEROUS_DIR_WRITE_MASK) == 0 {
-                continue;
-            }
             let ace_sid = unsafe { core::ptr::addr_of_mut!((*allowed_ptr).sid_start).cast() };
             if unsafe { IsValidSid(ace_sid) } == 0 {
                 return Err(io::Error::new(
@@ -3340,14 +3424,9 @@ mod windows_dacl {
                     || IsWellKnownSid(ace_sid, WIN_BUILTIN_ADMINISTRATORS_SID) != 0
                     || IsWellKnownSid(ace_sid, WIN_CREATOR_OWNER_SID) != 0
             };
-            if !is_trusted {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "private file directory DACL on Windows grants non-owner write, delete, or ACL-edit access",
-                ));
-            }
+            parsed_aces.push((ace_type, mask, is_trusted));
         }
-        Ok(())
+        validate_windows_directory_owner_and_dacl(owner_is_trusted, control, &parsed_aces)
     }
 
     /// Create a brand-new private file atomically bound to a protected
@@ -3827,14 +3906,10 @@ mod windows_dacl {
     }
 }
 
-fn derive_journal_auth_key(
-    identities: &[Identity],
-    verify_identities: &[Identity],
-) -> Zeroizing<[u8; 32]> {
+fn derive_journal_auth_key(target_verify_candidates: &[Identity]) -> Zeroizing<[u8; 32]> {
     use sha2::Digest as _;
-    let mut secret_material: Vec<Zeroizing<String>> = identities
+    let mut secret_material: Vec<Zeroizing<String>> = target_verify_candidates
         .iter()
-        .chain(verify_identities.iter())
         .map(|id| Zeroizing::new(seclusor_crypto::identity_to_string(id)))
         .collect();
     secret_material.sort_by(|a, b| a.as_str().cmp(b.as_str()));
@@ -4085,6 +4160,8 @@ fn read_existing_state_journal_for_cas(
             bytes: buf,
             #[cfg(unix)]
             identity: open_identity,
+            #[cfg(windows)]
+            file_id: open_id,
         },
         file_id: open_id,
     }))
@@ -4412,7 +4489,16 @@ pub(crate) fn handle_blob_rekey_batch_with_policy(
 
     // Self-lockout candidate selection: any loaded or verify identity in target_strings.
     let mut target_verify_candidates: Vec<Identity> = Vec::new();
-    for id in identities.iter().chain(verify_identities.iter()) {
+    let mut retired_source_identities: Vec<Identity> = Vec::new();
+    for id in &identities {
+        let pubkey = id.to_public().to_string();
+        if target_strings.iter().any(|r| r == &pubkey) {
+            target_verify_candidates.push(id.clone());
+        } else {
+            retired_source_identities.push(id.clone());
+        }
+    }
+    for id in &verify_identities {
         let pubkey = id.to_public().to_string();
         if target_strings.iter().any(|r| r == &pubkey) {
             target_verify_candidates.push(id.clone());
@@ -4424,6 +4510,15 @@ pub(crate) fn handle_blob_rekey_batch_with_policy(
              recipient set; refusing blob rekey-batch to prevent self-lockout. Supply \
              --verify-identity-file / --verify-identity-public-key for a target recipient \
              or pass --allow-self-lockout"
+                .to_string(),
+        ));
+    }
+    if args.state.is_some() && target_verify_candidates.is_empty() {
+        return Err(CliError::Message(
+            "--state with --allow-self-lockout requires at least one target-set verification \
+             identity (--verify-identity-file / --verify-identity-public-key or -i matching \
+             a target recipient) so resumed journal state can authenticate and verify target \
+             decryption independently of the source key"
                 .to_string(),
         ));
     }
@@ -4528,6 +4623,7 @@ pub(crate) fn handle_blob_rekey_batch_with_policy(
     }
 
     let recipient_refresh = if let Some(wr_path) = &args.write_recipients {
+        reject_symlink_traversal_in_path(wr_path, "--write-recipients", true)?;
         for selected in &selected_files {
             let blob_path = &selected.path;
             if paths_alias(wr_path, blob_path)? {
@@ -4558,7 +4654,7 @@ pub(crate) fn handle_blob_rekey_batch_with_policy(
         None
     };
 
-    let journal_auth_key = derive_journal_auth_key(&identities, &verify_identities);
+    let journal_auth_key = derive_journal_auth_key(&target_verify_candidates);
     let mut journal_state = if let Some(state_path) = &args.state {
         Some(load_or_init_state_journal(
             state_path,
@@ -4697,18 +4793,35 @@ pub(crate) fn handle_blob_rekey_batch_with_policy(
                                 target_recipients.len()
                             )));
                         }
-                        if !target_verify_candidates.is_empty() {
-                            let verified_pt = seclusor_crypto::decrypt_zeroizing(
-                                &prior_snapshot.bytes,
-                                &target_verify_candidates,
+                        if target_verify_candidates.is_empty() {
+                            return Err(CliError::Message(
+                                "refusing journal-based already-done completion without a target-set verification identity"
+                                    .to_string(),
+                            ));
+                        }
+                        let verified_pt = seclusor_crypto::decrypt_zeroizing(
+                            &prior_snapshot.bytes,
+                            &target_verify_candidates,
+                        )
+                        .map_err(|_| {
+                            CliError::Message(
+                                "on-disk blob matched journal sha256_after but could not be decrypted by any target-set verification identity"
+                                    .to_string(),
                             )
-                            .map_err(|_| {
-                                CliError::Message(
-                                    "on-disk blob matched journal sha256_after but could not be decrypted by any target-set verification identity"
+                        })?;
+                        refuse_if_secrets_bundle_document(&verified_pt)?;
+                        for retired_id in &retired_source_identities {
+                            if seclusor_crypto::decrypt_zeroizing(
+                                &prior_snapshot.bytes,
+                                std::slice::from_ref(retired_id),
+                            )
+                            .is_ok()
+                            {
+                                return Err(CliError::Message(
+                                    "on-disk blob matched journal sha256_after but is still decryptable by a retired source identity"
                                         .to_string(),
-                                )
-                            })?;
-                            refuse_if_secrets_bundle_document(&verified_pt)?;
+                                ));
+                            }
                         }
                         Ok(())
                     })();
@@ -5444,6 +5557,15 @@ pub(crate) fn handle_blob_rekey_batch_with_policy(
     if args.apply {
         if all_selected_rekeyed_or_done {
             if let Some(plan) = recipient_refresh.as_ref() {
+                if let Some(wr_path) = &args.write_recipients {
+                    reject_symlink_traversal_in_path(wr_path, "--write-recipients", true).map_err(
+                        |err| CliError::PostCommitFailure {
+                            path: wr_path.display().to_string(),
+                            step: "write-recipients path validation",
+                            source: Box::new(err),
+                        },
+                    )?;
+                }
                 let batch_label = Path::new("<blob-rekey-batch>");
                 commit_recipient_refresh(Some(plan), batch_label)?;
                 emit_recipient_refresh_notice(Some(plan));
@@ -7651,9 +7773,13 @@ mod tests {
         fs::remove_file(&tricky_hardlink).unwrap();
         fs::remove_file(&tricky_name_path).unwrap();
 
-        // Reject intermediate symlink traversal in absolute FILE and --dir paths.
+        // Reject intermediate symlink traversal in absolute FILE, --dir, and --write-recipients paths,
+        // and reject non-UTF-8 input paths.
         #[cfg(unix)]
         {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
+
             let real_sub = dir.path().join("real-sub");
             fs::create_dir(&real_sub).unwrap();
             let sub_blob = real_sub.join("pack.age");
@@ -7669,11 +7795,107 @@ mod tests {
             let err_abs_file = reject_symlink_traversal_in_user_path(&via_link_blob, "input")
                 .expect_err("absolute FILE traversing a symlinked parent must be rejected");
             assert!(err_abs_file.to_string().contains("symlink"));
+
+            let via_link_recipients = link_sub.join("recipients.txt");
+            let err_symlink_wr = handle_blob_rekey_batch(BlobRekeyBatchArgs {
+                files: vec![blob_path.clone()],
+                dir: None,
+                glob: "*.age".to_string(),
+                recursive: false,
+                apply: true,
+                state: None,
+                backup: false,
+                fail_fast: false,
+                json: false,
+                write_recipients: Some(via_link_recipients),
+                allow_self_lockout: false,
+                allow_large: false,
+                recipients: RecipientArgs {
+                    recipients: vec![r.to_string()],
+                    recipient_files: vec![],
+                    recipient_env_var: None,
+                },
+                prior_recipients: PriorRecipientArgs {
+                    prior_recipients: vec![r.to_string()],
+                    prior_recipient_files: vec![],
+                },
+                identities: IdentityArgs {
+                    identity_files: vec![id_path.clone()],
+                    identity_public_key: None,
+                },
+                verify_identities: VerifyIdentityArgs::default(),
+                passphrase: PassphraseArgs::default(),
+            })
+            .expect_err("--write-recipients traversing a symlinked parent must be rejected");
+            assert!(err_symlink_wr.to_string().contains("symlink"));
+
+            let non_utf8_path = dir.path().join(OsStr::from_bytes(b"non-utf8-\xff.age"));
+            let err_non_utf8 = collect_batch_files(&BlobRekeyBatchArgs {
+                files: vec![non_utf8_path],
+                dir: None,
+                glob: "*.age".to_string(),
+                recursive: false,
+                apply: false,
+                state: None,
+                backup: false,
+                fail_fast: false,
+                json: false,
+                write_recipients: None,
+                allow_self_lockout: false,
+                allow_large: false,
+                recipients: RecipientArgs::default(),
+                prior_recipients: PriorRecipientArgs::default(),
+                identities: IdentityArgs::default(),
+                verify_identities: VerifyIdentityArgs::default(),
+                passphrase: PassphraseArgs::default(),
+            })
+            .expect_err("non-UTF-8 input path must be rejected before lossy key conversion");
+            assert!(err_non_utf8.to_string().contains("non-UTF-8"));
         }
 
         // Load identity to derive the authentic HMAC key for journal tests.
         let loaded_ids = seclusor_keyring::load_identity_file_auto(&id_path, None).unwrap();
-        let test_auth_key = derive_journal_auth_key(&loaded_ids, &[]);
+        let test_auth_key = derive_journal_auth_key(&loaded_ids);
+
+        // Disallow --state with --allow-self-lockout when no target-set verification identity
+        // is provided, and reject a journal authenticated only by a retired source key.
+        let rotated_id_path = dir.path().join("rotated-target-id.txt");
+        let rotated_gen = seclusor_keyring::generate_identity_file(&rotated_id_path).unwrap();
+        let err_lockout_state = handle_blob_rekey_batch(BlobRekeyBatchArgs {
+            files: vec![blob_path.clone()],
+            dir: None,
+            glob: "*.age".to_string(),
+            recursive: false,
+            apply: false,
+            state: Some(dir.path().join("lockout-state.json")),
+            backup: false,
+            fail_fast: false,
+            json: false,
+            write_recipients: None,
+            allow_self_lockout: true,
+            allow_large: false,
+            recipients: RecipientArgs {
+                recipients: vec![rotated_gen.recipient.clone()],
+                recipient_files: vec![],
+                recipient_env_var: None,
+            },
+            prior_recipients: PriorRecipientArgs {
+                prior_recipients: vec![r.to_string()],
+                prior_recipient_files: vec![],
+            },
+            identities: IdentityArgs {
+                identity_files: vec![id_path.clone()],
+                identity_public_key: None,
+            },
+            verify_identities: VerifyIdentityArgs::default(),
+            passphrase: PassphraseArgs::default(),
+        })
+        .expect_err(
+            "--state with --allow-self-lockout and no target verification identity must be refused",
+        );
+        assert!(err_lockout_state
+            .to_string()
+            .contains("--state with --allow-self-lockout requires"));
 
         // Reject forged --state journal lacking a valid cryptographic auth_tag.
         let forged_state_path = dir.path().join("forged-state.json");
@@ -7880,6 +8102,49 @@ mod tests {
         )
         .expect_err("non-owner ACE in DACL must be rejected");
         assert!(non_owner_ace_err.to_string().contains("non-owner SID"));
+
+        // Windows parent-directory ownership and DACL validation:
+        // - trusted owner + trusted ACEs pass;
+        // - foreign directory owner is rejected even if DACL has no dangerous grants;
+        // - non-basic ACE types (e.g. callback or object ACEs) are rejected fail-closed;
+        // - untrusted SID with dangerous write/file-add/child-delete mask is rejected.
+        validate_windows_directory_owner_and_dacl(
+            true,
+            WINDOWS_SE_DACL_PRESENT,
+            &[(
+                WINDOWS_ACCESS_ALLOWED_ACE_TYPE,
+                WINDOWS_DANGEROUS_DIR_WRITE_MASK,
+                true,
+            )],
+        )
+        .expect("trusted directory owner and trusted ACE must pass");
+        let foreign_dir_owner_err = validate_windows_directory_owner_and_dacl(
+            false,
+            WINDOWS_SE_DACL_PRESENT,
+            &[(WINDOWS_ACCESS_ALLOWED_ACE_TYPE, 0, true)],
+        )
+        .expect_err("foreign directory owner must be rejected");
+        assert!(foreign_dir_owner_err
+            .to_string()
+            .contains("not owned by a trusted principal"));
+        let callback_ace_dir_err = validate_windows_directory_owner_and_dacl(
+            true,
+            WINDOWS_SE_DACL_PRESENT,
+            &[(9, 0, true)],
+        )
+        .expect_err("callback/object ACE type in directory DACL must be rejected");
+        assert!(callback_ace_dir_err
+            .to_string()
+            .contains("unsupported ACE type"));
+        let untrusted_dir_write_err = validate_windows_directory_owner_and_dacl(
+            true,
+            WINDOWS_SE_DACL_PRESENT,
+            &[(WINDOWS_ACCESS_ALLOWED_ACE_TYPE, 0x0002, false)],
+        )
+        .expect_err("untrusted FILE_ADD_FILE grant in directory DACL must be rejected");
+        assert!(untrusted_dir_write_err
+            .to_string()
+            .contains("grants non-owner write"));
 
         // Bounded journal serialization rejects overflow before allocation growth or
         // publication and preserves the previous readable journal.

@@ -48,6 +48,8 @@ pub(crate) struct PrivateCiphertextPriorSnapshot {
     pub bytes: Zeroizing<Vec<u8>>,
     #[cfg(unix)]
     pub identity: (u64, u64, u32),
+    #[cfg(windows)]
+    pub file_id: (u64, u64),
 }
 
 /// Test-only fault injection points for durability seams.
@@ -232,6 +234,8 @@ fn atomic_write_with_permissions(
             expected,
             #[cfg(unix)]
             prior_snapshot.as_ref().map(|s| s.identity),
+            #[cfg(windows)]
+            prior_snapshot.as_ref().map(|s| s.file_id),
         )? {
             Some(guard) => Some(guard),
             None => {
@@ -365,30 +369,49 @@ fn apply_target_permissions(
     }
     #[cfg(not(unix))]
     {
-        if permission_policy == PermissionPolicy::CiphertextTightenPrivate
-            && prior_snapshot.is_some()
-        {
-            match fs::symlink_metadata(target) {
-                Ok(meta) => {
-                    if meta.file_type().is_symlink() {
-                        return Err(CliError::Message(format!(
-                            "refusing to overwrite symlink output path {}",
-                            target.display()
-                        )));
+        if permission_policy == PermissionPolicy::CiphertextTightenPrivate {
+            if let Some(snapshot) = prior_snapshot {
+                match fs::symlink_metadata(target) {
+                    Ok(meta) => {
+                        if meta.file_type().is_symlink() {
+                            return Err(CliError::Message(format!(
+                                "refusing to overwrite symlink output path {}",
+                                target.display()
+                            )));
+                        }
+                        if !meta.is_file() {
+                            return Err(CliError::Message(format!(
+                                "output path {} must be a regular file",
+                                target.display()
+                            )));
+                        }
+                        #[cfg(windows)]
+                        {
+                            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+                            use std::os::windows::fs::MetadataExt;
+                            if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                                return Err(CliError::Message(format!(
+                                    "refusing to overwrite symlink output path {}",
+                                    target.display()
+                                )));
+                            }
+                            let (actual_id, actual_nlink) =
+                                windows_path_identity_and_nlink_nofollow(target)
+                                    .map_err(CliError::Io)?;
+                            if actual_id != snapshot.file_id || actual_nlink != 1 {
+                                return Err(CliError::ConcurrentModification {
+                                    path: target.display().to_string(),
+                                });
+                            }
+                        }
                     }
-                    if !meta.is_file() {
-                        return Err(CliError::Message(format!(
-                            "output path {} must be a regular file",
-                            target.display()
-                        )));
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(CliError::ConcurrentModification {
+                            path: target.display().to_string(),
+                        });
                     }
+                    Err(err) => return Err(CliError::Io(err)),
                 }
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    return Err(CliError::ConcurrentModification {
-                        path: target.display().to_string(),
-                    });
-                }
-                Err(err) => return Err(CliError::Io(err)),
             }
         }
         // Windows: fresh-file ACL inherits parent directory defaults (documented
@@ -455,6 +478,98 @@ impl Drop for LockedTargetGuard {
             let _ = UnlockFileEx(self.file.as_raw_handle(), 0, 1, 0, &mut overlapped);
         }
     }
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_file_identity_and_nlink(file: &File) -> std::io::Result<((u64, u64), u64)> {
+    use std::os::windows::io::AsRawHandle;
+
+    #[repr(C)]
+    struct FileTime {
+        low_date_time: u32,
+        high_date_time: u32,
+    }
+
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        file_attributes: u32,
+        creation_time: FileTime,
+        last_access_time: FileTime,
+        last_write_time: FileTime,
+        volume_serial_number: u32,
+        file_size_high: u32,
+        file_size_low: u32,
+        number_of_links: u32,
+        file_index_high: u32,
+        file_index_low: u32,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandle(
+            hFile: *mut core::ffi::c_void,
+            lpFileInformation: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+
+    let mut info = ByHandleFileInformation {
+        file_attributes: 0,
+        creation_time: FileTime {
+            low_date_time: 0,
+            high_date_time: 0,
+        },
+        last_access_time: FileTime {
+            low_date_time: 0,
+            high_date_time: 0,
+        },
+        last_write_time: FileTime {
+            low_date_time: 0,
+            high_date_time: 0,
+        },
+        volume_serial_number: 0,
+        file_size_high: 0,
+        file_size_low: 0,
+        number_of_links: 0,
+        file_index_high: 0,
+        file_index_low: 0,
+    };
+    // SAFETY: `file` is a valid open file handle and `info` is stack-allocated.
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let file_index = ((info.file_index_high as u64) << 32) | (info.file_index_low as u64);
+    Ok((
+        (info.volume_serial_number as u64, file_index),
+        info.number_of_links as u64,
+    ))
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_path_identity_and_nlink_nofollow(
+    path: &Path,
+) -> std::io::Result<((u64, u64), u64)> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+    const FILE_SHARE_ALL: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+
+    let f = OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_ALL)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let meta = f.metadata()?;
+    if meta.file_type().is_symlink() || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing symlink or reparse point path",
+        ));
+    }
+    windows_file_identity_and_nlink(&f)
 }
 
 #[cfg(windows)]
@@ -531,6 +646,7 @@ fn verify_and_lock_expected_target(
     path: &Path,
     expected: &[u8],
     #[cfg(unix)] expected_prior_identity: Option<(u64, u64, u32)>,
+    #[cfg(windows)] expected_prior_file_id: Option<(u64, u64)>,
 ) -> CliResult<Option<LockedTargetGuard>> {
     let meta = match fs::symlink_metadata(path) {
         Ok(m) => m,
@@ -624,6 +740,20 @@ fn verify_and_lock_expected_target(
         };
         if !same {
             return Ok(None);
+        }
+        let Ok((open_id, open_nlink)) = windows_file_identity_and_nlink(&file) else {
+            return Ok(None);
+        };
+        let Ok((path_id, path_nlink)) = windows_path_identity_and_nlink_nofollow(path) else {
+            return Ok(None);
+        };
+        if open_id != path_id || open_nlink != 1 || path_nlink != 1 {
+            return Ok(None);
+        }
+        if let Some(expected_id) = expected_prior_file_id {
+            if open_id != expected_id {
+                return Ok(None);
+            }
         }
     }
     #[cfg(unix)]
@@ -1479,6 +1609,8 @@ mod tests {
             opts.read(true)
                 .share_mode(0x0000_0001 | 0x0000_0002 | 0x0000_0004);
             let locked_file = opts.open(&path).expect("open target");
+            let (locked_id, _) =
+                windows_file_identity_and_nlink(&locked_file).expect("target file identity");
             assert!(
                 lock_windows_target_handle(&locked_file).expect("lock target"),
                 "test must acquire exclusive byte-range lock on target"
@@ -1490,6 +1622,7 @@ mod tests {
                 b"v2",
                 Some(PrivateCiphertextPriorSnapshot {
                     bytes: Zeroizing::new(b"v1".to_vec()),
+                    file_id: locked_id,
                 }),
             )
             .expect_err("competing Windows target lock must fail closed as ConcurrentModification");
@@ -1503,6 +1636,7 @@ mod tests {
                 b"v2",
                 Some(PrivateCiphertextPriorSnapshot {
                     bytes: Zeroizing::new(b"v1".to_vec()),
+                    file_id: locked_id,
                 }),
             )
             .expect("write succeeds after competing Windows target lock is released");
