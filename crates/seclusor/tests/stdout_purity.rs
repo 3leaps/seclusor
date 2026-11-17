@@ -828,27 +828,109 @@ fn blob_rekey_batch_json_stdout_purity_schema_and_single_passphrase_unlock() {
         format!("{new_recipient}\n")
     );
 
-    // If `--write-recipients` fails at commit time (e.g. concurrent modification of
-    // the recipient file while batch runs, simulated by re-running when both blobs
-    // are `already-done` via journal and replacing `recipients_out` with a directory
-    // only if... or we test concurrent modification / read-only parent directory on
-    // resume), `--json` must STILL emit a valid JSON report on stdout before exiting 1.
+    // If a resumed `in_progress` journal record fails promotion persistence, OR if
+    // `--write-recipients` fails at commit time, `--json` must STILL emit a valid
+    // JSON report on stdout before exiting non-zero.
     #[cfg(unix)]
     {
+        use sha2::Digest as _;
         use std::os::unix::fs::PermissionsExt;
-        // Demote one record in the state journal back to `in_progress` (re-computing
-        // valid HMAC via a read-only state directory so journal promotion fails on resume!)
+
+        // 1. Demote one record in the state journal back to `in_progress` (`displaced_verified: true`),
+        // recompute the authentic HMAC-SHA256 `auth_tag`, place the journal inside a `0o500`
+        // read-only directory so promotion persistence fails on resume, and assert valid JSON
+        // on stdout (`summary.failed == 1`, `summary.already_done == 1`) before non-zero exit.
         let state_ro_dir = dir.path().join("state-ro");
         fs::create_dir(&state_ro_dir).unwrap();
         let ro_state_file = state_ro_dir.join("state.json");
-        fs::copy(&state_file, &ro_state_file).unwrap();
+        let raw_journal_str = fs::read_to_string(&state_file).unwrap();
+        let demoted_str =
+            raw_journal_str.replacen("\"status\": \"rekeyed\"", "\"status\": \"in_progress\"", 1);
+        let tag_prefix = "\"auth_tag\": \"";
+        let tag_start = demoted_str.find(tag_prefix).unwrap() + tag_prefix.len();
+        let canonical_str = format!(
+            "{}{}",
+            &demoted_str[..tag_start],
+            &demoted_str[tag_start + 64..]
+        );
+        let raw_id = fs::read_to_string(&new_id).unwrap();
+        let secret_line = raw_id
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with("AGE-SECRET-KEY-"))
+            .unwrap();
+        let mut key_hasher = sha2::Sha256::new();
+        key_hasher.update(b"seclusor.v1.blob-rekey-batch.journal-hmac-key\0");
+        key_hasher.update((secret_line.len() as u64).to_le_bytes());
+        key_hasher.update(secret_line.as_bytes());
+        let auth_key: [u8; 32] = key_hasher.finalize().into();
+        let mut ipad = [0x36u8; 64];
+        let mut opad = [0x5cu8; 64];
+        for i in 0..32 {
+            ipad[i] ^= auth_key[i];
+            opad[i] ^= auth_key[i];
+        }
+        let mut inner = sha2::Sha256::new();
+        inner.update(ipad);
+        inner.update(canonical_str.as_bytes());
+        let inner_digest: [u8; 32] = inner.finalize().into();
+        let mut outer = sha2::Sha256::new();
+        outer.update(opad);
+        outer.update(inner_digest);
+        let tag_bytes: [u8; 32] = outer.finalize().into();
+        let mut auth_tag_hex = String::with_capacity(64);
+        for b in tag_bytes {
+            use std::fmt::Write as _;
+            let _ = write!(&mut auth_tag_hex, "{b:02x}");
+        }
+        let final_journal_str = format!(
+            "{}{}{}",
+            &demoted_str[..tag_start],
+            auth_tag_hex,
+            &demoted_str[tag_start + 64..]
+        );
+        fs::write(&ro_state_file, final_journal_str.as_bytes()).unwrap();
         fs::set_permissions(&ro_state_file, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&state_ro_dir, fs::Permissions::from_mode(0o500)).unwrap();
 
-        // Also test `--write-recipients` commit failure after batch processing:
-        // make a recipient directory where we remove write permission on a sibling or
+        let promo_fail_out = run_seclusor(&[
+            "secrets",
+            "--allow-recipient-mismatch",
+            "blob",
+            "rekey-batch",
+            blob1.to_str().unwrap(),
+            blob2.to_str().unwrap(),
+            "--apply",
+            "--json",
+            "--state",
+            ro_state_file.to_str().unwrap(),
+            "--identity-file",
+            new_id.to_str().unwrap(),
+            "--recipient",
+            &new_recipient,
+            "--prior-recipient",
+            &old_recipient,
+            "--verify-identity-file",
+            new_id.to_str().unwrap(),
+        ]);
+        fs::set_permissions(&state_ro_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            !promo_fail_out.status.success(),
+            "resumed in_progress journal promotion failure must exit non-zero"
+        );
+        let pf_stdout = String::from_utf8(promo_fail_out.stdout).expect("utf8 stdout");
+        let pf_parsed: serde_json::Value = serde_json::from_str(&pf_stdout).expect(
+            "stdout must still contain valid JSON report when resumed journal promotion fails",
+        );
+        assert_eq!(pf_parsed["version"], 1);
+        assert_eq!(pf_parsed["mode"], "apply");
+        assert_eq!(pf_parsed["summary"]["failed"], 1);
+        assert_eq!(pf_parsed["summary"]["already_done"], 1);
+
+        // 2. Test `--write-recipients` commit failure after batch processing:
         // lock the recipient file with an exclusive flock during batch execution so
         // `prepare_batch_recipient_refresh` succeeds (read-only open) and
-        // `commit_batch_recipient_refresh` fails with ConcurrentModification!
+        // `commit_batch_recipient_refresh` fails with ConcurrentModification.
         let locked_rcpt = dir.path().join("locked-recipients.txt");
         fs::write(&locked_rcpt, format!("{old_recipient}\n")).unwrap();
         let lock_holder = fs::File::open(&locked_rcpt).unwrap();
