@@ -616,6 +616,8 @@ pub(crate) enum BlobSubcommand {
     Decrypt(BlobDecryptArgs),
     /// Re-encrypt a whole-file blob to a new recipient set without writing plaintext to disk.
     Rekey(BlobRekeyArgs),
+    /// Re-encrypt multiple whole-file blobs in one batch (plan by default; --apply to write).
+    RekeyBatch(BlobRekeyBatchArgs),
     /// Verify in memory that an identity decrypts and authenticates a whole-file blob.
     Verify(BlobVerifyArgs),
 }
@@ -668,6 +670,88 @@ pub(crate) struct BlobRekeyArgs {
         long,
         value_name = "PATH",
         help = "After blob rekey succeeds, atomically write the resulting public recipient set to PATH"
+    )]
+    pub(crate) write_recipients: Option<PathBuf>,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Allow rekey when no target-set private identity can decrypt and authenticate the new blob before commit"
+    )]
+    pub(crate) allow_self_lockout: bool,
+    #[arg(long, default_value_t = false, help = "Allow files larger than 10 MB")]
+    pub(crate) allow_large: bool,
+    #[command(flatten)]
+    pub(crate) recipients: RecipientArgs,
+    #[command(flatten)]
+    pub(crate) prior_recipients: PriorRecipientArgs,
+    #[command(flatten)]
+    pub(crate) identities: IdentityArgs,
+    #[command(flatten)]
+    pub(crate) verify_identities: VerifyIdentityArgs,
+    #[command(flatten)]
+    pub(crate) passphrase: PassphraseArgs,
+}
+
+#[derive(Debug, Parser)]
+pub(crate) struct BlobRekeyBatchArgs {
+    #[arg(
+        value_name = "FILE",
+        help = "Explicit encrypted blob file path(s) to inspect or rekey"
+    )]
+    pub(crate) files: Vec<PathBuf>,
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "Directory to scan for encrypted blobs (non-recursive unless --recursive)"
+    )]
+    pub(crate) dir: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "PATTERN",
+        default_value = "*.age",
+        help = "Filename glob pattern when scanning --dir"
+    )]
+    pub(crate) glob: String,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Recurse into subdirectories when scanning --dir (symlinks are never followed)"
+    )]
+    pub(crate) recursive: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Apply rekey replacements in place (default mode is read-only plan)"
+    )]
+    pub(crate) apply: bool,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Path to a private 0600 two-phase state journal for idempotent resume"
+    )]
+    pub(crate) state: Option<PathBuf>,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Create a private 0600 .bak-<UTC>Z copy of the prior ciphertext before replacing each blob"
+    )]
+    pub(crate) backup: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Stop batch processing after the first file failure"
+    )]
+    pub(crate) fail_fast: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Emit a single machine-readable JSON report on stdout (notices go to stderr)"
+    )]
+    pub(crate) json: bool,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "After every selected blob ends rekeyed or already-done, atomically write the resulting public recipient set to PATH"
     )]
     pub(crate) write_recipients: Option<PathBuf>,
     #[arg(

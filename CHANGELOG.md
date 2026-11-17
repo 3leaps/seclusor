@@ -10,17 +10,27 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ### Added
 
-- `secrets blob rekey` and `secrets blob verify` for rotating recipients on
-  whole-file age blobs in memory without writing plaintext to disk. `blob rekey`
-  always generates a fresh file key, refuses seclusor bundle JSON documents
-  (pointing to `secrets rekey`), enforces recipient-delta and stanza-count /
-  opening-identity tripwires against `--prior-recipient` /
-  `--prior-recipient-file`, verifies in memory before commit that a target-set
-  private identity (`--identity-*` or `--verify-identity-*`) decrypts and
-  authenticates the new blob unless `--allow-self-lockout` is passed, supports
-  `--write-recipients`, and commits via the atomic private-ciphertext writer.
-  `blob verify` decrypts and authenticates a blob in memory, prints the opening
-  public key on `stdout`, and writes nothing to disk.
+- `secrets blob rekey`, `secrets blob rekey-batch`, and `secrets blob verify`
+  for rotating recipients on whole-file age blobs in memory without writing
+  plaintext to disk. `blob rekey` always generates a fresh file key, refuses
+  seclusor bundle JSON documents (pointing to `secrets rekey`), enforces
+  recipient-delta and stanza-count / opening-identity tripwires against
+  `--prior-recipient` / `--prior-recipient-file`, verifies in memory before
+  commit that a target-set private identity (`--identity-*` or
+  `--verify-identity-*`) decrypts and authenticates the new blob unless
+  `--allow-self-lockout` is passed, supports `--write-recipients`, and commits
+  via the atomic private-ciphertext writer. `blob rekey-batch` runs in read-only
+  `plan` mode by default (`--apply` to replace in place), unlocks the invoking
+  identity once for the entire batch, classifies files (`affected`,
+  `not-openable`, `scrypt`, `secrets-document`, `not-age`, `too-large`,
+  `prior-mismatch`, `error`, `failed`, `rekeyed`, `already-done`), supports a
+  private `0600` two-phase `--state` journal (`sha256_before` / `sha256_after`)
+  for idempotent resume, supports opt-in `.bak-<UTC>Z` (`0600`) backups via
+  `--backup`, writes `--write-recipients` only when every selected file ends
+  `rekeyed` or `already-done`, and emits a schema-checked (`schemas/seclusor/v1.1.0/blob-rekey-batch.schema.json`)
+  report on `stdout` under `--json`. `blob verify` decrypts and authenticates a
+  blob in memory, prints the opening public key on `stdout`, and writes nothing
+  to disk.
 
 ### Changed
 

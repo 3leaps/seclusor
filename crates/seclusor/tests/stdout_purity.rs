@@ -679,3 +679,152 @@ fn blob_rekey_and_verify_stdout_purity_and_process_roundtrip() {
     );
     assert_eq!(String::from_utf8(verify_new.stderr).expect("utf8"), "");
 }
+
+#[test]
+fn blob_rekey_batch_json_stdout_purity_schema_and_single_passphrase_unlock() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let old_id = dir.path().join("old-protected-identity.txt");
+    let new_id = dir.path().join("new-identity.txt");
+    let plain1 = dir.path().join("plain1.txt");
+    let plain2 = dir.path().join("plain2.txt");
+    let blob1 = dir.path().join("one.age");
+    let blob2 = dir.path().join("two.age");
+    let state_file = dir.path().join("rekey-state.json");
+    let recipients_out = dir.path().join("recipients.txt");
+
+    let pp_str = "batch-single-unlock-passphrase-42";
+    fs::write(&plain1, b"SECRET_BATCH_ONE_99").expect("write plain1");
+    fs::write(&plain2, b"SECRET_BATCH_TWO_99").expect("write plain2");
+
+    let bin = env!("CARGO_BIN_EXE_seclusor");
+    let mut gen_old = Command::new(bin)
+        .args([
+            "keys",
+            "age",
+            "identity",
+            "generate",
+            "--output",
+            old_id.to_str().unwrap(),
+            "--passphrase-stdin",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn identity generate");
+    writeln!(gen_old.stdin.as_mut().unwrap(), "{pp_str}").expect("write passphrase");
+    let gen_old_out = gen_old.wait_with_output().expect("wait gen_old");
+    assert!(
+        gen_old_out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&gen_old_out.stderr)
+    );
+    let old_recipient = String::from_utf8(gen_old_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let gen_new = run_seclusor(&[
+        "keys",
+        "age",
+        "identity",
+        "generate",
+        "--output",
+        new_id.to_str().unwrap(),
+    ]);
+    assert!(gen_new.status.success());
+    let new_recipient = String::from_utf8(gen_new.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    for (inp, outp) in [(&plain1, &blob1), (&plain2, &blob2)] {
+        let enc = run_seclusor(&[
+            "secrets",
+            "blob",
+            "encrypt",
+            "--input",
+            inp.to_str().unwrap(),
+            "--output",
+            outp.to_str().unwrap(),
+            "--recipient",
+            &old_recipient,
+        ]);
+        assert!(enc.status.success());
+    }
+    fs::remove_file(&plain1).unwrap();
+    fs::remove_file(&plain2).unwrap();
+
+    // T18 + T19: Run `secrets blob rekey-batch --apply --json` with a single passphrase line on stdin.
+    let mut child = Command::new(bin)
+        .args([
+            "secrets",
+            "--allow-recipient-mismatch",
+            "blob",
+            "rekey-batch",
+            blob1.to_str().unwrap(),
+            blob2.to_str().unwrap(),
+            "--apply",
+            "--json",
+            "--state",
+            state_file.to_str().unwrap(),
+            "--write-recipients",
+            recipients_out.to_str().unwrap(),
+            "--identity-file",
+            old_id.to_str().unwrap(),
+            "--passphrase-stdin",
+            "--recipient",
+            &new_recipient,
+            "--prior-recipient",
+            &old_recipient,
+            "--verify-identity-file",
+            new_id.to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn rekey-batch");
+    writeln!(child.stdin.as_mut().unwrap(), "{pp_str}").expect("write passphrase once");
+    let output = child.wait_with_output().expect("wait rekey-batch");
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout_str = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let stderr_str = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(!stdout_str.contains("SECRET_BATCH_ONE_99"));
+    assert!(!stdout_str.contains("SECRET_BATCH_TWO_99"));
+    assert!(!stderr_str.contains("SECRET_BATCH_ONE_99"));
+    assert!(!stderr_str.contains("SECRET_BATCH_TWO_99"));
+    assert!(!stdout_str.contains(pp_str));
+    assert!(!stderr_str.contains(pp_str));
+
+    let schema: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../schemas/seclusor/v1.1.0/blob-rekey-batch.schema.json"
+    ))
+    .expect("schema json");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout_str).expect("stdout must be pure JSON");
+    assert_eq!(parsed["version"], 1);
+    assert_eq!(parsed["mode"], "apply");
+    assert_eq!(parsed["summary"]["selected"], 2);
+    assert_eq!(parsed["summary"]["rekeyed"], 2);
+    assert_eq!(parsed["summary"]["failed"], 0);
+    for req_key in schema["required"].as_array().unwrap() {
+        assert!(parsed
+            .as_object()
+            .unwrap()
+            .contains_key(req_key.as_str().unwrap()));
+    }
+    assert!(state_file.exists());
+    assert_eq!(
+        fs::read_to_string(&recipients_out).unwrap(),
+        format!("{new_recipient}\n")
+    );
+}

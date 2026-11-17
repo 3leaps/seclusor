@@ -9,14 +9,14 @@ use seclusor_keyring::{
     discover_recipients_from_file, find_identity_path_by_public_key,
     is_passphrase_protected_identity, load_identity_file_auto, KeyringError,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::atomic_write::{atomic_write_private_ciphertext, PrivateCiphertextPriorSnapshot};
 use crate::cli::{
-    BlobDecryptArgs, BlobEncryptArgs, BlobRekeyArgs, BlobSubcommand, BlobVerifyArgs,
-    PriorRecipientArgs, VerifyIdentityArgs,
+    BlobDecryptArgs, BlobEncryptArgs, BlobRekeyArgs, BlobRekeyBatchArgs, BlobSubcommand,
+    BlobVerifyArgs, PriorRecipientArgs, VerifyIdentityArgs,
 };
 use crate::error::{CliError, CliResult};
 use crate::handlers::encrypted_write::{
@@ -36,7 +36,7 @@ pub(crate) fn handle_blob_command_with_policy(
         BlobSubcommand::Encrypt(args) => {
             if allow_recipient_mismatch {
                 return Err(CliError::Message(
-                    "--allow-recipient-mismatch is only valid for `blob rekey` in the `secrets blob` family"
+                    "--allow-recipient-mismatch is only valid for `blob rekey` and `blob rekey-batch` in the `secrets blob` family"
                         .to_string(),
                 ));
             }
@@ -45,7 +45,7 @@ pub(crate) fn handle_blob_command_with_policy(
         BlobSubcommand::Decrypt(args) => {
             if allow_recipient_mismatch {
                 return Err(CliError::Message(
-                    "--allow-recipient-mismatch is only valid for `blob rekey` in the `secrets blob` family"
+                    "--allow-recipient-mismatch is only valid for `blob rekey` and `blob rekey-batch` in the `secrets blob` family"
                         .to_string(),
                 ));
             }
@@ -54,10 +54,13 @@ pub(crate) fn handle_blob_command_with_policy(
         BlobSubcommand::Rekey(args) => {
             handle_blob_rekey_with_policy(args, allow_recipient_mismatch)
         }
+        BlobSubcommand::RekeyBatch(args) => {
+            handle_blob_rekey_batch_with_policy(args, allow_recipient_mismatch)
+        }
         BlobSubcommand::Verify(args) => {
             if allow_recipient_mismatch {
                 return Err(CliError::Message(
-                    "--allow-recipient-mismatch is only valid for `blob rekey` in the `secrets blob` family"
+                    "--allow-recipient-mismatch is only valid for `blob rekey` and `blob rekey-batch` in the `secrets blob` family"
                         .to_string(),
                 ));
             }
@@ -2142,6 +2145,1616 @@ pub(crate) fn handle_blob_verify(args: BlobVerifyArgs) -> CliResult<()> {
     Ok(())
 }
 
+const MAX_STATE_JOURNAL_BYTES: u64 = 16 * 1024 * 1024;
+const STATE_JOURNAL_SCHEMA: &str = "seclusor.blob-rekey-state.v1";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BatchStateJournal {
+    schema: String,
+    operation: String,
+    target_recipients: Vec<String>,
+    prior_recipients: Option<Vec<String>>,
+    allow_recipient_mismatch: bool,
+    allow_self_lockout: bool,
+    allow_large: bool,
+    records: std::collections::BTreeMap<String, BatchJournalRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BatchJournalRecord {
+    path: String,
+    sha256_before: String,
+    sha256_after: String,
+    status: String,
+    ts: String,
+    opened_with: String,
+    stanzas_before: usize,
+    stanzas_after: usize,
+    delta: Option<BatchReportDelta>,
+    mode_before: Option<String>,
+    mode_after: Option<String>,
+    backup: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BatchReportDelta {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BatchReportFileEntry {
+    pub path: String,
+    pub status: String,
+    pub opened_with: Option<String>,
+    pub stanzas_before: Option<usize>,
+    pub stanzas_after: Option<usize>,
+    pub delta: Option<BatchReportDelta>,
+    pub mode_before: Option<String>,
+    pub mode_after: Option<String>,
+    pub backup: Option<String>,
+    pub sha256_before: Option<String>,
+    pub sha256_after: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BatchReportSummary {
+    pub selected: usize,
+    pub affected: usize,
+    pub rekeyed: usize,
+    pub already_done: usize,
+    pub not_openable: usize,
+    pub skipped: usize,
+    pub failed: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BatchReport {
+    pub version: u32,
+    pub mode: String,
+    pub target_recipients: Vec<String>,
+    pub files: Vec<BatchReportFileEntry>,
+    pub summary: BatchReportSummary,
+}
+
+#[cfg(test)]
+thread_local! {
+    static BATCH_FAIL_AFTER_COMMITS: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    static BATCH_ABORT_AFTER_PLANNED_JOURNAL: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_batch_fail_after_commits(limit: Option<usize>) {
+    BATCH_FAIL_AFTER_COMMITS.with(|c| c.set(limit));
+}
+
+#[cfg(test)]
+pub(crate) fn set_batch_abort_after_planned_journal(abort: bool) {
+    BATCH_ABORT_AFTER_PLANNED_JOURNAL.with(|c| c.set(abort));
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
+}
+
+fn utc_compact_timestamp_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format_utc_compact(secs)
+}
+
+fn format_utc_compact(epoch_secs: u64) -> String {
+    let days = (epoch_secs / 86_400) as i64;
+    let rem = epoch_secs % 86_400;
+    let hour = rem / 3600;
+    let minute = (rem % 3600) / 60;
+    let second = rem % 60;
+
+    // Howard Hinnant's civil_from_days algorithm (proleptic Gregorian UTC).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+
+    format!("{year:04}{m:02}{d:02}T{hour:02}{minute:02}{second:02}Z")
+}
+
+fn filename_glob_matches(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = name.chars().collect();
+    let mut dp = vec![false; t.len() + 1];
+    dp[0] = true;
+    for &pc in &p {
+        if pc == '*' {
+            for j in 1..=t.len() {
+                dp[j] = dp[j] || dp[j - 1];
+            }
+        } else {
+            for j in (1..=t.len()).rev() {
+                dp[j] = dp[j - 1] && (pc == '?' || pc == t[j - 1]);
+            }
+            dp[0] = false;
+        }
+    }
+    dp[t.len()]
+}
+
+fn is_skipped_dir_entry_name(name: &str) -> bool {
+    name.starts_with('.') || name.starts_with(".seclusor-") || name.contains(".bak-")
+}
+
+/// Reject any explicit `FILE` or `--dir` path that traverses a symlinked
+/// component below the current working directory (when relative) or below its
+/// parent directory (when absolute), so symlinks are never followed during
+/// selection.
+fn reject_symlink_traversal_in_user_path(path: &Path, flag_label: &str) -> CliResult<()> {
+    use std::path::Component;
+    if path.is_relative() {
+        let mut cur = std::env::current_dir().map_err(CliError::Io)?;
+        for comp in path.components() {
+            match comp {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    cur.pop();
+                }
+                Component::Normal(part) => {
+                    cur.push(part);
+                    let meta = fs::symlink_metadata(&cur).map_err(|err| {
+                        CliError::Message(format!(
+                            "cannot inspect {flag_label} path {}: {err}",
+                            path.display()
+                        ))
+                    })?;
+                    if meta.file_type().is_symlink() {
+                        return Err(CliError::Message(format!(
+                            "refusing symlink in {flag_label} path {}; symlinks are not followed",
+                            path.display()
+                        )));
+                    }
+                }
+                Component::RootDir | Component::Prefix(_) => {}
+            }
+        }
+    } else {
+        let meta = fs::symlink_metadata(path).map_err(|err| {
+            CliError::Message(format!(
+                "cannot inspect {flag_label} path {}: {err}",
+                path.display()
+            ))
+        })?;
+        if meta.file_type().is_symlink() {
+            return Err(CliError::Message(format!(
+                "refusing symlink {flag_label} path {}; symlinks are not followed",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn is_valid_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn collect_dir_candidates(
+    dir: &Path,
+    glob_pattern: &str,
+    recursive: bool,
+    out: &mut Vec<PathBuf>,
+) -> CliResult<()> {
+    let meta = fs::symlink_metadata(dir).map_err(CliError::Io)?;
+    if meta.file_type().is_symlink() {
+        return Err(CliError::Message(format!(
+            "--dir path {} must not be a symlink",
+            dir.display()
+        )));
+    }
+    if !meta.is_dir() {
+        return Err(CliError::Message(format!(
+            "--dir path {} is not a directory",
+            dir.display()
+        )));
+    }
+    let canon_dir = fs::canonicalize(dir).map_err(CliError::Io)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let canon_meta = fs::symlink_metadata(&canon_dir).map_err(CliError::Io)?;
+        if canon_meta.dev() != meta.dev() || canon_meta.ino() != meta.ino() {
+            return Err(CliError::ConcurrentModification {
+                path: dir.display().to_string(),
+            });
+        }
+    }
+
+    let mut entries: Vec<fs::DirEntry> = fs::read_dir(&canon_dir)
+        .map_err(CliError::Io)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(CliError::Io)?;
+    entries.sort_by_key(|e| e.file_name());
+
+    for entry in entries {
+        let file_name = entry.file_name();
+        let name_str = file_name.to_string_lossy();
+        if is_skipped_dir_entry_name(&name_str) {
+            continue;
+        }
+        let path = entry.path();
+        let entry_meta = fs::symlink_metadata(&path).map_err(CliError::Io)?;
+        let file_type = entry_meta.file_type();
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            if recursive {
+                collect_dir_candidates(&path, glob_pattern, true, out)?;
+            }
+            continue;
+        }
+        if file_type.is_file() && filename_glob_matches(glob_pattern, &name_str) {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn collect_batch_files(args: &BlobRekeyBatchArgs) -> CliResult<Vec<PathBuf>> {
+    if args.files.is_empty() && args.dir.is_none() {
+        return Err(CliError::Message(
+            "blob rekey-batch requires at least one FILE or --dir <DIR>".to_string(),
+        ));
+    }
+    if args.recursive && args.dir.is_none() {
+        return Err(CliError::Message(
+            "--recursive requires --dir <DIR>".to_string(),
+        ));
+    }
+    if args.glob.trim().is_empty() {
+        return Err(CliError::Message(
+            "--glob pattern must not be empty".to_string(),
+        ));
+    }
+
+    let mut raw_candidates: Vec<PathBuf> = Vec::new();
+    for file in &args.files {
+        reject_symlink_traversal_in_user_path(file, "input")?;
+        let meta = fs::symlink_metadata(file).map_err(|err| {
+            CliError::Message(format!(
+                "cannot inspect input path {}: {err}",
+                file.display()
+            ))
+        })?;
+        if meta.file_type().is_symlink() {
+            return Err(CliError::Message(format!(
+                "refusing symlink input path {} in blob rekey-batch; symlinks are not followed",
+                file.display()
+            )));
+        }
+        if !meta.is_file() {
+            return Err(CliError::Message(format!(
+                "input path {} must be a regular file",
+                file.display()
+            )));
+        }
+        raw_candidates.push(file.clone());
+    }
+
+    if let Some(dir) = &args.dir {
+        reject_symlink_traversal_in_user_path(dir, "--dir")?;
+        collect_dir_candidates(dir, &args.glob, args.recursive, &mut raw_candidates)?;
+    }
+
+    let mut canonical_paths: Vec<PathBuf> = Vec::with_capacity(raw_candidates.len());
+    for candidate in raw_candidates {
+        let pre_meta = fs::symlink_metadata(&candidate).map_err(CliError::Io)?;
+        if pre_meta.file_type().is_symlink() || !pre_meta.is_file() {
+            return Err(CliError::Message(format!(
+                "refusing symlink or non-regular input path {}",
+                candidate.display()
+            )));
+        }
+        let canon = fs::canonicalize(&candidate).map_err(CliError::Io)?;
+        let post_meta = fs::symlink_metadata(&candidate).map_err(CliError::Io)?;
+        let canon_meta = fs::symlink_metadata(&canon).map_err(CliError::Io)?;
+        if post_meta.file_type().is_symlink()
+            || !post_meta.is_file()
+            || canon_meta.file_type().is_symlink()
+            || !canon_meta.is_file()
+        {
+            return Err(CliError::ConcurrentModification {
+                path: candidate.display().to_string(),
+            });
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if pre_meta.dev() != post_meta.dev()
+                || pre_meta.ino() != post_meta.ino()
+                || pre_meta.dev() != canon_meta.dev()
+                || pre_meta.ino() != canon_meta.ino()
+            {
+                return Err(CliError::ConcurrentModification {
+                    path: candidate.display().to_string(),
+                });
+            }
+        }
+        canonical_paths.push(canon);
+    }
+    canonical_paths.sort();
+    canonical_paths.dedup();
+
+    // Reject distinct canonical paths that alias the same underlying inode (hardlinks).
+    for i in 0..canonical_paths.len() {
+        for j in (i + 1)..canonical_paths.len() {
+            if paths_alias(&canonical_paths[i], &canonical_paths[j])? {
+                return Err(CliError::Message(format!(
+                    "selected blob path {} aliases selected blob path {} (hardlink to the same file); \
+                     refusing batch rekey with hardlinked inputs",
+                    canonical_paths[i].display(),
+                    canonical_paths[j].display()
+                )));
+            }
+        }
+    }
+
+    Ok(canonical_paths)
+}
+
+fn load_or_init_state_journal(
+    state_path: &Path,
+    target_recipients: &[String],
+    prior_recipients: Option<&[String]>,
+    allow_recipient_mismatch: bool,
+    allow_self_lockout: bool,
+    allow_large: bool,
+) -> CliResult<(BatchStateJournal, Option<PrivateCiphertextPriorSnapshot>)> {
+    if let Ok(meta) = fs::symlink_metadata(state_path) {
+        if meta.file_type().is_symlink() {
+            return Err(CliError::Message(format!(
+                "refusing symlink --state journal path {}",
+                state_path.display()
+            )));
+        }
+        if !meta.is_file() {
+            return Err(CliError::Message(format!(
+                "--state journal path {} must be a regular file",
+                state_path.display()
+            )));
+        }
+        seclusor_crypto::assert_identity_file_access(state_path)?;
+    } else {
+        let parent = state_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        seclusor_crypto::acl::reject_writable_directory_acl(parent)?;
+    }
+    let prior_snapshot = read_existing_output_for_cas(state_path)?;
+    if let Some(snapshot) = prior_snapshot {
+        seclusor_crypto::assert_identity_file_access(state_path)?;
+        if (snapshot.bytes.len() as u64) > MAX_STATE_JOURNAL_BYTES {
+            return Err(CliError::Message(format!(
+                "--state journal {} exceeds maximum size of {} bytes",
+                state_path.display(),
+                MAX_STATE_JOURNAL_BYTES
+            )));
+        }
+        let journal: BatchStateJournal =
+            serde_json::from_slice(&snapshot.bytes).map_err(|err| {
+                CliError::Message(format!(
+                    "invalid --state journal at {}: {}",
+                    state_path.display(),
+                    CliError::from(err)
+                ))
+            })?;
+        if journal.schema != STATE_JOURNAL_SCHEMA || journal.operation != "blob-rekey-batch" {
+            return Err(CliError::Message(format!(
+                "--state journal at {} has unsupported schema or operation",
+                state_path.display()
+            )));
+        }
+        let expected_prior = prior_recipients.map(|s| s.to_vec());
+        if journal.target_recipients != target_recipients
+            || journal.prior_recipients != expected_prior
+            || journal.allow_recipient_mismatch != allow_recipient_mismatch
+            || journal.allow_self_lockout != allow_self_lockout
+            || journal.allow_large != allow_large
+        {
+            return Err(CliError::Message(format!(
+                "--state journal at {} is bound to different target recipients or policy flags; \
+                 refusing to mix batch state across mismatched parameters",
+                state_path.display()
+            )));
+        }
+        for (key, rec) in &journal.records {
+            if key != &rec.path
+                || !matches!(rec.status.as_str(), "in_progress" | "rekeyed")
+                || !is_valid_sha256_hex(&rec.sha256_before)
+                || !is_valid_sha256_hex(&rec.sha256_after)
+                || rec.sha256_before == rec.sha256_after
+            {
+                return Err(CliError::Message(format!(
+                    "--state journal at {} contains malformed record for {}",
+                    state_path.display(),
+                    key
+                )));
+            }
+        }
+        return Ok((journal, Some(snapshot)));
+    }
+
+    let journal = BatchStateJournal {
+        schema: STATE_JOURNAL_SCHEMA.to_string(),
+        operation: "blob-rekey-batch".to_string(),
+        target_recipients: target_recipients.to_vec(),
+        prior_recipients: prior_recipients.map(|s| s.to_vec()),
+        allow_recipient_mismatch,
+        allow_self_lockout,
+        allow_large,
+        records: std::collections::BTreeMap::new(),
+    };
+    Ok((journal, None))
+}
+
+fn persist_state_journal(
+    state_path: &Path,
+    journal: &BatchStateJournal,
+    prior_snapshot: Option<PrivateCiphertextPriorSnapshot>,
+) -> CliResult<PrivateCiphertextPriorSnapshot> {
+    let mut bytes = serde_json::to_vec_pretty(journal)?;
+    if !bytes.ends_with(b"\n") {
+        bytes.push(b'\n');
+    }
+    atomic_write_private_ciphertext(state_path, &bytes, prior_snapshot)?;
+    let refreshed = read_existing_output_for_cas(state_path)?.ok_or_else(|| {
+        CliError::Message(format!(
+            "--state journal {} disappeared immediately after write",
+            state_path.display()
+        ))
+    })?;
+    if refreshed.bytes.as_slice() != bytes.as_slice() {
+        return Err(CliError::ConcurrentModification {
+            path: state_path.display().to_string(),
+        });
+    }
+    Ok(refreshed)
+}
+
+fn create_private_backup_file(path: &Path, prior_bytes: &[u8]) -> CliResult<PathBuf> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    seclusor_crypto::acl::reject_writable_directory_acl(parent)?;
+
+    let ts = utc_compact_timestamp_now();
+    let base_name = path
+        .file_name()
+        .ok_or_else(|| CliError::Message(format!("invalid file path {}", path.display())))?
+        .to_string_lossy();
+    let backup_path = parent.join(format!("{base_name}.bak-{ts}"));
+
+    if fs::symlink_metadata(&backup_path).is_ok() {
+        return Err(CliError::Message(format!(
+            "refusing to create backup {}: path already exists",
+            backup_path.display()
+        )));
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(&backup_path).map_err(CliError::Io)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(CliError::Io)?;
+    }
+    if let Err(err) = seclusor_crypto::acl::prepare_private_file(&file, &backup_path) {
+        drop(file);
+        let _ = fs::remove_file(&backup_path);
+        return Err(CliError::Io(err));
+    }
+    if let Err(err) =
+        std::io::Write::write_all(&mut file, prior_bytes).and_then(|()| file.sync_all())
+    {
+        drop(file);
+        let _ = fs::remove_file(&backup_path);
+        return Err(CliError::Io(err));
+    }
+    drop(file);
+    #[cfg(unix)]
+    {
+        let dir = fs::File::open(parent).map_err(CliError::Io)?;
+        dir.sync_all().map_err(CliError::Io)?;
+    }
+    Ok(backup_path)
+}
+
+#[cfg(unix)]
+fn format_unix_mode(mode: u32) -> Option<String> {
+    Some(format!("{:04o}", mode & 0o777))
+}
+
+#[cfg(not(unix))]
+fn format_unix_mode(_mode: u32) -> Option<String> {
+    None
+}
+
+#[cfg(unix)]
+fn tightened_unix_mode(mode: u32) -> u32 {
+    let m = mode & 0o777;
+    if m & 0o077 != 0 {
+        m & !0o077
+    } else {
+        m
+    }
+}
+
+#[cfg(not(unix))]
+fn tightened_unix_mode(mode: u32) -> u32 {
+    mode
+}
+
+/// Probe whether `bytes` is a JSON secrets document (plaintext or inline)
+/// without retaining any credential values in unzeroized heap strings.
+///
+/// Bounded to `MAX_SECRETS_DOC_BYTES` (4 MiB) so an oversized non-age blob
+/// under `--allow-large` (up to 24 MiB) is never parsed as a secrets document.
+fn is_json_secrets_document(bytes: &[u8]) -> bool {
+    if bytes.len() > seclusor_core::constants::MAX_SECRETS_DOC_BYTES {
+        return false;
+    }
+    refuse_if_secrets_bundle_document(bytes).is_err()
+}
+
+#[cfg(test)]
+pub(crate) fn handle_blob_rekey_batch(args: BlobRekeyBatchArgs) -> CliResult<()> {
+    handle_blob_rekey_batch_with_policy(args, false)
+}
+
+pub(crate) fn handle_blob_rekey_batch_with_policy(
+    args: BlobRekeyBatchArgs,
+    allow_recipient_mismatch: bool,
+) -> CliResult<()> {
+    // 1. Explicit recipient channel required (never fall back to SECLUSOR_RECIPIENTS).
+    if !recipient_channels_present(&args.recipients) {
+        return Err(CliError::Message(
+            "blob rekey-batch requires at least one of --recipient, --recipient-file, or \
+             --recipient-env-var (implicit SECLUSOR_RECIPIENTS fallback is not used for rekey)"
+                .to_string(),
+        ));
+    }
+    if args.backup && !args.apply {
+        return Err(CliError::Message(
+            "--backup is only valid with --apply (plan mode writes nothing)".to_string(),
+        ));
+    }
+    if !args.apply && args.write_recipients.is_some() {
+        return Err(CliError::Message(
+            "--write-recipients is only valid with --apply (plan mode writes nothing)".to_string(),
+        ));
+    }
+
+    let selected_paths = collect_batch_files(&args)?;
+    let target_recipients = resolve_recipients(&args.recipients)?;
+    let target_strings = recipient_strings(&target_recipients);
+    let prior_strings = resolve_prior_recipients(&args.prior_recipients)?;
+
+    // Single identity resolution for the entire batch (one passphrase read).
+    let (identities, mut identity_paths) =
+        resolve_identities_with_sources(&args.identities, &args.passphrase, true)?;
+    let (verify_identities, verify_paths) = resolve_verify_identities(&args.verify_identities)?;
+    identity_paths.extend(verify_paths);
+
+    // Self-lockout candidate selection: any loaded or verify identity in target_strings.
+    let mut target_verify_candidates: Vec<Identity> = Vec::new();
+    for id in identities.iter().chain(verify_identities.iter()) {
+        let pubkey = id.to_public().to_string();
+        if target_strings.iter().any(|r| r == &pubkey) {
+            target_verify_candidates.push(id.clone());
+        }
+    }
+    if target_verify_candidates.is_empty() && !args.allow_self_lockout {
+        return Err(CliError::Message(
+            "none of the loaded or --verify-identity-* private keys belongs to the target \
+             recipient set; refusing blob rekey-batch to prevent self-lockout. Supply \
+             --verify-identity-file / --verify-identity-public-key for a target recipient \
+             or pass --allow-self-lockout"
+                .to_string(),
+        ));
+    }
+
+    // Alias checks for batch files, --state, and --write-recipients before any writes.
+    for blob_path in &selected_paths {
+        for rfile in &args.recipients.recipient_files {
+            if paths_alias(blob_path, rfile)? {
+                return Err(CliError::Message(format!(
+                    "selected blob path {} aliases --recipient-file path {}",
+                    blob_path.display(),
+                    rfile.display()
+                )));
+            }
+        }
+        for pfile in &args.prior_recipients.prior_recipient_files {
+            if paths_alias(blob_path, pfile)? {
+                return Err(CliError::Message(format!(
+                    "selected blob path {} aliases --prior-recipient-file path {}",
+                    blob_path.display(),
+                    pfile.display()
+                )));
+            }
+        }
+        for id_path in &identity_paths {
+            if paths_alias(blob_path, id_path)? {
+                return Err(CliError::Message(format!(
+                    "selected blob path {} aliases identity source path {}",
+                    blob_path.display(),
+                    id_path.display()
+                )));
+            }
+        }
+        if let Some(pp_file) = &args.passphrase.passphrase_file {
+            if paths_alias(blob_path, pp_file)? {
+                return Err(CliError::Message(format!(
+                    "selected blob path {} aliases --passphrase-file path {}",
+                    blob_path.display(),
+                    pp_file.display()
+                )));
+            }
+        }
+    }
+
+    if let Some(state_path) = &args.state {
+        for blob_path in &selected_paths {
+            if paths_alias(state_path, blob_path)? {
+                return Err(CliError::Message(format!(
+                    "--state path {} aliases selected blob path {}",
+                    state_path.display(),
+                    blob_path.display()
+                )));
+            }
+        }
+        for rfile in &args.recipients.recipient_files {
+            if paths_alias(state_path, rfile)? {
+                return Err(CliError::Message(format!(
+                    "--state path {} aliases --recipient-file path {}",
+                    state_path.display(),
+                    rfile.display()
+                )));
+            }
+        }
+        for pfile in &args.prior_recipients.prior_recipient_files {
+            if paths_alias(state_path, pfile)? {
+                return Err(CliError::Message(format!(
+                    "--state path {} aliases --prior-recipient-file path {}",
+                    state_path.display(),
+                    pfile.display()
+                )));
+            }
+        }
+        for id_path in &identity_paths {
+            if paths_alias(state_path, id_path)? {
+                return Err(CliError::Message(format!(
+                    "--state path {} aliases identity source path {}",
+                    state_path.display(),
+                    id_path.display()
+                )));
+            }
+        }
+        if let Some(pp_file) = &args.passphrase.passphrase_file {
+            if paths_alias(state_path, pp_file)? {
+                return Err(CliError::Message(format!(
+                    "--state path {} aliases --passphrase-file path {}",
+                    state_path.display(),
+                    pp_file.display()
+                )));
+            }
+        }
+        if let Some(wr_path) = &args.write_recipients {
+            if paths_alias(state_path, wr_path)? {
+                return Err(CliError::Message(format!(
+                    "--state path {} aliases --write-recipients path {}",
+                    state_path.display(),
+                    wr_path.display()
+                )));
+            }
+        }
+    }
+
+    let recipient_refresh = if let Some(wr_path) = &args.write_recipients {
+        for blob_path in &selected_paths {
+            if paths_alias(wr_path, blob_path)? {
+                return Err(CliError::Message(format!(
+                    "--write-recipients path {} aliases selected blob path {}",
+                    wr_path.display(),
+                    blob_path.display()
+                )));
+            }
+        }
+        // Use a dummy non-aliasing sentinel if selected_paths is empty, or the first selected path.
+        let dummy_or_first = selected_paths
+            .first()
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from(".seclusor-batch-nonexistent-sentinel"));
+        let target = prepare_recipient_refresh_target_with_flag(
+            Some(wr_path.as_path()),
+            &dummy_or_first,
+            "FILE",
+            &dummy_or_first,
+            &identity_paths,
+            args.passphrase.passphrase_file.as_deref(),
+            &args.recipients.recipient_files,
+            &args.prior_recipients.prior_recipient_files,
+        )?;
+        prepare_recipient_refresh(target, &target_strings)?
+    } else {
+        None
+    };
+
+    let mut journal_state = if let Some(state_path) = &args.state {
+        Some(load_or_init_state_journal(
+            state_path,
+            &target_strings,
+            prior_strings.as_deref(),
+            allow_recipient_mismatch,
+            args.allow_self_lockout,
+            args.allow_large,
+        )?)
+    } else {
+        None
+    };
+
+    if args.apply && args.backup {
+        eprintln!(
+            "warning: --backup copies retain the prior ciphertext and remain decryptable by \
+             prior identities (including any compromised identity); delete .bak-* files once \
+             the batch is verified"
+        );
+    }
+    if target_verify_candidates.is_empty() && args.allow_self_lockout {
+        eprintln!(
+            "warning: proceeding with --allow-self-lockout; no target-set private identity \
+             was available to decrypt and verify rekeyed blobs before commit"
+        );
+    }
+
+    let soft_limit = if args.allow_large {
+        None
+    } else {
+        Some(BLOB_MAX_FILE_BYTES)
+    };
+
+    let mut report_files: Vec<BatchReportFileEntry> = Vec::with_capacity(selected_paths.len());
+    let mut summary = BatchReportSummary {
+        selected: selected_paths.len(),
+        ..BatchReportSummary::default()
+    };
+    #[cfg(test)]
+    let mut commits_completed = 0usize;
+
+    for blob_path in &selected_paths {
+        let path_str = blob_path.display().to_string();
+
+        // Step 1: Bounded read of the candidate file.
+        let prior_snapshot = match read_blob_input_for_rekey(
+            blob_path,
+            soft_limit,
+            BLOB_MAX_CIPHERTEXT_HARD_BYTES,
+            true,
+        ) {
+            Ok(snap) => snap,
+            Err(CliError::Message(msg))
+                if msg.contains("MB limit") || msg.contains("maximum size") =>
+            {
+                summary.skipped += 1;
+                eprintln!("skip {path_str}: too-large ({msg})");
+                report_files.push(BatchReportFileEntry {
+                    path: path_str,
+                    status: "too-large".to_string(),
+                    opened_with: None,
+                    stanzas_before: None,
+                    stanzas_after: None,
+                    delta: None,
+                    mode_before: None,
+                    mode_after: None,
+                    backup: None,
+                    sha256_before: None,
+                    sha256_after: None,
+                    error: Some(msg),
+                });
+                continue;
+            }
+            Err(err) => {
+                let status = if args.apply { "failed" } else { "error" };
+                summary.failed += 1;
+                let msg = err.to_string();
+                eprintln!("{status} {path_str}: {msg}");
+                report_files.push(BatchReportFileEntry {
+                    path: path_str,
+                    status: status.to_string(),
+                    opened_with: None,
+                    stanzas_before: None,
+                    stanzas_after: None,
+                    delta: None,
+                    mode_before: None,
+                    mode_after: None,
+                    backup: None,
+                    sha256_before: None,
+                    sha256_after: None,
+                    error: Some(msg),
+                });
+                if args.fail_fast {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        let current_sha256 = sha256_hex(&prior_snapshot.bytes);
+        #[cfg(unix)]
+        let raw_mode = prior_snapshot.identity.2;
+        #[cfg(not(unix))]
+        let raw_mode = 0u32;
+        let mode_before = format_unix_mode(raw_mode);
+        let mode_after_planned = format_unix_mode(tightened_unix_mode(raw_mode));
+
+        // Step 2: Check journal for idempotent resume (`sha256_after` match -> `already-done`).
+        if let Some((ref mut journal, ref mut journal_snap)) = journal_state {
+            if let Some(rec) = journal.records.get(&path_str).cloned() {
+                if current_sha256 == rec.sha256_after {
+                    // If the journal recorded `in_progress` and a crash happened right after
+                    // atomic rename before the post-commit journal update, upgrade it to `rekeyed`
+                    // when running under `--apply`.
+                    if args.apply && rec.status != "rekeyed" {
+                        if let Some(entry) = journal.records.get_mut(&path_str) {
+                            entry.status = "rekeyed".to_string();
+                        }
+                        if let Some(state_path) = &args.state {
+                            let new_snap =
+                                persist_state_journal(state_path, journal, journal_snap.take())?;
+                            *journal_snap = Some(new_snap);
+                        }
+                    }
+                    summary.already_done += 1;
+                    eprintln!("already-done {path_str} (matched journal sha256_after)");
+                    report_files.push(BatchReportFileEntry {
+                        path: path_str,
+                        status: "already-done".to_string(),
+                        opened_with: Some(rec.opened_with),
+                        stanzas_before: Some(rec.stanzas_before),
+                        stanzas_after: Some(rec.stanzas_after),
+                        delta: rec.delta,
+                        mode_before: rec.mode_before.or(mode_before),
+                        mode_after: rec.mode_after.or(mode_after_planned),
+                        backup: rec.backup,
+                        sha256_before: Some(rec.sha256_before),
+                        sha256_after: Some(rec.sha256_after),
+                        error: None,
+                    });
+                    continue;
+                }
+                if current_sha256 != rec.sha256_before {
+                    let status = if args.apply { "failed" } else { "error" };
+                    summary.failed += 1;
+                    let msg = format!(
+                        "on-disk sha256 ({current_sha256}) matches neither journal sha256_before ({}) nor sha256_after ({})",
+                        rec.sha256_before, rec.sha256_after
+                    );
+                    eprintln!("{status} {path_str}: {msg}");
+                    report_files.push(BatchReportFileEntry {
+                        path: path_str,
+                        status: status.to_string(),
+                        opened_with: None,
+                        stanzas_before: None,
+                        stanzas_after: None,
+                        delta: None,
+                        mode_before,
+                        mode_after: None,
+                        backup: None,
+                        sha256_before: Some(current_sha256),
+                        sha256_after: None,
+                        error: Some(msg),
+                    });
+                    if args.fail_fast {
+                        break;
+                    }
+                    continue;
+                }
+                // current_sha256 == rec.sha256_before: safe to retry from the beginning.
+            }
+        }
+
+        // Step 3: Classify header (scrypt vs non-age vs X25519 blob).
+        match seclusor_crypto::is_scrypt_ciphertext(&prior_snapshot.bytes) {
+            Ok(true) => {
+                summary.skipped += 1;
+                let msg =
+                    "passphrase-encrypted (scrypt) blob; convert to X25519 recipient mode first"
+                        .to_string();
+                eprintln!("skip {path_str}: scrypt");
+                report_files.push(BatchReportFileEntry {
+                    path: path_str,
+                    status: "scrypt".to_string(),
+                    opened_with: None,
+                    stanzas_before: None,
+                    stanzas_after: None,
+                    delta: None,
+                    mode_before,
+                    mode_after: None,
+                    backup: None,
+                    sha256_before: Some(current_sha256),
+                    sha256_after: None,
+                    error: Some(msg),
+                });
+                continue;
+            }
+            Ok(false) => {}
+            Err(_) => {
+                if is_json_secrets_document(&prior_snapshot.bytes) {
+                    summary.skipped += 1;
+                    let msg =
+                        "file is a seclusor JSON secrets document; use `seclusor secrets rekey`"
+                            .to_string();
+                    eprintln!("skip {path_str}: secrets-document (use `seclusor secrets rekey`)");
+                    report_files.push(BatchReportFileEntry {
+                        path: path_str,
+                        status: "secrets-document".to_string(),
+                        opened_with: None,
+                        stanzas_before: None,
+                        stanzas_after: None,
+                        delta: None,
+                        mode_before,
+                        mode_after: None,
+                        backup: None,
+                        sha256_before: Some(current_sha256),
+                        sha256_after: None,
+                        error: Some(msg),
+                    });
+                } else {
+                    summary.skipped += 1;
+                    let msg = "file is not an age ciphertext blob".to_string();
+                    eprintln!("skip {path_str}: not-age");
+                    report_files.push(BatchReportFileEntry {
+                        path: path_str,
+                        status: "not-age".to_string(),
+                        opened_with: None,
+                        stanzas_before: None,
+                        stanzas_after: None,
+                        delta: None,
+                        mode_before,
+                        mode_after: None,
+                        backup: None,
+                        sha256_before: Some(current_sha256),
+                        sha256_after: None,
+                        error: Some(msg),
+                    });
+                }
+                continue;
+            }
+        }
+
+        let stanzas_before = match classify_blob_ciphertext_header(&prior_snapshot.bytes) {
+            Ok(n) => n,
+            Err(err) => {
+                summary.skipped += 1;
+                let msg = err.to_string();
+                eprintln!("skip {path_str}: not-age ({msg})");
+                report_files.push(BatchReportFileEntry {
+                    path: path_str,
+                    status: "not-age".to_string(),
+                    opened_with: None,
+                    stanzas_before: None,
+                    stanzas_after: None,
+                    delta: None,
+                    mode_before,
+                    mode_after: None,
+                    backup: None,
+                    sha256_before: Some(current_sha256),
+                    sha256_after: None,
+                    error: Some(msg),
+                });
+                continue;
+            }
+        };
+
+        // Step 4: Try to decrypt with loaded identities.
+        let (plaintext, opened_with) =
+            match decrypt_blob_recording_opening_identity(&prior_snapshot.bytes, &identities) {
+                Ok(pair) => pair,
+                Err(_) => {
+                    // Never relabel `not-openable` as `already-done` without a journal `sha256_after` match.
+                    summary.not_openable += 1;
+                    summary.skipped += 1;
+                    eprintln!("skip {path_str}: not-openable by supplied identities");
+                    report_files.push(BatchReportFileEntry {
+                        path: path_str,
+                        status: "not-openable".to_string(),
+                        opened_with: None,
+                        stanzas_before: Some(stanzas_before),
+                        stanzas_after: None,
+                        delta: None,
+                        mode_before,
+                        mode_after: None,
+                        backup: None,
+                        sha256_before: Some(current_sha256),
+                        sha256_after: None,
+                        error: None,
+                    });
+                    continue;
+                }
+            };
+
+        // Step 5: Refuse seclusor bundle documents (route to `secrets rekey`).
+        if let Err(err) = refuse_if_secrets_bundle_document(&plaintext) {
+            drop(plaintext);
+            summary.skipped += 1;
+            let msg = err.to_string();
+            eprintln!("skip {path_str}: secrets-document (use `seclusor secrets rekey`)");
+            report_files.push(BatchReportFileEntry {
+                path: path_str,
+                status: "secrets-document".to_string(),
+                opened_with: Some(opened_with),
+                stanzas_before: Some(stanzas_before),
+                stanzas_after: None,
+                delta: None,
+                mode_before,
+                mode_after: None,
+                backup: None,
+                sha256_before: Some(current_sha256),
+                sha256_after: None,
+                error: Some(msg),
+            });
+            continue;
+        }
+
+        // Step 6: Evaluate `--prior-*` tripwires and delta policy.
+        if let Some(prior) = prior_strings.as_deref() {
+            if stanzas_before != prior.len() || !prior.iter().any(|r| r == &opened_with) {
+                drop(plaintext);
+                let msg = if stanzas_before != prior.len() {
+                    format!(
+                        "asserted prior recipient count ({}) does not match input blob age header stanza count ({stanzas_before})",
+                        prior.len()
+                    )
+                } else {
+                    format!(
+                        "opening identity {opened_with} is not in the asserted prior recipient set"
+                    )
+                };
+                if args.apply {
+                    summary.failed += 1;
+                } else {
+                    summary.skipped += 1;
+                }
+                eprintln!("prior-mismatch {path_str}: {msg}");
+                report_files.push(BatchReportFileEntry {
+                    path: path_str,
+                    status: "prior-mismatch".to_string(),
+                    opened_with: Some(opened_with),
+                    stanzas_before: Some(stanzas_before),
+                    stanzas_after: None,
+                    delta: None,
+                    mode_before,
+                    mode_after: None,
+                    backup: None,
+                    sha256_before: Some(current_sha256),
+                    sha256_after: None,
+                    error: Some(msg),
+                });
+                if args.fail_fast && args.apply {
+                    break;
+                }
+                continue;
+            }
+        }
+
+        let delta_notice = match evaluate_blob_rekey_delta_policy(
+            prior_strings.as_deref(),
+            &target_strings,
+            stanzas_before,
+            &opened_with,
+            allow_recipient_mismatch,
+        ) {
+            Ok(notice) => notice,
+            Err(err) => {
+                drop(plaintext);
+                let status = if args.apply { "failed" } else { "error" };
+                summary.failed += 1;
+                let msg = err.to_string();
+                eprintln!("{status} {path_str}: {msg}");
+                report_files.push(BatchReportFileEntry {
+                    path: path_str,
+                    status: status.to_string(),
+                    opened_with: Some(opened_with),
+                    stanzas_before: Some(stanzas_before),
+                    stanzas_after: None,
+                    delta: None,
+                    mode_before,
+                    mode_after: None,
+                    backup: None,
+                    sha256_before: Some(current_sha256),
+                    sha256_after: None,
+                    error: Some(msg),
+                });
+                if args.fail_fast {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        let report_delta = match &delta_notice {
+            BlobDeltaNotice::Match => Some(BatchReportDelta {
+                added: vec![],
+                removed: vec![],
+            }),
+            BlobDeltaNotice::Delta { added, removed } => Some(BatchReportDelta {
+                added: added.clone(),
+                removed: removed.clone(),
+            }),
+            BlobDeltaNotice::Indeterminate { .. } => None,
+        };
+
+        // Step 7: Encrypt with fresh file key and run pre-commit verification in memory.
+        // Plan and apply share one code path through step 7.
+        let new_ciphertext = match seclusor_crypto::encrypt(&plaintext, &target_recipients) {
+            Ok(ct) => ct,
+            Err(err) => {
+                drop(plaintext);
+                let status = if args.apply { "failed" } else { "error" };
+                summary.failed += 1;
+                let msg = err.to_string();
+                eprintln!("{status} {path_str}: {msg}");
+                report_files.push(BatchReportFileEntry {
+                    path: path_str,
+                    status: status.to_string(),
+                    opened_with: Some(opened_with),
+                    stanzas_before: Some(stanzas_before),
+                    stanzas_after: None,
+                    delta: report_delta,
+                    mode_before,
+                    mode_after: None,
+                    backup: None,
+                    sha256_before: Some(current_sha256),
+                    sha256_after: None,
+                    error: Some(msg),
+                });
+                if args.fail_fast {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        let verify_res: CliResult<usize> = (|| {
+            if seclusor_crypto::is_scrypt_ciphertext(&new_ciphertext)? {
+                return Err(CliError::Message(
+                    "internal error: rekeyed blob unexpectedly produced scrypt header".to_string(),
+                ));
+            }
+            let stanzas_after = seclusor_crypto::count_x25519_recipient_stanzas(&new_ciphertext)?;
+            if stanzas_after != target_recipients.len() {
+                return Err(CliError::Message(format!(
+                    "internal error: rekeyed blob stanza count ({stanzas_after}) does not match target recipient count ({})",
+                    target_recipients.len()
+                )));
+            }
+            if !target_verify_candidates.is_empty() {
+                use sha2::Digest as _;
+                let mut expected_hasher = sha2::Sha256::new();
+                expected_hasher.update(plaintext.as_slice());
+                let expected_digest: Zeroizing<[u8; 32]> =
+                    Zeroizing::new(expected_hasher.finalize().into());
+
+                let verified_pt = seclusor_crypto::decrypt_zeroizing(
+                    &new_ciphertext,
+                    &target_verify_candidates,
+                )
+                .map_err(|_| {
+                    CliError::Message(
+                        "pre-commit verification failed: target identity could not decrypt the newly encrypted blob"
+                            .to_string(),
+                    )
+                })?;
+
+                let mut actual_hasher = sha2::Sha256::new();
+                actual_hasher.update(verified_pt.as_slice());
+                let actual_digest: Zeroizing<[u8; 32]> =
+                    Zeroizing::new(actual_hasher.finalize().into());
+
+                if verified_pt.len() != plaintext.len()
+                    || actual_digest
+                        .as_slice()
+                        .ct_eq(expected_digest.as_slice())
+                        .unwrap_u8()
+                        != 1
+                    || verified_pt
+                        .as_slice()
+                        .ct_eq(plaintext.as_slice())
+                        .unwrap_u8()
+                        != 1
+                {
+                    return Err(CliError::Message(
+                        "pre-commit verification failed: decrypted payload mismatch".to_string(),
+                    ));
+                }
+            }
+            Ok(stanzas_after)
+        })();
+        drop(plaintext);
+
+        let stanzas_after = match verify_res {
+            Ok(n) => n,
+            Err(err) => {
+                let status = if args.apply { "failed" } else { "error" };
+                summary.failed += 1;
+                let msg = err.to_string();
+                eprintln!("{status} {path_str}: {msg}");
+                report_files.push(BatchReportFileEntry {
+                    path: path_str,
+                    status: status.to_string(),
+                    opened_with: Some(opened_with),
+                    stanzas_before: Some(stanzas_before),
+                    stanzas_after: None,
+                    delta: report_delta,
+                    mode_before,
+                    mode_after: None,
+                    backup: None,
+                    sha256_before: Some(current_sha256),
+                    sha256_after: None,
+                    error: Some(msg),
+                });
+                if args.fail_fast {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        summary.affected += 1;
+        let new_sha256 = sha256_hex(&new_ciphertext);
+
+        if !args.apply {
+            eprintln!(
+                "affected {path_str} (opened_with: {opened_with}, stanzas: {stanzas_before} -> {stanzas_after})"
+            );
+            report_files.push(BatchReportFileEntry {
+                path: path_str,
+                status: "affected".to_string(),
+                opened_with: Some(opened_with),
+                stanzas_before: Some(stanzas_before),
+                stanzas_after: Some(stanzas_after),
+                delta: report_delta,
+                mode_before,
+                mode_after: mode_after_planned,
+                backup: None,
+                sha256_before: Some(current_sha256),
+                sha256_after: Some(new_sha256),
+                error: None,
+            });
+            continue;
+        }
+
+        #[cfg(test)]
+        if let Some(limit) = BATCH_FAIL_AFTER_COMMITS.with(|c| c.get()) {
+            if commits_completed >= limit {
+                summary.failed += 1;
+                let msg = "injected batch failure after commit limit".to_string();
+                eprintln!("failed {path_str}: {msg}");
+                report_files.push(BatchReportFileEntry {
+                    path: path_str,
+                    status: "failed".to_string(),
+                    opened_with: Some(opened_with),
+                    stanzas_before: Some(stanzas_before),
+                    stanzas_after: Some(stanzas_after),
+                    delta: report_delta,
+                    mode_before,
+                    mode_after: None,
+                    backup: None,
+                    sha256_before: Some(current_sha256),
+                    sha256_after: None,
+                    error: Some(msg),
+                });
+                if args.fail_fast {
+                    break;
+                }
+                continue;
+            }
+        }
+
+        // Step 8 (apply): Optional `.bak-<UTC>Z` 0600 backup before replacement.
+        let backup_path_str = if args.backup {
+            match create_private_backup_file(blob_path, &prior_snapshot.bytes) {
+                Ok(bpath) => Some(bpath.display().to_string()),
+                Err(err) => {
+                    summary.failed += 1;
+                    let msg = format!("backup creation failed: {err}");
+                    eprintln!("failed {path_str}: {msg}");
+                    report_files.push(BatchReportFileEntry {
+                        path: path_str,
+                        status: "failed".to_string(),
+                        opened_with: Some(opened_with),
+                        stanzas_before: Some(stanzas_before),
+                        stanzas_after: Some(stanzas_after),
+                        delta: report_delta,
+                        mode_before,
+                        mode_after: None,
+                        backup: None,
+                        sha256_before: Some(current_sha256),
+                        sha256_after: None,
+                        error: Some(msg),
+                    });
+                    if args.fail_fast {
+                        break;
+                    }
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+
+        // Step 9 (apply): Two-phase journal phase 1 (`in_progress`) persisted durably BEFORE replacement.
+        if let (Some(state_path), Some((ref mut journal, ref mut journal_snap))) =
+            (&args.state, &mut journal_state)
+        {
+            journal.records.insert(
+                path_str.clone(),
+                BatchJournalRecord {
+                    path: path_str.clone(),
+                    sha256_before: current_sha256.clone(),
+                    sha256_after: new_sha256.clone(),
+                    status: "in_progress".to_string(),
+                    ts: utc_compact_timestamp_now(),
+                    opened_with: opened_with.clone(),
+                    stanzas_before,
+                    stanzas_after,
+                    delta: report_delta.clone(),
+                    mode_before: mode_before.clone(),
+                    mode_after: mode_after_planned.clone(),
+                    backup: backup_path_str.clone(),
+                },
+            );
+            match persist_state_journal(state_path, journal, journal_snap.take()) {
+                Ok(new_snap) => *journal_snap = Some(new_snap),
+                Err(err) => {
+                    summary.failed += 1;
+                    let msg = format!("pre-commit state journal write failed: {err}");
+                    eprintln!("failed {path_str}: {msg}");
+                    report_files.push(BatchReportFileEntry {
+                        path: path_str,
+                        status: "failed".to_string(),
+                        opened_with: Some(opened_with),
+                        stanzas_before: Some(stanzas_before),
+                        stanzas_after: Some(stanzas_after),
+                        delta: report_delta,
+                        mode_before,
+                        mode_after: None,
+                        backup: backup_path_str,
+                        sha256_before: Some(current_sha256),
+                        sha256_after: None,
+                        error: Some(msg),
+                    });
+                    if args.fail_fast {
+                        break;
+                    }
+                    continue;
+                }
+            }
+        }
+
+        // Step 10 (apply): Atomic replacement + post-commit re-read check.
+        let commit_res: CliResult<()> = (|| {
+            atomic_write_private_ciphertext(blob_path, &new_ciphertext, Some(prior_snapshot))?;
+            let post_commit_bytes =
+                read_file_bounded_zeroizing(blob_path, None, BLOB_MAX_CIPHERTEXT_HARD_BYTES)
+                    .map_err(|err| CliError::PostCommitFailure {
+                        path: path_str.clone(),
+                        step: "re-read verification",
+                        source: Box::new(err),
+                    })?;
+            if post_commit_bytes.as_slice() != new_ciphertext.as_slice() {
+                return Err(CliError::PostCommitFailure {
+                    path: path_str.clone(),
+                    step: "re-read byte comparison",
+                    source: Box::new(CliError::Message(
+                        "on-disk bytes after commit did not match written ciphertext".to_string(),
+                    )),
+                });
+            }
+            Ok(())
+        })();
+
+        if let Err(err) = commit_res {
+            summary.failed += 1;
+            let msg = err.to_string();
+            eprintln!("failed {path_str}: {msg}");
+            report_files.push(BatchReportFileEntry {
+                path: path_str,
+                status: "failed".to_string(),
+                opened_with: Some(opened_with),
+                stanzas_before: Some(stanzas_before),
+                stanzas_after: Some(stanzas_after),
+                delta: report_delta,
+                mode_before,
+                mode_after: None,
+                backup: backup_path_str,
+                sha256_before: Some(current_sha256),
+                sha256_after: None,
+                error: Some(msg),
+            });
+            if args.fail_fast {
+                break;
+            }
+            continue;
+        }
+
+        #[cfg(test)]
+        if BATCH_ABORT_AFTER_PLANNED_JOURNAL.with(|c| c.get()) {
+            return Err(CliError::Message(
+                "simulated crash after blob replacement before post-commit journal mark"
+                    .to_string(),
+            ));
+        }
+
+        // Step 11 (apply): Two-phase journal phase 2 (`rekeyed`).
+        if let (Some(state_path), Some((ref mut journal, ref mut journal_snap))) =
+            (&args.state, &mut journal_state)
+        {
+            if let Some(entry) = journal.records.get_mut(&path_str) {
+                entry.status = "rekeyed".to_string();
+                entry.ts = utc_compact_timestamp_now();
+            }
+            if let Err(err) = persist_state_journal(state_path, journal, journal_snap.take())
+                .map(|snap| *journal_snap = Some(snap))
+            {
+                summary.failed += 1;
+                let msg = format!(
+                    "output was committed to {path_str}, but post-commit state journal update at {} failed: {err}",
+                    state_path.display()
+                );
+                eprintln!("failed {path_str}: {msg}");
+                report_files.push(BatchReportFileEntry {
+                    path: path_str,
+                    status: "failed".to_string(),
+                    opened_with: Some(opened_with),
+                    stanzas_before: Some(stanzas_before),
+                    stanzas_after: Some(stanzas_after),
+                    delta: report_delta,
+                    mode_before,
+                    mode_after: mode_after_planned,
+                    backup: backup_path_str,
+                    sha256_before: Some(current_sha256),
+                    sha256_after: Some(new_sha256),
+                    error: Some(msg),
+                });
+                if args.fail_fast {
+                    break;
+                }
+                continue;
+            }
+        }
+
+        #[cfg(test)]
+        {
+            commits_completed += 1;
+        }
+        summary.rekeyed += 1;
+        emit_blob_delta_notice(&delta_notice);
+        eprintln!("rekeyed {path_str} (opened_with: {opened_with})");
+        report_files.push(BatchReportFileEntry {
+            path: path_str,
+            status: "rekeyed".to_string(),
+            opened_with: Some(opened_with),
+            stanzas_before: Some(stanzas_before),
+            stanzas_after: Some(stanzas_after),
+            delta: report_delta,
+            mode_before,
+            mode_after: mode_after_planned,
+            backup: backup_path_str,
+            sha256_before: Some(current_sha256),
+            sha256_after: Some(new_sha256),
+            error: None,
+        });
+    }
+
+    // `--write-recipients` is written once, ONLY if every selected file ended
+    // `rekeyed` or `already-done` (and at least one file was selected).
+    let all_selected_rekeyed_or_done = !selected_paths.is_empty()
+        && report_files.len() == selected_paths.len()
+        && report_files
+            .iter()
+            .all(|f| f.status == "rekeyed" || f.status == "already-done");
+
+    if args.apply {
+        if all_selected_rekeyed_or_done {
+            if let Some(plan) = recipient_refresh.as_ref() {
+                let batch_label = Path::new("<blob-rekey-batch>");
+                commit_recipient_refresh(Some(plan), batch_label)?;
+                emit_recipient_refresh_notice(Some(plan));
+            }
+        } else if recipient_refresh.is_some() {
+            eprintln!(
+                "warning: skipping --write-recipients because not all selected files ended rekeyed or already-done"
+            );
+        }
+    }
+
+    let mode_str = if args.apply { "apply" } else { "plan" };
+    eprintln!(
+        "blob rekey-batch ({mode_str}): selected={} affected={} rekeyed={} already_done={} not_openable={} skipped={} failed={}",
+        summary.selected,
+        summary.affected,
+        summary.rekeyed,
+        summary.already_done,
+        summary.not_openable,
+        summary.skipped,
+        summary.failed
+    );
+
+    let report = BatchReport {
+        version: 1,
+        mode: mode_str.to_string(),
+        target_recipients: target_strings,
+        files: report_files,
+        summary,
+    };
+
+    let any_prior_mismatch = report.files.iter().any(|f| f.status == "prior-mismatch");
+    let has_failures = if args.apply {
+        report.summary.failed > 0 || any_prior_mismatch
+    } else {
+        report.summary.failed > 0
+    };
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        for f in &report.files {
+            if (args.apply && (f.status == "rekeyed" || f.status == "already-done"))
+                || (!args.apply && f.status == "affected")
+            {
+                println!("{}", f.path);
+            }
+        }
+    }
+
+    if has_failures {
+        return Err(CliError::CommandFailed(1));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3654,5 +5267,642 @@ mod tests {
                 .to_string()
                 .contains("seclusor secrets rekey"));
         }
+    }
+
+    fn validate_batch_report_against_schema(report: &BatchReport) {
+        let schema: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../schemas/seclusor/v1.1.0/blob-rekey-batch.schema.json"
+        ))
+        .expect("schema json must parse");
+        assert_eq!(schema["$id"], "seclusor/v1.1.0/blob-rekey-batch");
+
+        let val = serde_json::to_value(report).expect("serialize report");
+        let obj = val.as_object().expect("report must be object");
+        let req = schema["required"]
+            .as_array()
+            .expect("required array")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect::<Vec<_>>();
+        for k in &req {
+            assert!(obj.contains_key(*k), "missing required top-level key {k}");
+        }
+        assert_eq!(obj.len(), req.len(), "no extra top-level keys allowed");
+        assert_eq!(val["version"], 1);
+        assert!(val["mode"] == "plan" || val["mode"] == "apply");
+        let tr = val["target_recipients"]
+            .as_array()
+            .expect("target_recipients array");
+        assert!(!tr.is_empty());
+        for r in tr {
+            assert!(r.as_str().unwrap().starts_with("age1"));
+        }
+
+        let allowed_statuses: Vec<&str> = schema["$defs"]["file_entry"]["properties"]["status"]
+            ["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        let entry_req: Vec<&str> = schema["$defs"]["file_entry"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+
+        for item in val["files"].as_array().expect("files array") {
+            let item_obj = item.as_object().expect("file_entry object");
+            for k in &entry_req {
+                assert!(item_obj.contains_key(*k), "missing file_entry key {k}");
+            }
+            assert_eq!(item_obj.len(), entry_req.len());
+            let st = item["status"].as_str().expect("status string");
+            assert!(
+                allowed_statuses.contains(&st),
+                "unexpected status {st:?} not in schema enum"
+            );
+            if let Some(s) = item["sha256_before"].as_str() {
+                assert_eq!(s.len(), 64);
+                assert!(s.chars().all(|c| c.is_ascii_hexdigit()));
+            }
+            if let Some(s) = item["sha256_after"].as_str() {
+                assert_eq!(s.len(), 64);
+                assert!(s.chars().all(|c| c.is_ascii_hexdigit()));
+            }
+        }
+
+        let sum_req: Vec<&str> = schema["$defs"]["summary"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        let sum_obj = val["summary"].as_object().expect("summary object");
+        for k in &sum_req {
+            assert!(sum_obj.contains_key(*k), "missing summary key {k}");
+            assert!(sum_obj[*k].is_u64(), "summary.{k} must be non-negative int");
+        }
+        assert_eq!(sum_obj.len(), sum_req.len());
+    }
+
+    #[test]
+    fn blob_rekey_batch_plan_classifies_mixed_directory_and_skips_hidden_temps_and_symlinks() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (old_id_path, old_r) = blob_fixture_identity_and_recipient(dir.path());
+        let other_id_path = dir.path().join("other-identity.txt");
+        let other_gen = seclusor_keyring::generate_identity_file(&other_id_path).expect("gen");
+        let other_r: seclusor_crypto::Recipient = other_gen.recipient.parse().expect("parse");
+        let new_id_path = dir.path().join("new-identity.txt");
+        let new_gen = seclusor_keyring::generate_identity_file(&new_id_path).expect("gen new");
+
+        let packs_dir = dir.path().join("packs");
+        fs::create_dir_all(&packs_dir).expect("mkdir packs");
+
+        // 1. Affected blob (openable by old_id).
+        let affected_path = packs_dir.join("01-affected.age");
+        let affected_ct =
+            seclusor_crypto::encrypt(BLOB_REKEY_SENTINEL.as_bytes(), std::slice::from_ref(&old_r))
+                .expect("enc affected");
+        fs::write(&affected_path, &affected_ct).expect("write affected");
+
+        // 2. Not-openable blob (encrypted only to other_r).
+        let not_openable_path = packs_dir.join("02-not-openable.age");
+        let not_openable_ct =
+            seclusor_crypto::encrypt(b"other-payload", std::slice::from_ref(&other_r))
+                .expect("enc other");
+        fs::write(&not_openable_path, &not_openable_ct).expect("write not-openable");
+
+        // 3. Scrypt blob.
+        let scrypt_path = packs_dir.join("03-scrypt.age");
+        let scrypt_ct = seclusor_crypto::encrypt_with_passphrase(b"scrypt-payload", "test-pass")
+            .expect("scrypt");
+        fs::write(&scrypt_path, &scrypt_ct).expect("write scrypt");
+
+        // 4. Bundle secrets document (.age).
+        let bundle_doc_path = packs_dir.join("04-bundle-doc.age");
+        seclusor_codec::encrypt_bundle_to_file(
+            &fixture_secrets(),
+            std::slice::from_ref(&old_r),
+            &bundle_doc_path,
+        )
+        .expect("write bundle doc");
+
+        // 5. Not-age file with .age suffix.
+        let not_age_path = packs_dir.join("05-not-age.age");
+        fs::write(&not_age_path, b"plain text not age").expect("write not-age");
+
+        // 6. Hidden file, .seclusor-* temp file, and .bak-* file (all must be skipped).
+        fs::write(packs_dir.join(".hidden.age"), &affected_ct).expect("write hidden");
+        fs::write(packs_dir.join(".seclusor-tmp123.age"), &affected_ct).expect("write temp");
+        fs::write(
+            packs_dir.join("01-affected.age.bak-20261008T143000Z"),
+            &affected_ct,
+        )
+        .expect("write bak");
+
+        // 7. Nested directory (must be ignored without --recursive).
+        let nested_dir = packs_dir.join("nested");
+        fs::create_dir_all(&nested_dir).expect("mkdir nested");
+        fs::write(nested_dir.join("nested-pack.age"), &affected_ct).expect("write nested");
+
+        // 8. Symlink inside packs_dir (must be skipped).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink(&affected_path, packs_dir.join("99-symlink.age")).expect("symlink");
+        }
+
+        // Run plan mode via handle_blob_rekey_batch_with_policy (default apply=false).
+        handle_blob_rekey_batch_with_policy(
+            BlobRekeyBatchArgs {
+                files: vec![],
+                dir: Some(packs_dir.clone()),
+                glob: "*.age".to_string(),
+                recursive: false,
+                apply: false,
+                state: None,
+                backup: false,
+                fail_fast: false,
+                json: true,
+                write_recipients: None,
+                allow_self_lockout: false,
+                allow_large: false,
+                recipients: RecipientArgs {
+                    recipients: vec![new_gen.recipient.clone()],
+                    recipient_files: vec![],
+                    recipient_env_var: None,
+                },
+                prior_recipients: PriorRecipientArgs::default(),
+                identities: IdentityArgs {
+                    identity_files: vec![old_id_path.clone()],
+                    identity_public_key: None,
+                },
+                verify_identities: VerifyIdentityArgs {
+                    verify_identity_files: vec![new_id_path.clone()],
+                    verify_identity_public_key: None,
+                },
+                passphrase: PassphraseArgs::default(),
+            },
+            true,
+        )
+        .expect("plan mode must exit 0");
+
+        // Plan mode writes nothing: affected_path must still have its original bytes.
+        assert_eq!(fs::read(&affected_path).unwrap(), affected_ct);
+        assert_no_blob_sentinel_in_dir(&packs_dir);
+    }
+
+    #[test]
+    fn blob_rekey_batch_apply_partial_failure_journal_resume_and_backup() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (old_id_path, old_r) = blob_fixture_identity_and_recipient(dir.path());
+        let other_id_path = dir.path().join("other-identity.txt");
+        let other_gen = seclusor_keyring::generate_identity_file(&other_id_path).expect("gen");
+        let other_r: seclusor_crypto::Recipient = other_gen.recipient.parse().expect("parse");
+        let new_id_path = dir.path().join("new-identity.txt");
+        let new_gen = seclusor_keyring::generate_identity_file(&new_id_path).expect("gen new");
+
+        let packs_dir = dir.path().join("packs");
+        fs::create_dir_all(&packs_dir).expect("mkdir packs");
+
+        let blob1 = packs_dir.join("a.age");
+        let blob2 = packs_dir.join("b.age");
+        let blob_other = packs_dir.join("c-other.age");
+        let ct1 = seclusor_crypto::encrypt(b"payload-a", std::slice::from_ref(&old_r)).unwrap();
+        let ct2 = seclusor_crypto::encrypt(b"payload-b", std::slice::from_ref(&old_r)).unwrap();
+        let ct_other =
+            seclusor_crypto::encrypt(b"payload-other", std::slice::from_ref(&other_r)).unwrap();
+        fs::write(&blob1, &ct1).unwrap();
+        fs::write(&blob2, &ct2).unwrap();
+        fs::write(&blob_other, &ct_other).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&blob1, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        let state_path = dir.path().join("rekey-state.json");
+        let recipients_out = dir.path().join("recipients-out.txt");
+
+        // T15: Inject failure after 1 commit: blob1 commits, blob2 fails, exit 1,
+        // --write-recipients is NOT written, and state journal is 0600.
+        set_batch_fail_after_commits(Some(1));
+        let err_partial = handle_blob_rekey_batch_with_policy(
+            BlobRekeyBatchArgs {
+                files: vec![blob1.clone(), blob2.clone()],
+                dir: None,
+                glob: "*.age".to_string(),
+                recursive: false,
+                apply: true,
+                state: Some(state_path.clone()),
+                backup: true,
+                fail_fast: false,
+                json: true,
+                write_recipients: Some(recipients_out.clone()),
+                allow_self_lockout: false,
+                allow_large: false,
+                recipients: RecipientArgs {
+                    recipients: vec![new_gen.recipient.clone()],
+                    recipient_files: vec![],
+                    recipient_env_var: None,
+                },
+                prior_recipients: PriorRecipientArgs {
+                    prior_recipients: vec![old_r.to_string()],
+                    prior_recipient_files: vec![],
+                },
+                identities: IdentityArgs {
+                    identity_files: vec![old_id_path.clone()],
+                    identity_public_key: None,
+                },
+                verify_identities: VerifyIdentityArgs {
+                    verify_identity_files: vec![new_id_path.clone()],
+                    verify_identity_public_key: None,
+                },
+                passphrase: PassphraseArgs::default(),
+            },
+            true,
+        )
+        .expect_err("partial failure in apply mode must return CommandFailed(1)");
+        set_batch_fail_after_commits(None);
+        assert!(matches!(err_partial, CliError::CommandFailed(1)));
+        assert!(
+            !recipients_out.exists(),
+            "--write-recipients must not be written when any file failed"
+        );
+        assert!(state_path.exists(), "state journal must be created");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&state_path).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "state journal must be 0600"
+            );
+            assert_eq!(
+                fs::metadata(&blob1).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "blob1 must be tightened from 0644 to 0600"
+            );
+        }
+
+        // T17: Check that a .bak-<UTC>Z file was created for blob1 with 0600 permissions and original bytes.
+        let bak_files: Vec<PathBuf> = fs::read_dir(&packs_dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("a.age.bak-")
+            })
+            .collect();
+        assert_eq!(bak_files.len(), 1, "expected one backup file for a.age");
+        let bak_name = bak_files[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(bak_name.ends_with('Z') && !bak_name.contains(':'));
+        assert_eq!(fs::read(&bak_files[0]).unwrap(), ct1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&bak_files[0]).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        // T16: Re-run with simulated crash between blob2's replacement and post-commit journal update!
+        // On this run, blob1 is already-done via sha256_after, and blob2 is replaced on disk while its
+        // journal record is still `in_progress`.
+        set_batch_abort_after_planned_journal(true);
+        let _ = handle_blob_rekey_batch_with_policy(
+            BlobRekeyBatchArgs {
+                files: vec![blob1.clone(), blob2.clone()],
+                dir: None,
+                glob: "*.age".to_string(),
+                recursive: false,
+                apply: true,
+                state: Some(state_path.clone()),
+                backup: false,
+                fail_fast: false,
+                json: false,
+                write_recipients: Some(recipients_out.clone()),
+                allow_self_lockout: false,
+                allow_large: false,
+                recipients: RecipientArgs {
+                    recipients: vec![new_gen.recipient.clone()],
+                    recipient_files: vec![],
+                    recipient_env_var: None,
+                },
+                prior_recipients: PriorRecipientArgs {
+                    prior_recipients: vec![old_r.to_string()],
+                    prior_recipient_files: vec![],
+                },
+                identities: IdentityArgs {
+                    identity_files: vec![old_id_path.clone()],
+                    identity_public_key: None,
+                },
+                verify_identities: VerifyIdentityArgs {
+                    verify_identity_files: vec![new_id_path.clone()],
+                    verify_identity_public_key: None,
+                },
+                passphrase: PassphraseArgs::default(),
+            },
+            true,
+        )
+        .expect_err("simulated crash after replacement must abort");
+        set_batch_abort_after_planned_journal(false);
+
+        // Now resume on [blob1, blob2]: both match `sha256_after` in the journal (blob2 was `in_progress`),
+        // so both are recognized as `already-done` and `--write-recipients` is now written!
+        handle_blob_rekey_batch_with_policy(
+            BlobRekeyBatchArgs {
+                files: vec![blob1.clone(), blob2.clone()],
+                dir: None,
+                glob: "*.age".to_string(),
+                recursive: false,
+                apply: true,
+                state: Some(state_path.clone()),
+                backup: false,
+                fail_fast: false,
+                json: true,
+                write_recipients: Some(recipients_out.clone()),
+                allow_self_lockout: false,
+                allow_large: false,
+                recipients: RecipientArgs {
+                    recipients: vec![new_gen.recipient.clone()],
+                    recipient_files: vec![],
+                    recipient_env_var: None,
+                },
+                prior_recipients: PriorRecipientArgs {
+                    prior_recipients: vec![old_r.to_string()],
+                    prior_recipient_files: vec![],
+                },
+                identities: IdentityArgs {
+                    identity_files: vec![old_id_path.clone()],
+                    identity_public_key: None,
+                },
+                verify_identities: VerifyIdentityArgs {
+                    verify_identity_files: vec![new_id_path.clone()],
+                    verify_identity_public_key: None,
+                },
+                passphrase: PassphraseArgs::default(),
+            },
+            true,
+        )
+        .expect("resume when all files match sha256_after must succeed");
+        assert!(
+            recipients_out.exists(),
+            "--write-recipients must be written once all selected files are rekeyed or already-done"
+        );
+
+        // Also verify that `blob_other` (which is `not-openable` and not in journal) is NEVER
+        // mislabeled `already-done` and causes `--write-recipients` to be skipped.
+        let recipients_out_2 = dir.path().join("recipients-out-2.txt");
+        handle_blob_rekey_batch_with_policy(
+            BlobRekeyBatchArgs {
+                files: vec![blob1.clone(), blob2.clone(), blob_other.clone()],
+                dir: None,
+                glob: "*.age".to_string(),
+                recursive: false,
+                apply: true,
+                state: Some(state_path.clone()),
+                backup: false,
+                fail_fast: false,
+                json: true,
+                write_recipients: Some(recipients_out_2.clone()),
+                allow_self_lockout: false,
+                allow_large: false,
+                recipients: RecipientArgs {
+                    recipients: vec![new_gen.recipient.clone()],
+                    recipient_files: vec![],
+                    recipient_env_var: None,
+                },
+                prior_recipients: PriorRecipientArgs {
+                    prior_recipients: vec![old_r.to_string()],
+                    prior_recipient_files: vec![],
+                },
+                identities: IdentityArgs {
+                    identity_files: vec![old_id_path],
+                    identity_public_key: None,
+                },
+                verify_identities: VerifyIdentityArgs {
+                    verify_identity_files: vec![new_id_path],
+                    verify_identity_public_key: None,
+                },
+                passphrase: PassphraseArgs::default(),
+            },
+            true,
+        )
+        .expect("not-openable is skipped (exit 0), not failed");
+        assert!(
+            !recipients_out_2.exists(),
+            "--write-recipients must not be written when a selected file was not-openable"
+        );
+    }
+
+    #[test]
+    fn blob_rekey_batch_schema_validates_plan_and_apply_reports() {
+        let report_plan = BatchReport {
+            version: 1,
+            mode: "plan".to_string(),
+            target_recipients: vec![
+                "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p".to_string(),
+            ],
+            files: vec![
+                BatchReportFileEntry {
+                    path: "/tmp/a.age".to_string(),
+                    status: "affected".to_string(),
+                    opened_with: Some(
+                        "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p"
+                            .to_string(),
+                    ),
+                    stanzas_before: Some(2),
+                    stanzas_after: Some(1),
+                    delta: Some(BatchReportDelta {
+                        added: vec![],
+                        removed: vec![
+                            "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p"
+                                .to_string(),
+                        ],
+                    }),
+                    mode_before: Some("0644".to_string()),
+                    mode_after: Some("0600".to_string()),
+                    backup: None,
+                    sha256_before: Some("a".repeat(64)),
+                    sha256_after: Some("b".repeat(64)),
+                    error: None,
+                },
+                BatchReportFileEntry {
+                    path: "/tmp/b.age".to_string(),
+                    status: "not-openable".to_string(),
+                    opened_with: None,
+                    stanzas_before: Some(1),
+                    stanzas_after: None,
+                    delta: None,
+                    mode_before: Some("0600".to_string()),
+                    mode_after: None,
+                    backup: None,
+                    sha256_before: Some("c".repeat(64)),
+                    sha256_after: None,
+                    error: None,
+                },
+            ],
+            summary: BatchReportSummary {
+                selected: 2,
+                affected: 1,
+                rekeyed: 0,
+                already_done: 0,
+                not_openable: 1,
+                skipped: 1,
+                failed: 0,
+            },
+        };
+        validate_batch_report_against_schema(&report_plan);
+
+        // Also exercise handle_blob_rekey_batch directly (default allow_recipient_mismatch=false).
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (id_path, r) = blob_fixture_identity_and_recipient(dir.path());
+        let blob_path = dir.path().join("single.age");
+        fs::write(
+            &blob_path,
+            seclusor_crypto::encrypt(b"data", std::slice::from_ref(&r)).unwrap(),
+        )
+        .unwrap();
+        handle_blob_rekey_batch(BlobRekeyBatchArgs {
+            files: vec![blob_path.clone()],
+            dir: None,
+            glob: "*.age".to_string(),
+            recursive: false,
+            apply: false,
+            state: None,
+            backup: false,
+            fail_fast: false,
+            json: true,
+            write_recipients: None,
+            allow_self_lockout: false,
+            allow_large: false,
+            recipients: RecipientArgs {
+                recipients: vec![r.to_string()],
+                recipient_files: vec![],
+                recipient_env_var: None,
+            },
+            prior_recipients: PriorRecipientArgs {
+                prior_recipients: vec![r.to_string()],
+                prior_recipient_files: vec![],
+            },
+            identities: IdentityArgs {
+                identity_files: vec![id_path.clone()],
+                identity_public_key: None,
+            },
+            verify_identities: VerifyIdentityArgs::default(),
+            passphrase: PassphraseArgs::default(),
+        })
+        .expect("handle_blob_rekey_batch with matching prior set must succeed");
+
+        // Reject hardlinked inputs in batch selection.
+        let hardlink_path = dir.path().join("single-hardlink.age");
+        fs::hard_link(&blob_path, &hardlink_path).expect("create hardlink");
+        let err_hardlink = handle_blob_rekey_batch(BlobRekeyBatchArgs {
+            files: vec![blob_path.clone(), hardlink_path],
+            dir: None,
+            glob: "*.age".to_string(),
+            recursive: false,
+            apply: false,
+            state: None,
+            backup: false,
+            fail_fast: false,
+            json: false,
+            write_recipients: None,
+            allow_self_lockout: false,
+            allow_large: false,
+            recipients: RecipientArgs {
+                recipients: vec![r.to_string()],
+                recipient_files: vec![],
+                recipient_env_var: None,
+            },
+            prior_recipients: PriorRecipientArgs {
+                prior_recipients: vec![r.to_string()],
+                prior_recipient_files: vec![],
+            },
+            identities: IdentityArgs {
+                identity_files: vec![id_path.clone()],
+                identity_public_key: None,
+            },
+            verify_identities: VerifyIdentityArgs::default(),
+            passphrase: PassphraseArgs::default(),
+        })
+        .expect_err("hardlinked batch inputs must be rejected");
+        assert!(err_hardlink.to_string().contains("hardlink"));
+
+        // Reject malformed --state journal where sha256_before == sha256_after.
+        let bad_state_path = dir.path().join("bad-state.json");
+        let canon_blob_str = fs::canonicalize(&blob_path).unwrap().display().to_string();
+        let bad_journal = serde_json::json!({
+            "schema": STATE_JOURNAL_SCHEMA,
+            "operation": "blob-rekey-batch",
+            "target_recipients": [r.to_string()],
+            "prior_recipients": [r.to_string()],
+            "allow_recipient_mismatch": false,
+            "allow_self_lockout": false,
+            "allow_large": false,
+            "records": {
+                canon_blob_str.clone(): {
+                    "path": canon_blob_str,
+                    "sha256_before": "a".repeat(64),
+                    "sha256_after": "a".repeat(64),
+                    "status": "in_progress",
+                    "ts": "20261116T000000Z",
+                    "opened_with": r.to_string(),
+                    "stanzas_before": 1,
+                    "stanzas_after": 1,
+                    "delta": { "added": [], "removed": [] },
+                    "mode_before": "0600",
+                    "mode_after": "0600",
+                    "backup": null
+                }
+            }
+        });
+        atomic_write_private_ciphertext(
+            &bad_state_path,
+            serde_json::to_vec_pretty(&bad_journal).unwrap().as_slice(),
+            None,
+        )
+        .unwrap();
+        let err_bad_state = handle_blob_rekey_batch(BlobRekeyBatchArgs {
+            files: vec![blob_path],
+            dir: None,
+            glob: "*.age".to_string(),
+            recursive: false,
+            apply: false,
+            state: Some(bad_state_path),
+            backup: false,
+            fail_fast: false,
+            json: false,
+            write_recipients: None,
+            allow_self_lockout: false,
+            allow_large: false,
+            recipients: RecipientArgs {
+                recipients: vec![r.to_string()],
+                recipient_files: vec![],
+                recipient_env_var: None,
+            },
+            prior_recipients: PriorRecipientArgs {
+                prior_recipients: vec![r.to_string()],
+                prior_recipient_files: vec![],
+            },
+            identities: IdentityArgs {
+                identity_files: vec![id_path],
+                identity_public_key: None,
+            },
+            verify_identities: VerifyIdentityArgs::default(),
+            passphrase: PassphraseArgs::default(),
+        })
+        .expect_err("journal record with sha256_before == sha256_after must be rejected");
+        assert!(err_bad_state.to_string().contains("malformed record"));
     }
 }

@@ -90,11 +90,52 @@ seclusor secrets blob rekey \
   already decrypt historical ciphertext copies; rotate the underlying secret
   values or credentials inside the blob at their provider as well.
 - **Memory residual**: Decrypted plaintext is held in zeroizing process memory
-  buffers during `blob rekey` and `blob verify` (not `mlock`ed against OS swap
-  or core dumps; upstream `age` `StreamWriter` holds an internal 64 KiB chunk
-  buffer in heap memory during encryption; and JSON bundle-refusal probing can
-  leave `serde_json` string-unescape scratch in freed heap memory if an input
-  contains JSON escape sequences).
+  buffers during `blob rekey`, `blob rekey-batch`, and `blob verify` (not
+  `mlock`ed against OS swap or core dumps; upstream `age` `StreamWriter` holds
+  an internal 64 KiB chunk buffer in heap memory during encryption; and JSON
+  bundle-refusal probing can leave `serde_json` string-unescape scratch in freed
+  heap memory if an input contains JSON escape sequences).
+
+## 6. Batch rotation across multiple blobs (`blob rekey-batch`)
+
+When rotating recipients across a directory of `.age` blobs, use
+`blob rekey-batch` so a passphrase-protected identity is unlocked once for the
+entire batch. Plan mode is the default and writes nothing:
+
+```bash
+# 1. Plan (read-only; inspect affected vs skipped files):
+seclusor secrets blob rekey-batch \
+  --dir ./packs --glob '*.age' \
+  --identity-file ~/.config/seclusor/old-identity.txt \
+  --prior-recipient-file ~/.config/seclusor/old-recipients.txt \
+  --recipient-file ~/.config/seclusor/new-recipients.txt \
+  --verify-identity-file ~/.config/seclusor/new-identity.txt \
+  --allow-recipient-mismatch --json
+
+# 2. Apply with a two-phase 0600 resume journal:
+seclusor secrets blob rekey-batch \
+  --dir ./packs --glob '*.age' --apply \
+  --state ./rekey-state.json \
+  --identity-file ~/.config/seclusor/old-identity.txt \
+  --prior-recipient-file ~/.config/seclusor/old-recipients.txt \
+  --recipient-file ~/.config/seclusor/new-recipients.txt \
+  --verify-identity-file ~/.config/seclusor/new-identity.txt \
+  --write-recipients ~/.config/seclusor/new-recipients.txt \
+  --allow-recipient-mismatch --json
+```
+
+- **Selection**: Pass explicit `FILE...` paths and/or `--dir <DIR>` with
+  `--glob <PATTERN>` (default `*.age`). Subdirectories are ignored unless
+  `--recursive` is set. Symlinks, hidden files, `.seclusor-*` temp files, and
+  `.bak-*` backup files are skipped.
+- **Two-phase state journal (`--state`)**: Written as a private `0600` file
+  recording `sha256_before` and `sha256_after` before each replacement and
+  updating to `rekeyed` after commit. Re-running with `--state` marks files
+  matching `sha256_after` as `already-done` without mislabeling `not-openable`
+  files.
+- **Backups (`--backup`)**: Opt-in `.bak-<UTC>Z` (`0600`) copy before replacement.
+  Backups retain the prior ciphertext and remain readable by prior identities;
+  delete them once the batch is verified.
 
 ## Size limits
 
