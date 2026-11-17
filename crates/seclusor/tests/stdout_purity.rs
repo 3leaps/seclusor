@@ -827,4 +827,71 @@ fn blob_rekey_batch_json_stdout_purity_schema_and_single_passphrase_unlock() {
         fs::read_to_string(&recipients_out).unwrap(),
         format!("{new_recipient}\n")
     );
+
+    // If `--write-recipients` fails at commit time (e.g. concurrent modification of
+    // the recipient file while batch runs, simulated by re-running when both blobs
+    // are `already-done` via journal and replacing `recipients_out` with a directory
+    // only if... or we test concurrent modification / read-only parent directory on
+    // resume), `--json` must STILL emit a valid JSON report on stdout before exiting 1.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Demote one record in the state journal back to `in_progress` (re-computing
+        // valid HMAC via a read-only state directory so journal promotion fails on resume!)
+        let state_ro_dir = dir.path().join("state-ro");
+        fs::create_dir(&state_ro_dir).unwrap();
+        let ro_state_file = state_ro_dir.join("state.json");
+        fs::copy(&state_file, &ro_state_file).unwrap();
+        fs::set_permissions(&ro_state_file, fs::Permissions::from_mode(0o600)).unwrap();
+
+        // Also test `--write-recipients` commit failure after batch processing:
+        // make a recipient directory where we remove write permission on a sibling or
+        // lock the recipient file with an exclusive flock during batch execution so
+        // `prepare_batch_recipient_refresh` succeeds (read-only open) and
+        // `commit_batch_recipient_refresh` fails with ConcurrentModification!
+        let locked_rcpt = dir.path().join("locked-recipients.txt");
+        fs::write(&locked_rcpt, format!("{old_recipient}\n")).unwrap();
+        let lock_holder = fs::File::open(&locked_rcpt).unwrap();
+        unsafe {
+            use std::os::fd::AsRawFd;
+            assert_eq!(
+                libc::flock(lock_holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB),
+                0
+            );
+        }
+
+        let refresh_fail_out = run_seclusor(&[
+            "secrets",
+            "--allow-recipient-mismatch",
+            "blob",
+            "rekey-batch",
+            blob1.to_str().unwrap(),
+            blob2.to_str().unwrap(),
+            "--apply",
+            "--json",
+            "--state",
+            state_file.to_str().unwrap(),
+            "--write-recipients",
+            locked_rcpt.to_str().unwrap(),
+            "--identity-file",
+            new_id.to_str().unwrap(),
+            "--recipient",
+            &new_recipient,
+            "--prior-recipient",
+            &old_recipient,
+            "--verify-identity-file",
+            new_id.to_str().unwrap(),
+        ]);
+        drop(lock_holder);
+        assert!(
+            !refresh_fail_out.status.success(),
+            "recipient refresh lock contention must exit non-zero"
+        );
+        let rf_stdout = String::from_utf8(refresh_fail_out.stdout).expect("utf8 stdout");
+        let rf_parsed: serde_json::Value = serde_json::from_str(&rf_stdout)
+            .expect("stdout must still contain valid JSON report when --write-recipients fails");
+        assert_eq!(rf_parsed["version"], 1);
+        assert_eq!(rf_parsed["mode"], "apply");
+        assert_eq!(rf_parsed["summary"]["already_done"], 2);
+    }
 }

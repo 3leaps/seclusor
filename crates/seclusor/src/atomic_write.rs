@@ -254,6 +254,31 @@ fn atomic_write_with_permissions(
     }
 
     commit_replace(temp, path, options.create_new, expected_slice.is_some())?;
+    #[cfg(unix)]
+    if prior_snapshot.is_some() {
+        if let Some(ref guard) = _cas_guard {
+            use std::os::unix::fs::MetadataExt;
+            let displaced_meta =
+                guard
+                    .file
+                    .metadata()
+                    .map_err(|err| CliError::PostCommitFailure {
+                        path: path.display().to_string(),
+                        step: "displaced ciphertext link count check",
+                        source: Box::new(CliError::Io(err)),
+                    })?;
+            if displaced_meta.nlink() != 0 {
+                return Err(CliError::PostCommitFailure {
+                    path: path.display().to_string(),
+                    step: "displaced ciphertext link count verification",
+                    source: Box::new(CliError::Message(
+                        "displaced ciphertext inode retained unexpected hardlink after replacement"
+                            .to_string(),
+                    )),
+                });
+            }
+        }
+    }
     drop(_cas_guard);
 
     if let Some((old_mode, new_mode)) = tightened_mode {
@@ -332,6 +357,7 @@ fn apply_target_permissions(
                     let (expected_dev, expected_ino, old_mode) = snapshot.identity;
                     if meta.dev() != expected_dev
                         || meta.ino() != expected_ino
+                        || meta.nlink() != 1
                         || (meta.permissions().mode() & 0o777) != old_mode
                     {
                         return Err(CliError::ConcurrentModification {
@@ -760,8 +786,17 @@ fn verify_and_lock_expected_target(
     if let Some((expected_dev, expected_ino, expected_mode)) = expected_prior_identity {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let refreshed_meta = file.metadata().map_err(CliError::Io)?;
+        let path_meta = match fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(CliError::Io(err)),
+        };
         if refreshed_meta.dev() != expected_dev
             || refreshed_meta.ino() != expected_ino
+            || refreshed_meta.nlink() != 1
+            || path_meta.dev() != expected_dev
+            || path_meta.ino() != expected_ino
+            || path_meta.nlink() != 1
             || (refreshed_meta.permissions().mode() & 0o777) != expected_mode
         {
             return Ok(None);
@@ -1452,6 +1487,31 @@ mod tests {
                 entry.path().display()
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_ciphertext_cas_refuses_hardlink_created_after_snapshot() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        inject_fault(None);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("blob.age");
+        fs::write(&path, b"v1").expect("seed");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod 0600");
+        let meta = fs::symlink_metadata(&path).expect("meta");
+        let snapshot = PrivateCiphertextPriorSnapshot {
+            bytes: Zeroizing::new(b"v1".to_vec()),
+            identity: (meta.dev(), meta.ino(), meta.permissions().mode() & 0o777),
+        };
+
+        let hardlink = dir.path().join("blob-extra-link.age");
+        fs::hard_link(&path, &hardlink).expect("create hardlink after snapshot");
+
+        let err = atomic_write_private_ciphertext(&path, b"v2", Some(snapshot))
+            .expect_err("hardlink created after snapshot must be refused by CAS");
+        assert!(matches!(err, CliError::ConcurrentModification { .. }));
+        assert_eq!(fs::read(&path).expect("unchanged"), b"v1");
     }
 
     /// Native Windows behavior: `ReplaceFileW`, CAS, no-clobber, DACL posture.
