@@ -358,27 +358,54 @@ pub(crate) fn handle_blob_decrypt(args: BlobDecryptArgs) -> CliResult<()> {
     Ok(())
 }
 
-/// Read an existing blob for in-place `blob rekey` (with CAS snapshot identity)
-/// or `blob verify`, enforcing soft/hard size limits without `Vec` growth.
-fn read_blob_input_for_rekey(
+#[derive(Debug)]
+enum BlobReadForRekeyError {
+    TooLarge(String),
+    Other(CliError),
+}
+
+impl From<BlobReadForRekeyError> for CliError {
+    fn from(err: BlobReadForRekeyError) -> Self {
+        match err {
+            BlobReadForRekeyError::TooLarge(msg) => CliError::Message(msg),
+            BlobReadForRekeyError::Other(e) => e,
+        }
+    }
+}
+
+/// Read an existing blob for in-place `blob rekey` / `blob rekey-batch` (with
+/// cross-platform `(dev, ino)` / `(volume_serial, file_index)` identity and
+/// `nlink == 1` verification) or `blob verify`, enforcing soft/hard size limits
+/// without `Vec` growth and distinguishing size-limit refusals by type.
+fn read_blob_input_for_rekey_with_id(
     path: &Path,
     soft_limit: Option<u64>,
     hard_limit: u64,
     in_place: bool,
-) -> CliResult<PrivateCiphertextPriorSnapshot> {
+) -> std::result::Result<(PrivateCiphertextPriorSnapshot, (u64, u64)), BlobReadForRekeyError> {
     if in_place {
-        let meta = fs::symlink_metadata(path).map_err(CliError::Io)?;
+        let meta = fs::symlink_metadata(path)
+            .map_err(|e| BlobReadForRekeyError::Other(CliError::Io(e)))?;
         if is_symlink_or_reparse_point(&meta) {
-            return Err(CliError::Message(format!(
+            return Err(BlobReadForRekeyError::Other(CliError::Message(format!(
                 "refusing to overwrite symlink input path {} in place",
                 path.display()
-            )));
+            ))));
         }
         if !meta.is_file() {
-            return Err(CliError::Message(format!(
+            return Err(BlobReadForRekeyError::Other(CliError::Message(format!(
                 "input path {} must be a regular file",
                 path.display()
-            )));
+            ))));
+        }
+        let (pre_id, pre_nlink) = path_identity_and_nlink_nofollow(path)
+            .map_err(|e| BlobReadForRekeyError::Other(CliError::Io(e)))?;
+        if pre_nlink != 1 {
+            return Err(BlobReadForRekeyError::Other(CliError::Message(format!(
+                "refusing in-place rekey of hardlinked input path {} (nlink = {pre_nlink}); \
+                 remove extra hardlinks before rekeying in place",
+                path.display()
+            ))));
         }
 
         let mut options = fs::OpenOptions::new();
@@ -398,56 +425,57 @@ fn read_blob_input_for_rekey(
             Ok(file) => file,
             #[cfg(unix)]
             Err(err) if err.raw_os_error() == Some(libc::ELOOP) => {
-                return Err(CliError::Message(format!(
+                return Err(BlobReadForRekeyError::Other(CliError::Message(format!(
                     "refusing to overwrite symlink input path {} in place",
                     path.display()
-                )));
+                ))));
             }
-            Err(err) => return Err(CliError::Io(err)),
+            Err(err) => return Err(BlobReadForRekeyError::Other(CliError::Io(err))),
         };
-        let open_meta = file.metadata().map_err(CliError::Io)?;
+        let open_meta = file
+            .metadata()
+            .map_err(|e| BlobReadForRekeyError::Other(CliError::Io(e)))?;
         if is_symlink_or_reparse_point(&open_meta) {
-            return Err(CliError::Message(format!(
+            return Err(BlobReadForRekeyError::Other(CliError::Message(format!(
                 "refusing to overwrite symlink input path {} in place",
                 path.display()
-            )));
+            ))));
         }
         if !open_meta.is_file() {
-            return Err(CliError::Message(format!(
+            return Err(BlobReadForRekeyError::Other(CliError::Message(format!(
                 "input path {} must be a regular file",
                 path.display()
-            )));
+            ))));
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if open_meta.dev() != meta.dev() || open_meta.ino() != meta.ino() {
-                return Err(CliError::ConcurrentModification {
+        let (open_id, open_nlink) = file_identity_and_nlink(&file)
+            .map_err(|e| BlobReadForRekeyError::Other(CliError::Io(e)))?;
+        if open_id != pre_id {
+            return Err(BlobReadForRekeyError::Other(
+                CliError::ConcurrentModification {
                     path: path.display().to_string(),
-                });
-            }
-            if open_meta.nlink() != 1 {
-                return Err(CliError::Message(format!(
-                    "refusing in-place rekey of hardlinked input path {} (nlink = {}); \
-                     remove extra hardlinks before rekeying in place",
-                    path.display(),
-                    open_meta.nlink()
-                )));
-            }
+                },
+            ));
+        }
+        if open_nlink != 1 {
+            return Err(BlobReadForRekeyError::Other(CliError::Message(format!(
+                "refusing in-place rekey of hardlinked input path {} (nlink = {open_nlink}); \
+                 remove extra hardlinks before rekeying in place",
+                path.display()
+            ))));
         }
 
         let effective_limit = soft_limit.unwrap_or(hard_limit);
         let hint_len = open_meta.len();
         if hint_len > effective_limit {
             if let Some(limit) = soft_limit {
-                return Err(CliError::Message(format!(
+                return Err(BlobReadForRekeyError::TooLarge(format!(
                     "input file exceeds {} MB limit (size {} bytes). \
                      Use --allow-large to override.",
                     limit / (1024 * 1024),
                     hint_len
                 )));
             }
-            return Err(CliError::Message(format!(
+            return Err(BlobReadForRekeyError::TooLarge(format!(
                 "input file exceeds hard maximum size of {} bytes",
                 effective_limit
             )));
@@ -461,45 +489,59 @@ fn read_blob_input_for_rekey(
             match file.read(&mut buf[total..]) {
                 Ok(0) => break,
                 Ok(n) => total += n,
-                Err(err) => return Err(CliError::Io(err)),
+                Err(err) => return Err(BlobReadForRekeyError::Other(CliError::Io(err))),
             }
         }
         buf.truncate(total);
         if total == cap || (buf.len() as u64) > effective_limit {
             if let Some(limit) = soft_limit {
-                return Err(CliError::Message(format!(
+                return Err(BlobReadForRekeyError::TooLarge(format!(
                     "input file exceeds {} MB limit (read {} bytes). \
                      Use --allow-large to override.",
                     limit / (1024 * 1024),
                     buf.len().saturating_add(1)
                 )));
             }
-            return Err(CliError::Message(format!(
+            return Err(BlobReadForRekeyError::TooLarge(format!(
                 "input file changed size during read or exceeds hard maximum size of {} bytes",
                 effective_limit
             )));
         }
 
-        return Ok(PrivateCiphertextPriorSnapshot {
-            bytes: buf,
-            #[cfg(unix)]
-            identity: {
-                use std::os::unix::fs::{MetadataExt, PermissionsExt};
-                (
-                    open_meta.dev(),
-                    open_meta.ino(),
-                    open_meta.permissions().mode() & 0o777,
-                )
+        return Ok((
+            PrivateCiphertextPriorSnapshot {
+                bytes: buf,
+                #[cfg(unix)]
+                identity: {
+                    use std::os::unix::fs::PermissionsExt;
+                    (open_id.0, open_id.1, open_meta.permissions().mode() & 0o777)
+                },
             },
-        });
+            open_id,
+        ));
     }
 
-    let bytes = read_file_bounded_zeroizing(path, soft_limit, hard_limit)?;
-    Ok(PrivateCiphertextPriorSnapshot {
-        bytes,
-        #[cfg(unix)]
-        identity: (0, 0, 0),
-    })
+    let bytes = read_file_bounded_zeroizing(path, soft_limit, hard_limit)
+        .map_err(BlobReadForRekeyError::Other)?;
+    Ok((
+        PrivateCiphertextPriorSnapshot {
+            bytes,
+            #[cfg(unix)]
+            identity: (0, 0, 0),
+        },
+        (0, 0),
+    ))
+}
+
+fn read_blob_input_for_rekey(
+    path: &Path,
+    soft_limit: Option<u64>,
+    hard_limit: u64,
+    in_place: bool,
+) -> CliResult<PrivateCiphertextPriorSnapshot> {
+    read_blob_input_for_rekey_with_id(path, soft_limit, hard_limit, in_place)
+        .map(|(snap, _)| snap)
+        .map_err(CliError::from)
 }
 
 /// Classify a blob ciphertext header: refuse scrypt (passphrase), non-age, and
@@ -2178,7 +2220,15 @@ struct BatchStateJournal {
     allow_recipient_mismatch: bool,
     allow_self_lockout: bool,
     allow_large: bool,
+    #[serde(default)]
+    auth_tag: String,
     records: std::collections::BTreeMap<String, BatchJournalRecord>,
+}
+
+#[derive(Debug, Clone)]
+struct StateJournalSnapshot {
+    prior: PrivateCiphertextPriorSnapshot,
+    file_id: (u64, u64),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2457,11 +2507,36 @@ fn is_valid_sha256_hex(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+fn file_identity_and_nlink(file: &fs::File) -> std::io::Result<((u64, u64), u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = file.metadata()?;
+        Ok(((meta.dev(), meta.ino()), meta.nlink()))
+    }
+    #[cfg(windows)]
+    {
+        windows_dacl::file_identity_and_nlink(file)
+    }
+}
+
+fn path_identity_and_nlink_nofollow(path: &Path) -> std::io::Result<((u64, u64), u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::symlink_metadata(path)?;
+        Ok(((meta.dev(), meta.ino()), meta.nlink()))
+    }
+    #[cfg(windows)]
+    {
+        windows_dacl::path_identity_and_nlink_nofollow(path)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SelectedBatchFile {
     path: PathBuf,
     user_path: PathBuf,
-    #[cfg(unix)]
     identity: (u64, u64),
 }
 
@@ -2484,17 +2559,14 @@ fn collect_dir_candidates(
             dir.display()
         )));
     }
+    let (pre_dir_id, _) = path_identity_and_nlink_nofollow(dir).map_err(CliError::Io)?;
     let canon_dir = fs::canonicalize(dir).map_err(CliError::Io)?;
     reject_symlink_traversal_in_user_path(&canon_dir, "--dir")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let canon_meta = fs::symlink_metadata(&canon_dir).map_err(CliError::Io)?;
-        if canon_meta.dev() != meta.dev() || canon_meta.ino() != meta.ino() {
-            return Err(CliError::ConcurrentModification {
-                path: dir.display().to_string(),
-            });
-        }
+    let (canon_dir_id, _) = path_identity_and_nlink_nofollow(&canon_dir).map_err(CliError::Io)?;
+    if canon_dir_id != pre_dir_id {
+        return Err(CliError::ConcurrentModification {
+            path: dir.display().to_string(),
+        });
     }
 
     let mut entries: Vec<fs::DirEntry> = fs::read_dir(&canon_dir)
@@ -2584,17 +2656,14 @@ fn collect_batch_files(args: &BlobRekeyBatchArgs) -> CliResult<Vec<SelectedBatch
                 candidate.display()
             )));
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if pre_meta.nlink() != 1 {
-                return Err(CliError::Message(format!(
-                    "refusing hardlinked input path {} (nlink = {}); \
-                     remove extra hardlinks before running blob rekey-batch",
-                    candidate.display(),
-                    pre_meta.nlink()
-                )));
-            }
+        let (pre_id, pre_nlink) =
+            path_identity_and_nlink_nofollow(&candidate).map_err(CliError::Io)?;
+        if pre_nlink != 1 {
+            return Err(CliError::Message(format!(
+                "refusing hardlinked input path {} (nlink = {pre_nlink}); \
+                 remove extra hardlinks before running blob rekey-batch",
+                candidate.display()
+            )));
         }
         let canon = fs::canonicalize(&candidate).map_err(CliError::Io)?;
         reject_symlink_traversal_in_user_path(&canon, "input")?;
@@ -2609,33 +2678,26 @@ fn collect_batch_files(args: &BlobRekeyBatchArgs) -> CliResult<Vec<SelectedBatch
                 path: candidate.display().to_string(),
             });
         }
-        #[cfg(unix)]
-        let identity = {
-            use std::os::unix::fs::MetadataExt;
-            if pre_meta.dev() != post_meta.dev()
-                || pre_meta.ino() != post_meta.ino()
-                || pre_meta.dev() != canon_meta.dev()
-                || pre_meta.ino() != canon_meta.ino()
-            {
-                return Err(CliError::ConcurrentModification {
-                    path: candidate.display().to_string(),
-                });
-            }
-            if post_meta.nlink() != 1 || canon_meta.nlink() != 1 {
-                return Err(CliError::Message(format!(
-                    "refusing hardlinked input path {} (nlink = {}); \
-                     remove extra hardlinks before running blob rekey-batch",
-                    candidate.display(),
-                    canon_meta.nlink()
-                )));
-            }
-            (pre_meta.dev(), pre_meta.ino())
-        };
+        let (post_id, post_nlink) =
+            path_identity_and_nlink_nofollow(&candidate).map_err(CliError::Io)?;
+        let (canon_id, canon_nlink) =
+            path_identity_and_nlink_nofollow(&canon).map_err(CliError::Io)?;
+        if pre_id != post_id || pre_id != canon_id {
+            return Err(CliError::ConcurrentModification {
+                path: candidate.display().to_string(),
+            });
+        }
+        if post_nlink != 1 || canon_nlink != 1 {
+            return Err(CliError::Message(format!(
+                "refusing hardlinked input path {} (nlink = {canon_nlink}); \
+                 remove extra hardlinks before running blob rekey-batch",
+                candidate.display()
+            )));
+        }
         selected_files.push(SelectedBatchFile {
             path: canon,
             user_path: candidate,
-            #[cfg(unix)]
-            identity,
+            identity: pre_id,
         });
     }
     selected_files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -2644,7 +2706,9 @@ fn collect_batch_files(args: &BlobRekeyBatchArgs) -> CliResult<Vec<SelectedBatch
     // Reject distinct canonical paths that alias the same underlying inode (hardlinks).
     for i in 0..selected_files.len() {
         for j in (i + 1)..selected_files.len() {
-            if paths_alias(&selected_files[i].path, &selected_files[j].path)? {
+            if selected_files[i].identity == selected_files[j].identity
+                || paths_alias(&selected_files[i].path, &selected_files[j].path)?
+            {
                 return Err(CliError::Message(format!(
                     "selected blob path {} aliases selected blob path {} (hardlink to the same file); \
                      refusing batch rekey with hardlinked inputs",
@@ -2664,6 +2728,39 @@ const WINDOWS_SE_DACL_PRESENT: u16 = 0x0004;
 const WINDOWS_SE_DACL_PROTECTED: u16 = 0x1000;
 #[cfg(any(windows, test))]
 const WINDOWS_ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+#[cfg(any(windows, test))]
+const WINDOWS_MIN_ACCESS_ALLOWED_ACE_SIZE: u16 = 12;
+
+/// Validate an individual Windows ACE header before casting its pointer to
+/// `AccessAllowedAcePrefix` or reading the embedded SID.
+#[cfg(any(windows, test))]
+fn validate_windows_ace_header(
+    ace_type: u8,
+    ace_size: u16,
+    sid_len: Option<usize>,
+) -> std::io::Result<()> {
+    if ace_type != WINDOWS_ACCESS_ALLOWED_ACE_TYPE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "private file on Windows contains unexpected ACE type in DACL",
+        ));
+    }
+    if ace_size < WINDOWS_MIN_ACCESS_ALLOWED_ACE_SIZE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "private file on Windows contains truncated ACE in DACL",
+        ));
+    }
+    if let Some(slen) = sid_len {
+        if slen < 8 || 8usize.saturating_add(slen) > (ace_size as usize) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "private file on Windows contains ACE with out-of-bounds SID length",
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// Validate that a Windows security descriptor has an owner SID equal to the
 /// current process user SID, a present and protected DACL (`SE_DACL_PROTECTED`,
@@ -2725,11 +2822,14 @@ mod windows_dacl {
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use std::path::Path;
 
-    use crate::atomic_write::PrivateCiphertextPriorSnapshot;
+    use zeroize::Zeroizing;
+
     use crate::error::{CliError, CliResult};
 
     use super::{
-        validate_windows_owner_and_dacl_sids, WINDOWS_SE_DACL_PRESENT, WINDOWS_SE_DACL_PROTECTED,
+        is_symlink_or_reparse_point, validate_windows_ace_header,
+        validate_windows_owner_and_dacl_sids, StateJournalSnapshot, MAX_STATE_JOURNAL_BYTES,
+        WINDOWS_SE_DACL_PRESENT, WINDOWS_SE_DACL_PROTECTED,
     };
 
     #[repr(C)]
@@ -2784,6 +2884,35 @@ mod windows_dacl {
         b_inherit_handle: i32,
     }
 
+    #[repr(C)]
+    struct FileTime {
+        dw_low_date_time: u32,
+        dw_high_date_time: u32,
+    }
+
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        dw_file_attributes: u32,
+        ft_creation_time: FileTime,
+        ft_last_access_time: FileTime,
+        ft_last_write_time: FileTime,
+        dw_volume_serial_number: u32,
+        n_file_size_high: u32,
+        n_file_size_low: u32,
+        n_number_of_links: u32,
+        n_file_index_high: u32,
+        n_file_index_low: u32,
+    }
+
+    #[repr(C)]
+    struct Overlapped {
+        internal: usize,
+        internal_high: usize,
+        offset: u32,
+        offset_high: u32,
+        event: *mut core::ffi::c_void,
+    }
+
     struct HandleGuard(*mut core::ffi::c_void);
     impl Drop for HandleGuard {
         fn drop(&mut self) {
@@ -2808,11 +2937,50 @@ mod windows_dacl {
         }
     }
 
+    struct LockedJournalTargetGuard {
+        file: File,
+    }
+
+    impl Drop for LockedJournalTargetGuard {
+        fn drop(&mut self) {
+            let mut overlapped = Overlapped {
+                internal: 0,
+                internal_high: 0,
+                offset: u32::MAX,
+                offset_high: u32::MAX,
+                event: core::ptr::null_mut(),
+            };
+            // SAFETY: `self.file` is an open handle owned by this guard.
+            unsafe {
+                let _ = UnlockFileEx(self.file.as_raw_handle(), 0, 1, 0, &mut overlapped);
+            }
+        }
+    }
+
     #[link(name = "kernel32")]
     extern "system" {
         fn GetCurrentProcess() -> *mut core::ffi::c_void;
         fn CloseHandle(hObject: *mut core::ffi::c_void) -> i32;
         fn LocalFree(hMem: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+        fn GetFileInformationByHandle(
+            hFile: *mut core::ffi::c_void,
+            lpFileInformation: *mut ByHandleFileInformation,
+        ) -> i32;
+        fn LockFileEx(
+            hFile: *mut core::ffi::c_void,
+            dwFlags: u32,
+            dwReserved: u32,
+            nNumberOfBytesToLockLow: u32,
+            nNumberOfBytesToLockHigh: u32,
+            lpOverlapped: *mut Overlapped,
+        ) -> i32;
+        fn UnlockFileEx(
+            hFile: *mut core::ffi::c_void,
+            dwReserved: u32,
+            nNumberOfBytesToUnlockLow: u32,
+            nNumberOfBytesToUnlockHigh: u32,
+            lpOverlapped: *mut Overlapped,
+        ) -> i32;
         fn CreateFileW(
             lpFileName: *const u16,
             dwDesiredAccess: u32,
@@ -2826,14 +2994,6 @@ mod windows_dacl {
             lpExistingFileName: *const u16,
             lpNewFileName: *const u16,
             dwFlags: u32,
-        ) -> i32;
-        fn ReplaceFileW(
-            lpReplacedFileName: *const u16,
-            lpReplacementFileName: *const u16,
-            lpBackupFileName: *const u16,
-            dwReplaceFlags: u32,
-            lpExclude: *mut core::ffi::c_void,
-            lpReserved: *mut core::ffi::c_void,
         ) -> i32;
     }
 
@@ -2854,6 +3014,7 @@ mod windows_dacl {
         fn IsValidSid(pSid: *mut core::ffi::c_void) -> i32;
         fn GetLengthSid(pSid: *mut core::ffi::c_void) -> u32;
         fn EqualSid(pSid1: *mut core::ffi::c_void, pSid2: *mut core::ffi::c_void) -> i32;
+        fn IsWellKnownSid(pSid: *mut core::ffi::c_void, WellKnownSidType: u32) -> i32;
         fn InitializeAcl(pAcl: *mut AclHeader, nAclLength: u32, dwAclRevision: u32) -> i32;
         fn AddAccessAllowedAce(
             pAcl: *mut AclHeader,
@@ -2915,17 +3076,90 @@ mod windows_dacl {
     const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
     const GENERIC_READ: u32 = 0x8000_0000;
     const GENERIC_WRITE: u32 = 0x4000_0000;
+    const GENERIC_ALL: u32 = 0x1000_0000;
+    const DELETE: u32 = 0x0001_0000;
+    const READ_CONTROL: u32 = 0x0002_0000;
     const WRITE_DAC: u32 = 0x0004_0000;
     const WRITE_OWNER: u32 = 0x0008_0000;
+    const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+    const FILE_ADD_FILE: u32 = 0x0002;
+    const FILE_ADD_SUBDIRECTORY: u32 = 0x0004;
+    const FILE_DELETE_CHILD: u32 = 0x0040;
+    const DANGEROUS_DIR_WRITE_MASK: u32 = FILE_ADD_FILE
+        | FILE_ADD_SUBDIRECTORY
+        | FILE_DELETE_CHILD
+        | DELETE
+        | WRITE_DAC
+        | WRITE_OWNER
+        | GENERIC_WRITE
+        | GENERIC_ALL;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
     const CREATE_NEW: u32 = 1;
     const OPEN_EXISTING: u32 = 3;
     const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
     const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+    const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x0000_0001;
+    const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
     const SE_FILE_OBJECT: u32 = 1;
     const OWNER_SECURITY_INFORMATION: u32 = 0x0000_0001;
     const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
     const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
+    const WIN_CREATOR_OWNER_SID: u32 = 3;
+    const WIN_LOCAL_SYSTEM_SID: u32 = 22;
+    const WIN_BUILTIN_ADMINISTRATORS_SID: u32 = 26;
+
+    pub(super) fn file_identity_and_nlink(file: &File) -> io::Result<((u64, u64), u64)> {
+        let mut info = ByHandleFileInformation {
+            dw_file_attributes: 0,
+            ft_creation_time: FileTime {
+                dw_low_date_time: 0,
+                dw_high_date_time: 0,
+            },
+            ft_last_access_time: FileTime {
+                dw_low_date_time: 0,
+                dw_high_date_time: 0,
+            },
+            ft_last_write_time: FileTime {
+                dw_low_date_time: 0,
+                dw_high_date_time: 0,
+            },
+            dw_volume_serial_number: 0,
+            n_file_size_high: 0,
+            n_file_size_low: 0,
+            n_number_of_links: 0,
+            n_file_index_high: 0,
+            n_file_index_low: 0,
+        };
+        // SAFETY: `file` is a valid open file handle and `info` is stack-allocated.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let vol = info.dw_volume_serial_number as u64;
+        let idx = ((info.n_file_index_high as u64) << 32) | (info.n_file_index_low as u64);
+        Ok(((vol, idx), info.n_number_of_links as u64))
+    }
+
+    pub(super) fn path_identity_and_nlink_nofollow(path: &Path) -> io::Result<((u64, u64), u64)> {
+        use std::os::windows::fs::OpenOptionsExt;
+        let file = fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)?;
+        let meta = file.metadata()?;
+        if is_symlink_or_reparse_point(&meta) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "refusing symlink or reparse point",
+            ));
+        }
+        file_identity_and_nlink(&file)
+    }
 
     fn encode_wide_null(path: &Path) -> Vec<u16> {
         path.as_os_str()
@@ -3013,12 +3247,121 @@ mod windows_dacl {
         Some(unsafe { core::slice::from_raw_parts(sid.cast::<u8>(), len) })
     }
 
+    /// Reject a Windows parent directory whose DACL grants write, file-add,
+    /// child-delete, or ACL/owner-modification access to any principal other
+    /// than the current user SID, `SYSTEM`, `Administrators`, or `CREATOR OWNER`.
+    pub(super) fn reject_writable_directory_dacl(dir_path: &Path) -> io::Result<()> {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir_file = fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES | READ_CONTROL)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(dir_path)?;
+        let dir_meta = dir_file.metadata()?;
+        if is_symlink_or_reparse_point(&dir_meta) || !dir_meta.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private file parent directory on Windows must be a non-reparse directory",
+            ));
+        }
+
+        let user_buf = current_process_user_token_buf()?;
+        let token_user = user_buf.as_ptr().cast::<TokenUser>();
+        // SAFETY: `user_buf` holds a valid `TokenUser`.
+        let user_sid = unsafe { (*token_user).user.sid };
+
+        let mut owner_sid: *mut core::ffi::c_void = core::ptr::null_mut();
+        let mut dacl: *mut AclHeader = core::ptr::null_mut();
+        let mut sd: *mut core::ffi::c_void = core::ptr::null_mut();
+        // SAFETY: `dir_file` is an open directory handle; `sd` is freed by `LocalMemGuard`.
+        let rc = unsafe {
+            GetSecurityInfo(
+                dir_file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner_sid,
+                core::ptr::null_mut(),
+                &mut dacl,
+                core::ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc as i32));
+        }
+        let _sd_guard = LocalMemGuard(sd);
+
+        let mut control: u16 = 0;
+        let mut revision: u32 = 0;
+        // SAFETY: `sd` was returned by `GetSecurityInfo`.
+        if unsafe { GetSecurityDescriptorControl(sd, &mut control, &mut revision) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if (control & WINDOWS_SE_DACL_PRESENT) == 0 || dacl.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private file directory on Windows has no DACL (unrestricted access)",
+            ));
+        }
+
+        // SAFETY: `dacl` is non-null and points into `sd`.
+        let ace_count = unsafe { (*dacl).ace_count };
+        for idx in 0..(ace_count as u32) {
+            let mut ace_ptr: *mut AceHeader = core::ptr::null_mut();
+            // SAFETY: `dacl` is valid and `idx < ace_count`.
+            if unsafe { GetAce(dacl, idx, &mut ace_ptr) } == 0 || ace_ptr.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: `ace_ptr` points to a valid `AceHeader`.
+            let ace_type = unsafe { (*ace_ptr).ace_type };
+            let ace_size = unsafe { (*ace_ptr).ace_size };
+            if ace_type != super::WINDOWS_ACCESS_ALLOWED_ACE_TYPE {
+                continue;
+            }
+            validate_windows_ace_header(ace_type, ace_size, None)?;
+            let allowed_ptr = ace_ptr.cast::<AccessAllowedAcePrefix>();
+            // SAFETY: `ace_size >= 12` was validated above.
+            let mask = unsafe { (*allowed_ptr).mask };
+            if (mask & DANGEROUS_DIR_WRITE_MASK) == 0 {
+                continue;
+            }
+            let ace_sid = unsafe { core::ptr::addr_of_mut!((*allowed_ptr).sid_start).cast() };
+            if unsafe { IsValidSid(ace_sid) } == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "private file directory on Windows contains an invalid SID in DACL",
+                ));
+            }
+            let sid_len = unsafe { GetLengthSid(ace_sid) } as usize;
+            validate_windows_ace_header(ace_type, ace_size, Some(sid_len))?;
+            let is_trusted = unsafe {
+                EqualSid(ace_sid, user_sid) != 0
+                    || IsWellKnownSid(ace_sid, WIN_LOCAL_SYSTEM_SID) != 0
+                    || IsWellKnownSid(ace_sid, WIN_BUILTIN_ADMINISTRATORS_SID) != 0
+                    || IsWellKnownSid(ace_sid, WIN_CREATOR_OWNER_SID) != 0
+            };
+            if !is_trusted {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "private file directory DACL on Windows grants non-owner write, delete, or ACL-edit access",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Create a brand-new private file atomically bound to a protected
     /// current-user-only security descriptor (`owner = user_sid`,
     /// `SE_DACL_PROTECTED`, single `FILE_ALL_ACCESS` ACE for `user_sid`) and
     /// `dwShareMode = 0` (exclusive) at `CreateFileW` time so no other user can
     /// open or retain a handle during creation.
     pub(super) fn create_new_private_file(path: &Path) -> io::Result<File> {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        reject_writable_directory_dacl(parent)?;
+
         let user_buf = current_process_user_token_buf()?;
         let token_user = user_buf.as_ptr().cast::<TokenUser>();
         // SAFETY: `user_buf` lives for this function and holds a valid `TokenUser`.
@@ -3205,13 +3548,25 @@ mod windows_dacl {
             if unsafe { GetAce(dacl, idx, &mut ace_ptr) } == 0 || ace_ptr.is_null() {
                 return Err(io::Error::last_os_error());
             }
-            // SAFETY: `ace_ptr` points to a valid ACE header inside `dacl`.
+            // SAFETY: `ace_ptr` points to a valid `AceHeader` inside `dacl`.
+            // Validate `ace_type` and `ace_size >= 12` BEFORE casting to `AccessAllowedAcePrefix`.
             let ace_type = unsafe { (*ace_ptr).ace_type };
+            let ace_size = unsafe { (*ace_ptr).ace_size };
+            validate_windows_ace_header(ace_type, ace_size, None)?;
+
             let allowed_ptr = ace_ptr.cast::<AccessAllowedAcePrefix>();
-            // SAFETY: `ACCESS_ALLOWED_ACE_TYPE` has layout `AccessAllowedAcePrefix` where `sid_start` is the first DWORD of the SID.
+            // SAFETY: `ace_type == ACCESS_ALLOWED_ACE_TYPE` and `ace_size >= 12` were validated above.
             let ace_sid = unsafe { core::ptr::addr_of_mut!((*allowed_ptr).sid_start).cast() };
+            if unsafe { IsValidSid(ace_sid) } == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "private file on Windows contains invalid SID in DACL",
+                ));
+            }
+            let sid_len = unsafe { GetLengthSid(ace_sid) } as usize;
+            validate_windows_ace_header(ace_type, ace_size, Some(sid_len))?;
             let ace_sid_slice = unsafe { sid_bytes(ace_sid) }.unwrap_or(&[]);
-            if unsafe { IsValidSid(ace_sid) } == 0 || unsafe { EqualSid(ace_sid, user_sid) } == 0 {
+            if unsafe { EqualSid(ace_sid, user_sid) } == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "private file on Windows grants DACL access to a non-owner SID",
@@ -3222,20 +3577,57 @@ mod windows_dacl {
         validate_windows_owner_and_dacl_sids(expected_user_bytes, file_owner_bytes, control, &aces)
     }
 
-    /// Atomically write `--state` on Windows by creating the temporary file
-    /// with a protected current-user-only security descriptor and `dwShareMode = 0`
-    /// at `CreateFileW` time, verifying any existing target with `dwShareMode = 0`
-    /// (rejecting retained handles) and owner/DACL checks, and publishing via
-    /// `MoveFileExW` (create-new) or `ReplaceFileW` (rewrite).
+    fn lock_target_handle(file: File) -> CliResult<LockedJournalTargetGuard> {
+        let mut overlapped = Overlapped {
+            internal: 0,
+            internal_high: 0,
+            offset: u32::MAX,
+            offset_high: u32::MAX,
+            event: core::ptr::null_mut(),
+        };
+        // SAFETY: `file` is a valid open handle and `overlapped` lives for the call.
+        let ok = unsafe {
+            LockFileEx(
+                file.as_raw_handle(),
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                0,
+                1,
+                0,
+                &mut overlapped,
+            )
+        };
+        if ok == 0 {
+            return Err(CliError::ConcurrentModification {
+                path: "<state-journal>".to_string(),
+            });
+        }
+        Ok(LockedJournalTargetGuard { file })
+    }
+
+    /// Atomically write `--state` on Windows:
+    /// - Validates parent directory DACL (`reject_writable_directory_dacl`).
+    /// - Creates the temporary file via `create_new_private_file` (`CreateFileW`
+    ///   with `CREATE_NEW`, `dwShareMode = 0`, and protected owner-only
+    ///   `SECURITY_ATTRIBUTES`).
+    /// - When replacing an existing journal, opens the target with
+    ///   `dwShareMode = FILE_SHARE_DELETE` (excluding concurrent data handles),
+    ///   acquires an exclusive `LockFileEx` guard held across comparison AND
+    ///   publication, verifies `(volume_serial, file_index)` + `nlink == 1` +
+    ///   owner/DACL + bounded content (`expected.len() + 1`), and publishes via
+    ///   `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)` so
+    ///   the destination is rebound to the newly created `temp_file` object
+    ///   (orphaning any retained `WRITE_DAC` handle on the old object and never
+    ///   importing an unvalidated destination DACL).
     pub(super) fn atomic_write_private_journal(
         state_path: &Path,
         content: &[u8],
-        prior: Option<&PrivateCiphertextPriorSnapshot>,
+        prior: Option<&StateJournalSnapshot>,
     ) -> CliResult<()> {
         let parent = state_path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
+        reject_writable_directory_dacl(parent).map_err(CliError::Io)?;
 
         if prior.is_none() && fs::symlink_metadata(state_path).is_ok() {
             return Err(CliError::Message(format!(
@@ -3268,6 +3660,22 @@ mod windows_dacl {
         })?;
         let mut temp_file = temp_file.expect("temp_file set with temp_path");
 
+        let (temp_id, temp_nlink) = match file_identity_and_nlink(&temp_file) {
+            Ok(v) => v,
+            Err(err) => {
+                drop(temp_file);
+                let _ = fs::remove_file(&temp_path);
+                return Err(CliError::Io(err));
+            }
+        };
+        if temp_nlink != 1 {
+            drop(temp_file);
+            let _ = fs::remove_file(&temp_path);
+            return Err(CliError::ConcurrentModification {
+                path: temp_path.display().to_string(),
+            });
+        }
+
         if let Err(err) = temp_file
             .write_all(content)
             .and_then(|()| temp_file.sync_all())
@@ -3279,16 +3687,17 @@ mod windows_dacl {
         }
         drop(temp_file);
 
-        if let Some(expected_snap) = prior {
-            // Open existing target with dwShareMode = 0 so any retained handle by
-            // another process fails immediately with ERROR_SHARING_VIOLATION.
+        let _cas_lock = if let Some(expected_snap) = prior {
             let wide_target = encode_wide_null(state_path);
-            // SAFETY: `wide_target` is null-terminated.
+            // SAFETY: `wide_target` is null-terminated. `FILE_SHARE_DELETE` (without
+            // `FILE_SHARE_READ | FILE_SHARE_WRITE`) rejects any concurrent data
+            // handle while permitting `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` to
+            // unlink the target while this handle and its `LockFileEx` lock stay held.
             let handle = unsafe {
                 CreateFileW(
                     wide_target.as_ptr(),
                     GENERIC_READ,
-                    0, // dwShareMode = 0 (rejects any retained handle)
+                    FILE_SHARE_DELETE,
                     core::ptr::null_mut(),
                     OPEN_EXISTING,
                     FILE_FLAG_OPEN_REPARSE_POINT,
@@ -3302,64 +3711,176 @@ mod windows_dacl {
                 return Err(CliError::Io(err));
             }
             // SAFETY: `handle` is a valid open file handle.
-            let mut existing = unsafe { File::from_raw_handle(handle) };
-            if let Err(err) = verify_private_file_dacl(&existing) {
-                drop(existing);
-                let _ = fs::remove_file(&temp_path);
-                return Err(CliError::Io(err));
-            }
-            let mut current_bytes = Vec::with_capacity(expected_snap.bytes.len().saturating_add(1));
-            if let Err(err) = existing.read_to_end(&mut current_bytes) {
-                drop(existing);
-                let _ = fs::remove_file(&temp_path);
-                return Err(CliError::Io(err));
-            }
-            drop(existing);
-            if current_bytes.as_slice() != expected_snap.bytes.as_slice() {
-                let _ = fs::remove_file(&temp_path);
-                return Err(CliError::ConcurrentModification {
-                    path: state_path.display().to_string(),
-                });
-            }
+            let existing = unsafe { File::from_raw_handle(handle) };
+            let mut guard = match lock_target_handle(existing) {
+                Ok(g) => g,
+                Err(_) => {
+                    let _ = fs::remove_file(&temp_path);
+                    return Err(CliError::ConcurrentModification {
+                        path: state_path.display().to_string(),
+                    });
+                }
+            };
 
-            let wide_temp = encode_wide_null(&temp_path);
-            // SAFETY: `wide_target` and `wide_temp` are null-terminated UTF-16 paths.
-            let ok = unsafe {
-                ReplaceFileW(
-                    wide_target.as_ptr(),
-                    wide_temp.as_ptr(),
-                    core::ptr::null(),
-                    0,
-                    core::ptr::null_mut(),
-                    core::ptr::null_mut(),
-                )
-            };
-            if ok == 0 {
-                let err = io::Error::last_os_error();
+            let check_res: CliResult<()> = (|| {
+                let open_meta = guard.file.metadata().map_err(CliError::Io)?;
+                if !open_meta.is_file() || is_symlink_or_reparse_point(&open_meta) {
+                    return Err(CliError::ConcurrentModification {
+                        path: state_path.display().to_string(),
+                    });
+                }
+                let (open_id, open_nlink) =
+                    file_identity_and_nlink(&guard.file).map_err(CliError::Io)?;
+                let (named_id, named_nlink) =
+                    path_identity_and_nlink_nofollow(state_path).map_err(CliError::Io)?;
+                if open_id != expected_snap.file_id
+                    || named_id != expected_snap.file_id
+                    || open_nlink != 1
+                    || named_nlink != 1
+                {
+                    return Err(CliError::ConcurrentModification {
+                        path: state_path.display().to_string(),
+                    });
+                }
+                verify_private_file_dacl(&guard.file).map_err(CliError::Io)?;
+
+                let expected_bytes = expected_snap.prior.bytes.as_slice();
+                if open_meta.len() > MAX_STATE_JOURNAL_BYTES
+                    || open_meta.len() != expected_bytes.len() as u64
+                {
+                    return Err(CliError::ConcurrentModification {
+                        path: state_path.display().to_string(),
+                    });
+                }
+                let cap = expected_bytes
+                    .len()
+                    .min(MAX_STATE_JOURNAL_BYTES as usize)
+                    .saturating_add(1);
+                let mut current_bytes = Zeroizing::new(vec![0u8; cap]);
+                let mut total = 0usize;
+                while total < current_bytes.len() {
+                    match guard.file.read(&mut current_bytes[total..]) {
+                        Ok(0) => break,
+                        Ok(n) => total += n,
+                        Err(err) => return Err(CliError::Io(err)),
+                    }
+                }
+                if total == cap || &current_bytes[..total] != expected_bytes {
+                    return Err(CliError::ConcurrentModification {
+                        path: state_path.display().to_string(),
+                    });
+                }
+                Ok(())
+            })();
+            if let Err(err) = check_res {
+                drop(guard);
                 let _ = fs::remove_file(&temp_path);
-                return Err(CliError::Io(err));
+                return Err(err);
             }
+            Some(guard)
         } else {
-            let wide_temp = encode_wide_null(&temp_path);
-            let wide_target = encode_wide_null(state_path);
-            // SAFETY: `wide_temp` and `wide_target` are null-terminated UTF-16 paths;
-            // omitting MOVEFILE_REPLACE_EXISTING enforces no-clobber semantics while
-            // moving the temp file's protected owner-only security descriptor to `state_path`.
-            let ok = unsafe {
-                MoveFileExW(
-                    wide_temp.as_ptr(),
-                    wide_target.as_ptr(),
-                    MOVEFILE_WRITE_THROUGH,
-                )
+            None
+        };
+
+        let (pre_publish_temp_id, pre_publish_temp_nlink) =
+            match path_identity_and_nlink_nofollow(&temp_path) {
+                Ok(v) => v,
+                Err(err) => {
+                    drop(_cas_lock);
+                    let _ = fs::remove_file(&temp_path);
+                    return Err(CliError::Io(err));
+                }
             };
-            if ok == 0 {
-                let err = io::Error::last_os_error();
-                let _ = fs::remove_file(&temp_path);
-                return Err(CliError::Io(err));
-            }
+        if pre_publish_temp_id != temp_id || pre_publish_temp_nlink != 1 {
+            drop(_cas_lock);
+            let _ = fs::remove_file(&temp_path);
+            return Err(CliError::ConcurrentModification {
+                path: temp_path.display().to_string(),
+            });
+        }
+
+        let wide_temp = encode_wide_null(&temp_path);
+        let wide_target = encode_wide_null(state_path);
+        let move_flags = if prior.is_some() {
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH
+        } else {
+            MOVEFILE_WRITE_THROUGH
+        };
+        // SAFETY: `wide_temp` and `wide_target` are null-terminated UTF-16 paths;
+        // `_cas_lock` remains held across `MoveFileExW`.
+        let ok = unsafe { MoveFileExW(wide_temp.as_ptr(), wide_target.as_ptr(), move_flags) };
+        drop(_cas_lock);
+        if ok == 0 {
+            let err = io::Error::last_os_error();
+            let _ = fs::remove_file(&temp_path);
+            return Err(CliError::Io(err));
+        }
+
+        let (published_id, published_nlink) =
+            path_identity_and_nlink_nofollow(state_path).map_err(CliError::Io)?;
+        if published_id != temp_id || published_nlink != 1 {
+            return Err(CliError::ConcurrentModification {
+                path: state_path.display().to_string(),
+            });
         }
         Ok(())
     }
+}
+
+fn derive_journal_auth_key(
+    identities: &[Identity],
+    verify_identities: &[Identity],
+) -> Zeroizing<[u8; 32]> {
+    use sha2::Digest as _;
+    let mut secret_material: Vec<Zeroizing<String>> = identities
+        .iter()
+        .chain(verify_identities.iter())
+        .map(|id| Zeroizing::new(seclusor_crypto::identity_to_string(id)))
+        .collect();
+    secret_material.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    secret_material.dedup_by(|a, b| a.as_str() == b.as_str());
+
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"seclusor.v1.blob-rekey-batch.journal-hmac-key\0");
+    for s in &secret_material {
+        hasher.update((s.len() as u64).to_le_bytes());
+        hasher.update(s.as_bytes());
+    }
+    Zeroizing::new(hasher.finalize().into())
+}
+
+fn hmac_sha256_hex(key: &[u8; 32], message: &[u8]) -> String {
+    use sha2::Digest as _;
+    let mut ipad = Zeroizing::new([0x36u8; 64]);
+    let mut opad = Zeroizing::new([0x5cu8; 64]);
+    for i in 0..32 {
+        ipad[i] ^= key[i];
+        opad[i] ^= key[i];
+    }
+    let mut inner = sha2::Sha256::new();
+    inner.update(&ipad[..]);
+    inner.update(message);
+    let inner_digest: Zeroizing<[u8; 32]> = Zeroizing::new(inner.finalize().into());
+
+    let mut outer = sha2::Sha256::new();
+    outer.update(&opad[..]);
+    outer.update(&inner_digest[..]);
+    let tag: Zeroizing<[u8; 32]> = Zeroizing::new(outer.finalize().into());
+
+    let mut out = String::with_capacity(64);
+    for b in tag.iter() {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
+}
+
+fn compute_journal_auth_tag(journal: &BatchStateJournal, auth_key: &[u8; 32]) -> CliResult<String> {
+    let mut canonical = journal.clone();
+    canonical.auth_tag.clear();
+    let canonical_bytes =
+        serialize_state_journal_bounded(&canonical, MAX_STATE_JOURNAL_BYTES as usize)?;
+    Ok(hmac_sha256_hex(auth_key, &canonical_bytes))
 }
 
 /// Read an existing `--state` journal with file-descriptor-bound ownership,
@@ -3367,13 +3888,15 @@ mod windows_dacl {
 /// ACL rejection. Returns `Ok(None)` if `state_path` does not exist yet.
 fn read_existing_state_journal_for_cas(
     state_path: &Path,
-) -> CliResult<Option<PrivateCiphertextPriorSnapshot>> {
+) -> CliResult<Option<StateJournalSnapshot>> {
     reject_symlink_traversal_in_path(state_path, "--state", true)?;
     let parent = state_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     seclusor_crypto::acl::reject_writable_directory_acl(parent)?;
+    #[cfg(windows)]
+    windows_dacl::reject_writable_directory_dacl(parent).map_err(CliError::Io)?;
 
     let pre_meta = match fs::symlink_metadata(state_path) {
         Ok(m) => m,
@@ -3392,6 +3915,13 @@ fn read_existing_state_journal_for_cas(
             state_path.display()
         )));
     }
+    let (pre_id, pre_nlink) = path_identity_and_nlink_nofollow(state_path).map_err(CliError::Io)?;
+    if pre_nlink != 1 {
+        return Err(CliError::Message(format!(
+            "refusing hardlinked --state journal path {} (nlink = {pre_nlink})",
+            state_path.display()
+        )));
+    }
 
     let mut options = fs::OpenOptions::new();
     options.read(true);
@@ -3405,8 +3935,8 @@ fn read_existing_state_journal_for_cas(
         use std::os::windows::fs::OpenOptionsExt;
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
         // `share_mode(0)` is exclusive: if any other process retains an open
-        // handle (writable or otherwise) to `--state`, `CreateFileW` fails
-        // closed with `ERROR_SHARING_VIOLATION`.
+        // data handle to `--state`, `CreateFileW` fails closed with
+        // `ERROR_SHARING_VIOLATION`.
         options
             .share_mode(0)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
@@ -3441,22 +3971,22 @@ fn read_existing_state_journal_for_cas(
             state_path.display()
         )));
     }
+    let (open_id, open_nlink) = file_identity_and_nlink(&file).map_err(CliError::Io)?;
+    if open_id != pre_id {
+        return Err(CliError::ConcurrentModification {
+            path: state_path.display().to_string(),
+        });
+    }
+    if open_nlink != 1 {
+        return Err(CliError::Message(format!(
+            "refusing hardlinked --state journal path {} (nlink = {open_nlink})",
+            state_path.display()
+        )));
+    }
 
     #[cfg(unix)]
     let open_identity = {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        if open_meta.dev() != pre_meta.dev() || open_meta.ino() != pre_meta.ino() {
-            return Err(CliError::ConcurrentModification {
-                path: state_path.display().to_string(),
-            });
-        }
-        if open_meta.nlink() != 1 {
-            return Err(CliError::Message(format!(
-                "refusing hardlinked --state journal path {} (nlink = {})",
-                state_path.display(),
-                open_meta.nlink()
-            )));
-        }
         let file_uid = open_meta.uid();
         // SAFETY: `getuid` has no memory-safety preconditions and cannot fail.
         let current_uid = unsafe { libc::getuid() };
@@ -3474,7 +4004,7 @@ fn read_existing_state_journal_for_cas(
                 seclusor_crypto::CryptoError::InsecureIdentityFilePermissions { actual: mode },
             ));
         }
-        (open_meta.dev(), open_meta.ino(), mode)
+        (open_id.0, open_id.1, mode)
     };
 
     #[cfg(target_os = "macos")]
@@ -3533,25 +4063,30 @@ fn read_existing_state_journal_for_cas(
         )));
     }
 
+    let (after_id, after_nlink) = file_identity_and_nlink(&file).map_err(CliError::Io)?;
+    if after_id != open_id || after_nlink != 1 {
+        return Err(CliError::ConcurrentModification {
+            path: state_path.display().to_string(),
+        });
+    }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::os::unix::fs::PermissionsExt;
         let after_read_meta = file.metadata().map_err(CliError::Io)?;
-        if after_read_meta.dev() != open_identity.0
-            || after_read_meta.ino() != open_identity.1
-            || after_read_meta.nlink() != 1
-            || (after_read_meta.permissions().mode() & 0o777) != 0o600
-        {
+        if (after_read_meta.permissions().mode() & 0o777) != 0o600 {
             return Err(CliError::ConcurrentModification {
                 path: state_path.display().to_string(),
             });
         }
     }
 
-    Ok(Some(PrivateCiphertextPriorSnapshot {
-        bytes: buf,
-        #[cfg(unix)]
-        identity: open_identity,
+    Ok(Some(StateJournalSnapshot {
+        prior: PrivateCiphertextPriorSnapshot {
+            bytes: buf,
+            #[cfg(unix)]
+            identity: open_identity,
+        },
+        file_id: open_id,
     }))
 }
 
@@ -3562,11 +4097,12 @@ fn load_or_init_state_journal(
     allow_recipient_mismatch: bool,
     allow_self_lockout: bool,
     allow_large: bool,
-) -> CliResult<(BatchStateJournal, Option<PrivateCiphertextPriorSnapshot>)> {
+    auth_key: &[u8; 32],
+) -> CliResult<(BatchStateJournal, Option<StateJournalSnapshot>)> {
     let prior_snapshot = read_existing_state_journal_for_cas(state_path)?;
     if let Some(snapshot) = prior_snapshot {
         let journal: BatchStateJournal =
-            serde_json::from_slice(&snapshot.bytes).map_err(|err| {
+            serde_json::from_slice(&snapshot.prior.bytes).map_err(|err| {
                 CliError::Message(format!(
                     "invalid --state journal at {}: {}",
                     state_path.display(),
@@ -3592,6 +4128,26 @@ fn load_or_init_state_journal(
                 state_path.display()
             )));
         }
+        if !is_valid_sha256_hex(&journal.auth_tag) {
+            return Err(CliError::Message(format!(
+                "--state journal at {} is missing a valid cryptographic auth_tag",
+                state_path.display()
+            )));
+        }
+        let expected_tag = compute_journal_auth_tag(&journal, auth_key)?;
+        if journal
+            .auth_tag
+            .as_bytes()
+            .ct_eq(expected_tag.as_bytes())
+            .unwrap_u8()
+            != 1
+        {
+            return Err(CliError::Message(format!(
+                "--state journal at {} failed cryptographic authenticity verification \
+                 (journal was modified outside seclusor or bound to different identity keys)",
+                state_path.display()
+            )));
+        }
         for (key, rec) in &journal.records {
             if key != &rec.path
                 || !matches!(rec.status.as_str(), "in_progress" | "rekeyed")
@@ -3609,7 +4165,7 @@ fn load_or_init_state_journal(
         return Ok((journal, Some(snapshot)));
     }
 
-    let journal = BatchStateJournal {
+    let mut journal = BatchStateJournal {
         schema: STATE_JOURNAL_SCHEMA.to_string(),
         operation: "blob-rekey-batch".to_string(),
         target_recipients: target_recipients.to_vec(),
@@ -3617,8 +4173,10 @@ fn load_or_init_state_journal(
         allow_recipient_mismatch,
         allow_self_lockout,
         allow_large,
+        auth_tag: String::new(),
         records: std::collections::BTreeMap::new(),
     };
+    journal.auth_tag = compute_journal_auth_tag(&journal, auth_key)?;
     Ok((journal, None))
 }
 
@@ -3676,14 +4234,20 @@ fn serialize_state_journal_bounded(
 
 fn persist_state_journal(
     state_path: &Path,
-    journal: &BatchStateJournal,
-    prior_snapshot: Option<&PrivateCiphertextPriorSnapshot>,
-) -> CliResult<PrivateCiphertextPriorSnapshot> {
+    journal: &mut BatchStateJournal,
+    auth_key: &[u8; 32],
+    prior_snapshot: Option<&StateJournalSnapshot>,
+) -> CliResult<StateJournalSnapshot> {
     reject_symlink_traversal_in_path(state_path, "--state", true)?;
+    journal.auth_tag = compute_journal_auth_tag(journal, auth_key)?;
     let bytes = serialize_state_journal_bounded(journal, MAX_STATE_JOURNAL_BYTES as usize)?;
     #[cfg(unix)]
     {
-        atomic_write_private_ciphertext(state_path, &bytes, prior_snapshot.cloned())?;
+        atomic_write_private_ciphertext(
+            state_path,
+            &bytes,
+            prior_snapshot.map(|s| s.prior.clone()),
+        )?;
     }
     #[cfg(windows)]
     {
@@ -3695,10 +4259,17 @@ fn persist_state_journal(
             state_path.display()
         ))
     })?;
-    if refreshed.bytes.as_slice() != bytes.as_slice() {
+    if refreshed.prior.bytes.as_slice() != bytes.as_slice() {
         return Err(CliError::ConcurrentModification {
             path: state_path.display().to_string(),
         });
+    }
+    if let Some(prev) = prior_snapshot {
+        if refreshed.file_id == prev.file_id {
+            return Err(CliError::ConcurrentModification {
+                path: state_path.display().to_string(),
+            });
+        }
     }
     Ok(refreshed)
 }
@@ -3709,6 +4280,8 @@ fn create_private_backup_file(path: &Path, prior_bytes: &[u8]) -> CliResult<Path
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     seclusor_crypto::acl::reject_writable_directory_acl(parent)?;
+    #[cfg(windows)]
+    windows_dacl::reject_writable_directory_dacl(parent).map_err(CliError::Io)?;
 
     let ts = utc_compact_timestamp_now();
     let base_name = path
@@ -3985,6 +4558,7 @@ pub(crate) fn handle_blob_rekey_batch_with_policy(
         None
     };
 
+    let journal_auth_key = derive_journal_auth_key(&identities, &verify_identities);
     let mut journal_state = if let Some(state_path) = &args.state {
         Some(load_or_init_state_journal(
             state_path,
@@ -3993,6 +4567,7 @@ pub(crate) fn handle_blob_rekey_batch_with_policy(
             allow_recipient_mismatch,
             args.allow_self_lockout,
             args.allow_large,
+            &journal_auth_key,
         )?)
     } else {
         None
@@ -4032,28 +4607,30 @@ pub(crate) fn handle_blob_rekey_batch_with_policy(
 
         // Step 1: Re-verify no ancestor component was swapped to a symlink after selection,
         // then perform a bounded read of the candidate file and verify selection identity.
-        let read_res = (|| -> CliResult<PrivateCiphertextPriorSnapshot> {
-            reject_symlink_traversal_in_user_path(&selected.user_path, "input")?;
-            reject_symlink_traversal_in_user_path(blob_path, "input")?;
-            let snap = read_blob_input_for_rekey(
-                blob_path,
-                soft_limit,
-                BLOB_MAX_CIPHERTEXT_HARD_BYTES,
-                true,
-            )?;
-            #[cfg(unix)]
-            if (snap.identity.0, snap.identity.1) != selected.identity {
-                return Err(CliError::ConcurrentModification {
-                    path: path_str.clone(),
-                });
-            }
-            Ok(snap)
-        })();
+        let read_res =
+            (|| -> std::result::Result<PrivateCiphertextPriorSnapshot, BlobReadForRekeyError> {
+                reject_symlink_traversal_in_user_path(&selected.user_path, "input")
+                    .map_err(BlobReadForRekeyError::Other)?;
+                reject_symlink_traversal_in_user_path(blob_path, "input")
+                    .map_err(BlobReadForRekeyError::Other)?;
+                let (snap, read_id) = read_blob_input_for_rekey_with_id(
+                    blob_path,
+                    soft_limit,
+                    BLOB_MAX_CIPHERTEXT_HARD_BYTES,
+                    true,
+                )?;
+                if read_id != selected.identity {
+                    return Err(BlobReadForRekeyError::Other(
+                        CliError::ConcurrentModification {
+                            path: path_str.clone(),
+                        },
+                    ));
+                }
+                Ok(snap)
+            })();
         let prior_snapshot = match read_res {
             Ok(snap) => snap,
-            Err(CliError::Message(msg))
-                if msg.contains("MB limit") || msg.contains("maximum size") =>
-            {
+            Err(BlobReadForRekeyError::TooLarge(msg)) => {
                 summary.skipped += 1;
                 eprintln!("skip {path_str}: too-large ({msg})");
                 report_files.push(BatchReportFileEntry {
@@ -4072,7 +4649,7 @@ pub(crate) fn handle_blob_rekey_batch_with_policy(
                 });
                 continue;
             }
-            Err(err) => {
+            Err(BlobReadForRekeyError::Other(err)) => {
                 let status = if args.apply { "failed" } else { "error" };
                 summary.failed += 1;
                 let msg = err.to_string();
@@ -4110,6 +4687,56 @@ pub(crate) fn handle_blob_rekey_batch_with_policy(
         if let Some((ref mut journal, ref mut journal_snap)) = journal_state {
             if let Some(rec) = journal.records.get(&path_str).cloned() {
                 if current_sha256 == rec.sha256_after {
+                    let resume_verify_res: CliResult<()> = (|| {
+                        let stanzas_now = classify_blob_ciphertext_header(&prior_snapshot.bytes)?;
+                        if stanzas_now != target_recipients.len()
+                            || rec.stanzas_after != target_recipients.len()
+                        {
+                            return Err(CliError::Message(format!(
+                                "on-disk blob matched journal sha256_after but its X25519 stanza count ({stanzas_now}) does not match target recipient count ({})",
+                                target_recipients.len()
+                            )));
+                        }
+                        if !target_verify_candidates.is_empty() {
+                            let verified_pt = seclusor_crypto::decrypt_zeroizing(
+                                &prior_snapshot.bytes,
+                                &target_verify_candidates,
+                            )
+                            .map_err(|_| {
+                                CliError::Message(
+                                    "on-disk blob matched journal sha256_after but could not be decrypted by any target-set verification identity"
+                                        .to_string(),
+                                )
+                            })?;
+                            refuse_if_secrets_bundle_document(&verified_pt)?;
+                        }
+                        Ok(())
+                    })();
+                    if let Err(err) = resume_verify_res {
+                        let status = if args.apply { "failed" } else { "error" };
+                        summary.failed += 1;
+                        let msg = err.to_string();
+                        eprintln!("{status} {path_str}: {msg}");
+                        report_files.push(BatchReportFileEntry {
+                            path: path_str,
+                            status: status.to_string(),
+                            opened_with: None,
+                            stanzas_before: None,
+                            stanzas_after: None,
+                            delta: None,
+                            mode_before,
+                            mode_after: None,
+                            backup: None,
+                            sha256_before: Some(current_sha256),
+                            sha256_after: None,
+                            error: Some(msg),
+                        });
+                        if args.fail_fast {
+                            break;
+                        }
+                        continue;
+                    }
+
                     // If the journal recorded `in_progress` and a crash happened right after
                     // atomic rename before the post-commit journal update, upgrade it to `rekeyed`
                     // when running under `--apply`.
@@ -4119,8 +4746,12 @@ pub(crate) fn handle_blob_rekey_batch_with_policy(
                             entry.status = "rekeyed".to_string();
                         }
                         if let Some(state_path) = &args.state {
-                            match persist_state_journal(state_path, journal, journal_snap.as_ref())
-                            {
+                            match persist_state_journal(
+                                state_path,
+                                journal,
+                                &journal_auth_key,
+                                journal_snap.as_ref(),
+                            ) {
                                 Ok(new_snap) => *journal_snap = Some(new_snap),
                                 Err(err) => {
                                     if let Some(prev) = prev_rec {
@@ -4632,7 +5263,12 @@ pub(crate) fn handle_blob_rekey_batch_with_policy(
                     backup: backup_path_str.clone(),
                 },
             );
-            match persist_state_journal(state_path, journal, journal_snap.as_ref()) {
+            match persist_state_journal(
+                state_path,
+                journal,
+                &journal_auth_key,
+                journal_snap.as_ref(),
+            ) {
                 Ok(new_snap) => *journal_snap = Some(new_snap),
                 Err(err) => {
                     if let Some(prev) = prev_record {
@@ -4669,6 +5305,13 @@ pub(crate) fn handle_blob_rekey_batch_with_policy(
         let commit_res: CliResult<()> = (|| {
             reject_symlink_traversal_in_user_path(&selected.user_path, "input")?;
             reject_symlink_traversal_in_user_path(blob_path, "input")?;
+            let (pre_commit_id, pre_commit_nlink) =
+                path_identity_and_nlink_nofollow(blob_path).map_err(CliError::Io)?;
+            if pre_commit_id != selected.identity || pre_commit_nlink != 1 {
+                return Err(CliError::ConcurrentModification {
+                    path: path_str.clone(),
+                });
+            }
             atomic_write_private_ciphertext(blob_path, &new_ciphertext, Some(prior_snapshot))?;
             let post_commit_bytes =
                 read_file_bounded_zeroizing(blob_path, None, BLOB_MAX_CIPHERTEXT_HARD_BYTES)
@@ -4730,8 +5373,13 @@ pub(crate) fn handle_blob_rekey_batch_with_policy(
                 entry.status = "rekeyed".to_string();
                 entry.ts = utc_compact_timestamp_now();
             }
-            if let Err(err) = persist_state_journal(state_path, journal, journal_snap.as_ref())
-                .map(|snap| *journal_snap = Some(snap))
+            if let Err(err) = persist_state_journal(
+                state_path,
+                journal,
+                &journal_auth_key,
+                journal_snap.as_ref(),
+            )
+            .map(|snap| *journal_snap = Some(snap))
             {
                 if let Some(prev) = prev_record {
                     journal.records.insert(path_str.clone(), prev);
@@ -6901,8 +7549,9 @@ mod tests {
         })
         .expect("handle_blob_rekey_batch with matching prior set must succeed");
 
-        // Reject hardlinked inputs in batch selection (both when both links are selected
-        // and when only one link is selected while an unselected hardlink exists).
+        // Reject hardlinked inputs in batch selection on all platforms (Unix and Windows),
+        // both when both links are selected and when only one link is selected while an
+        // unselected hardlink exists.
         let hardlink_path = dir.path().join("single-hardlink.age");
         fs::hard_link(&blob_path, &hardlink_path).expect("create hardlink");
         let err_hardlink_single = handle_blob_rekey_batch(BlobRekeyBatchArgs {
@@ -6933,14 +7582,74 @@ mod tests {
             },
             verify_identities: VerifyIdentityArgs::default(),
             passphrase: PassphraseArgs::default(),
-        });
-        #[cfg(unix)]
-        {
-            let err = err_hardlink_single
-                .expect_err("blob with unselected hardlink (nlink > 1) must be rejected on Unix");
-            assert!(err.to_string().contains("hardlink"));
-        }
+        })
+        .expect_err("blob with unselected hardlink (nlink > 1) must be rejected on all platforms");
+        assert!(err_hardlink_single.to_string().contains("hardlink"));
         fs::remove_file(&hardlink_path).expect("remove hardlink");
+
+        // Regular-file substitution after selection changes cross-platform
+        // (dev, ino) / (volume_serial, file_index) and must be rejected.
+        let subst_blob_path = dir.path().join("subst-target.age");
+        fs::copy(&blob_path, &subst_blob_path).expect("copy subst target");
+        let selected = collect_batch_files(&BlobRekeyBatchArgs {
+            files: vec![subst_blob_path.clone()],
+            dir: None,
+            glob: "*.age".to_string(),
+            recursive: false,
+            apply: false,
+            state: None,
+            backup: false,
+            fail_fast: false,
+            json: false,
+            write_recipients: None,
+            allow_self_lockout: false,
+            allow_large: false,
+            recipients: RecipientArgs::default(),
+            prior_recipients: PriorRecipientArgs::default(),
+            identities: IdentityArgs::default(),
+            verify_identities: VerifyIdentityArgs::default(),
+            passphrase: PassphraseArgs::default(),
+        })
+        .expect("select subst target");
+        assert_eq!(selected.len(), 1);
+        let replacement_blob_path = dir.path().join("subst-replacement.age");
+        fs::write(
+            &replacement_blob_path,
+            seclusor_crypto::encrypt(b"replacement-data", std::slice::from_ref(&r)).unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(&subst_blob_path).unwrap();
+        fs::rename(&replacement_blob_path, &subst_blob_path).unwrap();
+        let (_, new_file_id) = read_blob_input_for_rekey_with_id(
+            &selected[0].path,
+            Some(BLOB_MAX_FILE_BYTES),
+            BLOB_MAX_CIPHERTEXT_HARD_BYTES,
+            true,
+        )
+        .expect("read replaced regular file");
+        assert_ne!(
+            new_file_id, selected[0].identity,
+            "replaced regular file must have a distinct file identity from selection"
+        );
+
+        // A path-guard failure on a filename containing "MB limit" or "maximum size"
+        // must be classified as an error/failure, never as `too-large` (`skipped`).
+        let tricky_name_path = dir.path().join("tricky MB limit maximum size.age");
+        fs::copy(&blob_path, &tricky_name_path).unwrap();
+        let tricky_hardlink = dir.path().join("tricky-link.age");
+        fs::hard_link(&tricky_name_path, &tricky_hardlink).unwrap();
+        let tricky_res = read_blob_input_for_rekey_with_id(
+            &tricky_name_path,
+            Some(BLOB_MAX_FILE_BYTES),
+            BLOB_MAX_CIPHERTEXT_HARD_BYTES,
+            true,
+        );
+        assert!(
+            matches!(tricky_res, Err(BlobReadForRekeyError::Other(_))),
+            "path-guard error on filename containing 'MB limit' must not be classified as TooLarge"
+        );
+        fs::remove_file(&tricky_hardlink).unwrap();
+        fs::remove_file(&tricky_name_path).unwrap();
 
         // Reject intermediate symlink traversal in absolute FILE and --dir paths.
         #[cfg(unix)]
@@ -6962,37 +7671,46 @@ mod tests {
             assert!(err_abs_file.to_string().contains("symlink"));
         }
 
-        // Reject malformed --state journal where sha256_before == sha256_after.
-        let bad_state_path = dir.path().join("bad-state.json");
+        // Load identity to derive the authentic HMAC key for journal tests.
+        let loaded_ids = seclusor_keyring::load_identity_file_auto(&id_path, None).unwrap();
+        let test_auth_key = derive_journal_auth_key(&loaded_ids, &[]);
+
+        // Reject forged --state journal lacking a valid cryptographic auth_tag.
+        let forged_state_path = dir.path().join("forged-state.json");
         let canon_blob_str = fs::canonicalize(&blob_path).unwrap().display().to_string();
-        let bad_journal = serde_json::json!({
-            "schema": STATE_JOURNAL_SCHEMA,
-            "operation": "blob-rekey-batch",
-            "target_recipients": [r.to_string()],
-            "prior_recipients": [r.to_string()],
-            "allow_recipient_mismatch": false,
-            "allow_self_lockout": false,
-            "allow_large": false,
-            "records": {
-                canon_blob_str.clone(): {
-                    "path": canon_blob_str,
-                    "sha256_before": "a".repeat(64),
-                    "sha256_after": "a".repeat(64),
-                    "status": "in_progress",
-                    "ts": "20261116T000000Z",
-                    "opened_with": r.to_string(),
-                    "stanzas_before": 1,
-                    "stanzas_after": 1,
-                    "delta": { "added": [], "removed": [] },
-                    "mode_before": "0600",
-                    "mode_after": "0600",
-                    "backup": null
-                }
-            }
-        });
+        let mut forged_journal = BatchStateJournal {
+            schema: STATE_JOURNAL_SCHEMA.to_string(),
+            operation: "blob-rekey-batch".to_string(),
+            target_recipients: vec![r.to_string()],
+            prior_recipients: Some(vec![r.to_string()]),
+            allow_recipient_mismatch: false,
+            allow_self_lockout: false,
+            allow_large: false,
+            auth_tag: "0".repeat(64),
+            records: std::collections::BTreeMap::new(),
+        };
+        forged_journal.records.insert(
+            canon_blob_str.clone(),
+            BatchJournalRecord {
+                path: canon_blob_str.clone(),
+                sha256_before: "a".repeat(64),
+                sha256_after: sha256_hex(&fs::read(&blob_path).unwrap()),
+                status: "rekeyed".to_string(),
+                ts: "20261116T000000Z".to_string(),
+                opened_with: r.to_string(),
+                stanzas_before: 1,
+                stanzas_after: 1,
+                delta: None,
+                mode_before: Some("0600".to_string()),
+                mode_after: Some("0600".to_string()),
+                backup: None,
+            },
+        );
         atomic_write_private_ciphertext(
-            &bad_state_path,
-            serde_json::to_vec_pretty(&bad_journal).unwrap().as_slice(),
+            &forged_state_path,
+            serde_json::to_vec_pretty(&forged_journal)
+                .unwrap()
+                .as_slice(),
             None,
         )
         .unwrap();
@@ -7003,10 +7721,76 @@ mod tests {
             const WRITE_OWNER: u32 = 0x0008_0000;
             let file = fs::OpenOptions::new()
                 .access_mode(WRITE_DAC | WRITE_OWNER)
-                .open(&bad_state_path)
+                .open(&forged_state_path)
                 .unwrap();
             windows_dacl::restrict_private_file_dacl(&file).unwrap();
         }
+        let err_forged = handle_blob_rekey_batch(BlobRekeyBatchArgs {
+            files: vec![blob_path.clone()],
+            dir: None,
+            glob: "*.age".to_string(),
+            recursive: false,
+            apply: false,
+            state: Some(forged_state_path),
+            backup: false,
+            fail_fast: false,
+            json: false,
+            write_recipients: None,
+            allow_self_lockout: false,
+            allow_large: false,
+            recipients: RecipientArgs {
+                recipients: vec![r.to_string()],
+                recipient_files: vec![],
+                recipient_env_var: None,
+            },
+            prior_recipients: PriorRecipientArgs {
+                prior_recipients: vec![r.to_string()],
+                prior_recipient_files: vec![],
+            },
+            identities: IdentityArgs {
+                identity_files: vec![id_path.clone()],
+                identity_public_key: None,
+            },
+            verify_identities: VerifyIdentityArgs::default(),
+            passphrase: PassphraseArgs::default(),
+        })
+        .expect_err("forged --state journal without valid HMAC auth_tag must be rejected");
+        assert!(err_forged.to_string().contains("authenticity verification"));
+
+        // Reject malformed --state journal where sha256_before == sha256_after (even with a valid auth_tag).
+        let bad_state_path = dir.path().join("bad-state.json");
+        let mut bad_journal = BatchStateJournal {
+            schema: STATE_JOURNAL_SCHEMA.to_string(),
+            operation: "blob-rekey-batch".to_string(),
+            target_recipients: vec![r.to_string()],
+            prior_recipients: Some(vec![r.to_string()]),
+            allow_recipient_mismatch: false,
+            allow_self_lockout: false,
+            allow_large: false,
+            auth_tag: String::new(),
+            records: std::collections::BTreeMap::new(),
+        };
+        bad_journal.records.insert(
+            canon_blob_str.clone(),
+            BatchJournalRecord {
+                path: canon_blob_str,
+                sha256_before: "a".repeat(64),
+                sha256_after: "a".repeat(64),
+                status: "in_progress".to_string(),
+                ts: "20261116T000000Z".to_string(),
+                opened_with: r.to_string(),
+                stanzas_before: 1,
+                stanzas_after: 1,
+                delta: Some(BatchReportDelta {
+                    added: vec![],
+                    removed: vec![],
+                }),
+                mode_before: Some("0600".to_string()),
+                mode_after: Some("0600".to_string()),
+                backup: None,
+            },
+        );
+        persist_state_journal(&bad_state_path, &mut bad_journal, &test_auth_key, None).unwrap();
         let err_bad_state = handle_blob_rekey_batch(BlobRekeyBatchArgs {
             files: vec![blob_path.clone()],
             dir: None,
@@ -7039,8 +7823,24 @@ mod tests {
         .expect_err("journal record with sha256_before == sha256_after must be rejected");
         assert!(err_bad_state.to_string().contains("malformed record"));
 
-        // Regression test (GR-06 / devrev GR-03): foreign-owned journal with victim-only
-        // protected DACL must be rejected; unprotected or non-owner ACEs must also be rejected.
+        // Foreign-owned journal with victim-only protected DACL must be rejected;
+        // unprotected DACLs, non-owner ACEs, unexpected ACE types, and truncated ACE
+        // headers must all be rejected before SID cast.
+        validate_windows_ace_header(WINDOWS_ACCESS_ALLOWED_ACE_TYPE, 20, Some(12))
+            .expect("valid ACCESS_ALLOWED_ACE header must pass");
+        assert!(
+            validate_windows_ace_header(1, 20, Some(12)).is_err(),
+            "non-ACCESS_ALLOWED_ACE_TYPE must be rejected before casting"
+        );
+        assert!(
+            validate_windows_ace_header(WINDOWS_ACCESS_ALLOWED_ACE_TYPE, 8, None).is_err(),
+            "truncated ACE header (< 12 bytes) must be rejected before casting"
+        );
+        assert!(
+            validate_windows_ace_header(WINDOWS_ACCESS_ALLOWED_ACE_TYPE, 16, Some(12)).is_err(),
+            "SID length exceeding AceSize must be rejected"
+        );
+
         let victim_sid: &[u8] = &[1, 2, 0, 0, 0, 0, 0, 5, 21, 10, 20, 30];
         let attacker_sid: &[u8] = &[1, 2, 0, 0, 0, 0, 0, 5, 21, 99, 99, 99];
         let protected_ctrl = WINDOWS_SE_DACL_PRESENT | WINDOWS_SE_DACL_PROTECTED;
@@ -7081,8 +7881,8 @@ mod tests {
         .expect_err("non-owner ACE in DACL must be rejected");
         assert!(non_owner_ace_err.to_string().contains("non-owner SID"));
 
-        // Regression test (GR-08): bounded journal serialization rejects overflow before
-        // allocation growth or publication and preserves the previous readable journal.
+        // Bounded journal serialization rejects overflow before allocation growth or
+        // publication and preserves the previous readable journal.
         let preserved_state_path = dir.path().join("preserved-state.json");
         let mut bounded_journal = BatchStateJournal {
             schema: STATE_JOURNAL_SCHEMA.to_string(),
@@ -7092,10 +7892,16 @@ mod tests {
             allow_recipient_mismatch: false,
             allow_self_lockout: false,
             allow_large: false,
+            auth_tag: String::new(),
             records: std::collections::BTreeMap::new(),
         };
-        let initial_snap =
-            persist_state_journal(&preserved_state_path, &bounded_journal, None).unwrap();
+        let initial_snap = persist_state_journal(
+            &preserved_state_path,
+            &mut bounded_journal,
+            &test_auth_key,
+            None,
+        )
+        .unwrap();
         let initial_on_disk = fs::read(&preserved_state_path).unwrap();
         let small_cap = initial_on_disk.len();
         serialize_state_journal_bounded(&bounded_journal, small_cap)
@@ -7125,28 +7931,72 @@ mod tests {
             initial_on_disk,
             "previous readable journal on disk must remain intact when serialization overflows"
         );
-        assert_eq!(initial_snap.bytes.as_slice(), initial_on_disk.as_slice());
+        assert_eq!(
+            initial_snap.prior.bytes.as_slice(),
+            initial_on_disk.as_slice()
+        );
 
-        // Regression test (GR-07 / devrev GR-04 on Windows): retained open handle on --state
-        // is rejected by exclusive share_mode(0) open on read and rewrite.
+        // Windows journal handle-retention and replacement checks:
+        // 1. Retained data handle is rejected by share_mode(0) / FILE_SHARE_DELETE.
+        // 2. Retained WRITE_DAC-only handle on the old file object is orphaned onto the
+        //    unlinked file object when `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` publishes
+        //    a new temp file object (`new_snap.file_id != initial_snap.file_id`), and any
+        //    unauthenticated journal modification is rejected by `auth_tag`.
         #[cfg(windows)]
         {
-            let retained_handle = fs::File::open(&preserved_state_path).expect("open retained");
-            let retained_read_err = read_existing_state_journal_for_cas(&preserved_state_path)
-                .expect_err("retained handle on --state must be rejected by share_mode(0)");
-            let _ = retained_read_err;
-            let retained_write_err =
-                persist_state_journal(&preserved_state_path, &bounded_journal, Some(&initial_snap))
-                    .expect_err("retained handle on --state must be rejected before rewrite");
-            let _ = retained_write_err;
-            drop(retained_handle);
+            use std::os::windows::fs::OpenOptionsExt;
+            const WRITE_DAC: u32 = 0x0004_0000;
+            const FILE_SHARE_ALL: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
+
+            let retained_data_handle =
+                fs::File::open(&preserved_state_path).expect("open retained data handle");
+            assert!(
+                read_existing_state_journal_for_cas(&preserved_state_path).is_err(),
+                "retained data handle on --state must be rejected by share_mode(0)"
+            );
+            assert!(
+                persist_state_journal(
+                    &preserved_state_path,
+                    &mut bounded_journal,
+                    &test_auth_key,
+                    Some(&initial_snap),
+                )
+                .is_err(),
+                "retained data handle on --state must be rejected before rewrite"
+            );
+            drop(retained_data_handle);
+
+            // Open a WRITE_DAC-only handle with compatible sharing, then rewrite the journal via
+            // persist_state_journal (`MoveFileExW(MOVEFILE_REPLACE_EXISTING)`): the published path
+            // now refers to a brand-new file object (`replaced_snap.file_id != initial_snap.file_id`),
+            // so the retained WRITE_DAC handle no longer refers to the live journal at `preserved_state_path`.
+            let retained_write_dac = fs::OpenOptions::new()
+                .access_mode(WRITE_DAC)
+                .share_mode(FILE_SHARE_ALL)
+                .open(&preserved_state_path)
+                .expect("open retained WRITE_DAC handle");
+            let (old_handle_id, _) = file_identity_and_nlink(&retained_write_dac).unwrap();
+            assert_eq!(old_handle_id, initial_snap.file_id);
+
+            let replaced_snap = persist_state_journal(
+                &preserved_state_path,
+                &mut bounded_journal,
+                &test_auth_key,
+                Some(&initial_snap),
+            )
+            .expect("rewrite journal via MoveFileExW");
+            assert_ne!(
+                replaced_snap.file_id, old_handle_id,
+                "MoveFileExW replacement must bind state_path to a new file object, orphaning the retained WRITE_DAC handle"
+            );
+            drop(retained_write_dac);
         }
 
         // On macOS, a --state journal with a non-owner extended ACL must be rejected (not merely warned).
         #[cfg(target_os = "macos")]
         {
             let acl_state_path = dir.path().join("acl-state.json");
-            let valid_journal = BatchStateJournal {
+            let mut valid_journal = BatchStateJournal {
                 schema: STATE_JOURNAL_SCHEMA.to_string(),
                 operation: "blob-rekey-batch".to_string(),
                 target_recipients: vec![r.to_string()],
@@ -7154,9 +8004,11 @@ mod tests {
                 allow_recipient_mismatch: false,
                 allow_self_lockout: false,
                 allow_large: false,
+                auth_tag: String::new(),
                 records: std::collections::BTreeMap::new(),
             };
-            persist_state_journal(&acl_state_path, &valid_journal, None).unwrap();
+            persist_state_journal(&acl_state_path, &mut valid_journal, &test_auth_key, None)
+                .unwrap();
             let status = std::process::Command::new("/bin/chmod")
                 .args(["+a", "user:root allow read,write"])
                 .arg(&acl_state_path)
