@@ -3090,6 +3090,12 @@ mod windows_dacl {
             lpNewFileName: *const u16,
             dwFlags: u32,
         ) -> i32;
+        fn SetFileInformationByHandle(
+            hFile: *mut core::ffi::c_void,
+            FileInformationClass: u32,
+            lpFileInformation: *const core::ffi::c_void,
+            dwBufferSize: u32,
+        ) -> i32;
     }
 
     #[link(name = "advapi32")]
@@ -3171,10 +3177,12 @@ mod windows_dacl {
     const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
     const GENERIC_READ: u32 = 0x8000_0000;
     const GENERIC_WRITE: u32 = 0x4000_0000;
+    const DELETE: u32 = 0x0001_0000;
     const READ_CONTROL: u32 = 0x0002_0000;
     const WRITE_DAC: u32 = 0x0004_0000;
     const WRITE_OWNER: u32 = 0x0008_0000;
     const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+    const FILE_RENAME_INFO_CLASS: u32 = 3;
     const FILE_SHARE_READ: u32 = 0x0000_0001;
     const FILE_SHARE_WRITE: u32 = 0x0000_0002;
     const FILE_SHARE_DELETE: u32 = 0x0000_0004;
@@ -3905,6 +3913,60 @@ mod windows_dacl {
         Ok(())
     }
 
+    /// Rename an open `source_file` handle (`DELETE` access) directly to
+    /// `target_path` via `SetFileInformationByHandle(FileRenameInfo)` so the
+    /// staged file is renamed by handle without re-resolving its temporary path.
+    fn rename_open_handle_to_path(
+        source_file: &File,
+        target_path: &Path,
+        replace_if_exists: bool,
+    ) -> io::Result<()> {
+        #[repr(C)]
+        struct FileRenameInfoHeader {
+            replace_if_exists: u8,
+            _pad: [u8; 7],
+            root_directory: *mut core::ffi::c_void,
+            file_name_length: u32,
+        }
+
+        let wide_name: Vec<u16> = target_path.as_os_str().encode_wide().collect();
+        let name_bytes_len = wide_name
+            .len()
+            .checked_mul(2)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path too long"))?;
+        let header_size = core::mem::size_of::<FileRenameInfoHeader>();
+        let total_bytes = header_size + name_bytes_len + 2;
+        let mut aligned_buf = vec![0u64; total_bytes.div_ceil(8)];
+        let buf_ptr = aligned_buf.as_mut_ptr().cast::<u8>();
+        let header = FileRenameInfoHeader {
+            replace_if_exists: u8::from(replace_if_exists),
+            _pad: [0; 7],
+            root_directory: core::ptr::null_mut(),
+            file_name_length: name_bytes_len as u32,
+        };
+        // SAFETY: `aligned_buf` is 8-byte aligned and holds at least `total_bytes` bytes.
+        unsafe {
+            core::ptr::write(buf_ptr.cast::<FileRenameInfoHeader>(), header);
+            let name_dst = buf_ptr.add(header_size).cast::<u16>();
+            core::ptr::copy_nonoverlapping(wide_name.as_ptr(), name_dst, wide_name.len());
+            core::ptr::write(name_dst.add(wide_name.len()), 0u16);
+        }
+        // SAFETY: `source_file` is an open handle with `DELETE` access and `buf_ptr`
+        // points to a valid `FILE_RENAME_INFO` buffer of `total_bytes` bytes.
+        let ok = unsafe {
+            SetFileInformationByHandle(
+                source_file.as_raw_handle(),
+                FILE_RENAME_INFO_CLASS,
+                buf_ptr.cast(),
+                total_bytes as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     pub(super) fn commit_batch_recipient_refresh_windows(
         parent_dir: &File,
         canon_parent: &Path,
@@ -3942,11 +4004,12 @@ mod windows_dacl {
             let candidate = canon_parent.join(format!(".seclusor-rcpt-{pid}-{ts}-{attempt}.tmp"));
             let wide_candidate = encode_wide_null(&candidate);
             // SAFETY: `wide_candidate` is null-terminated; `CREATE_NEW` + `dwShareMode = 0`
-            // creates an exclusive temporary file in `canon_parent`.
+            // + `DELETE` creates an exclusive temporary file in `canon_parent` that remains
+            // open and locked against any external open/rename until `SetFileInformationByHandle`.
             let handle = unsafe {
                 CreateFileW(
                     wide_candidate.as_ptr(),
-                    GENERIC_READ | GENERIC_WRITE,
+                    GENERIC_READ | GENERIC_WRITE | DELETE,
                     0,
                     core::ptr::null_mut(),
                     CREATE_NEW,
@@ -3996,14 +4059,16 @@ mod windows_dacl {
             let _ = fs::remove_file(&temp_path);
             return Err(CliError::Io(err));
         }
-        drop(temp_file);
 
+        // Keep `temp_file` open (`dwShareMode = 0`) across `_cas_lock` acquisition
+        // and `SetFileInformationByHandle` so the staged file cannot be swapped or
+        // modified before or during publication.
         let _cas_lock = if let Some(expected_id) = expected_file_id {
             let expected_bytes = expected_prior_bytes.unwrap_or(&[]);
             let wide_target = encode_wide_null(&target_path);
             // SAFETY: `wide_target` is null-terminated; `FILE_SHARE_DELETE` excludes
-            // concurrent data handles while permitting `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`
-            // while this handle and its `LockFileEx` guard remain held.
+            // concurrent data handles while permitting handle-based replacement while
+            // this handle and its `LockFileEx` guard remain held.
             let handle = unsafe {
                 CreateFileW(
                     wide_target.as_ptr(),
@@ -4018,6 +4083,7 @@ mod windows_dacl {
             let invalid = (-1isize) as *mut core::ffi::c_void;
             if handle.is_null() || handle == invalid {
                 let err = io::Error::last_os_error();
+                drop(temp_file);
                 let _ = fs::remove_file(&temp_path);
                 if err.kind() == io::ErrorKind::NotFound {
                     return Err(CliError::ConcurrentModification {
@@ -4031,6 +4097,7 @@ mod windows_dacl {
             let mut guard = match lock_target_handle(existing) {
                 Ok(g) => g,
                 Err(_) => {
+                    drop(temp_file);
                     let _ = fs::remove_file(&temp_path);
                     return Err(CliError::ConcurrentModification {
                         path: target_path.display().to_string(),
@@ -4077,6 +4144,7 @@ mod windows_dacl {
             })();
             if let Err(err) = check_res {
                 drop(guard);
+                drop(temp_file);
                 let _ = fs::remove_file(&temp_path);
                 return Err(err);
             }
@@ -4085,36 +4153,29 @@ mod windows_dacl {
             None
         };
 
-        let (pre_publish_temp_id, pre_publish_temp_nlink) =
-            match path_identity_and_nlink_nofollow(&temp_path) {
-                Ok(v) => v,
-                Err(err) => {
-                    drop(_cas_lock);
-                    let _ = fs::remove_file(&temp_path);
-                    return Err(CliError::Io(err));
-                }
-            };
-        if pre_publish_temp_id != temp_id || pre_publish_temp_nlink != 1 {
+        let (still_temp_id, still_temp_nlink) = match file_identity_and_nlink(&temp_file) {
+            Ok(v) => v,
+            Err(err) => {
+                drop(_cas_lock);
+                drop(temp_file);
+                let _ = fs::remove_file(&temp_path);
+                return Err(CliError::Io(err));
+            }
+        };
+        if still_temp_id != temp_id || still_temp_nlink != 1 {
             drop(_cas_lock);
+            drop(temp_file);
             let _ = fs::remove_file(&temp_path);
             return Err(CliError::ConcurrentModification {
                 path: temp_path.display().to_string(),
             });
         }
 
-        let wide_temp = encode_wide_null(&temp_path);
-        let wide_target = encode_wide_null(&target_path);
-        let move_flags = if expected_file_id.is_some() {
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH
-        } else {
-            MOVEFILE_WRITE_THROUGH
-        };
-        // SAFETY: `wide_temp` and `wide_target` are null-terminated UTF-16 paths;
-        // `_cas_lock` and `parent_dir` remain held across `MoveFileExW`.
-        let ok = unsafe { MoveFileExW(wide_temp.as_ptr(), wide_target.as_ptr(), move_flags) };
-        drop(_cas_lock);
-        if ok == 0 {
-            let err = io::Error::last_os_error();
+        let rename_res =
+            rename_open_handle_to_path(&temp_file, &target_path, expected_file_id.is_some());
+        if let Err(err) = rename_res {
+            drop(_cas_lock);
+            drop(temp_file);
             let _ = fs::remove_file(&temp_path);
             if expected_file_id.is_none() && err.kind() == io::ErrorKind::AlreadyExists {
                 return Err(CliError::ConcurrentModification {
@@ -4124,9 +4185,17 @@ mod windows_dacl {
             return Err(CliError::Io(err));
         }
 
+        let (post_handle_id, post_handle_nlink) =
+            file_identity_and_nlink(&temp_file).map_err(CliError::Io)?;
+        drop(_cas_lock);
+        drop(temp_file);
         let (published_id, published_nlink) =
             path_identity_and_nlink_nofollow(&target_path).map_err(CliError::Io)?;
-        if published_id != temp_id || published_nlink != 1 {
+        if post_handle_id != temp_id
+            || post_handle_nlink != 1
+            || published_id != temp_id
+            || published_nlink != 1
+        {
             return Err(CliError::ConcurrentModification {
                 path: target_path.display().to_string(),
             });
@@ -4679,6 +4748,118 @@ fn is_json_secrets_document(bytes: &[u8]) -> bool {
 
 const MAX_BATCH_RECIPIENT_FILE_BYTES: u64 = 1024 * 1024;
 
+#[cfg(test)]
+type PostStatHook = Box<dyn FnOnce()>;
+
+#[cfg(test)]
+thread_local! {
+    static BATCH_RECIPIENT_POST_STAT_HOOK: std::cell::RefCell<Option<PostStatHook>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn set_batch_recipient_post_stat_hook(hook: Option<PostStatHook>) {
+    BATCH_RECIPIENT_POST_STAT_HOOK.with(|h| *h.borrow_mut() = hook);
+}
+
+#[cfg(all(test, unix))]
+fn run_batch_recipient_post_stat_hook() {
+    let hook = BATCH_RECIPIENT_POST_STAT_HOOK.with(|h| h.borrow_mut().take());
+    if let Some(f) = hook {
+        f();
+    }
+}
+
+/// Validate a Unix directory's ownership and mode bits from its open handle metadata.
+///
+/// - The directory owner (`dir_uid`) must be `current_uid` or `0` (`root`).
+/// - For the target's immediate parent directory (`is_leaf_parent == true`),
+///   group and other write bits (`0o022`) must be clear so no untrusted
+///   namespace writer can create, unlink, or rename entries in the directory.
+/// - For intermediate ancestor directories (`is_leaf_parent == false`), group
+///   and other write bits must be clear unless the directory is owned by `root`
+///   (`dir_uid == 0`) and has the sticky bit (`0o1000`, e.g. `/tmp`), where the
+///   kernel forbids non-owners from renaming or unlinking child directories
+///   owned by `current_uid`.
+#[cfg(any(unix, test))]
+fn validate_unix_directory_owner_and_mode(
+    current_uid: u32,
+    dir_uid: u32,
+    dir_mode: u32,
+    is_leaf_parent: bool,
+    dir_display: &Path,
+) -> CliResult<()> {
+    if dir_uid != current_uid && dir_uid != 0 {
+        return Err(CliError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "directory {} is owned by uid {dir_uid} (expected current uid {current_uid} or 0)",
+                dir_display.display()
+            ),
+        )));
+    }
+    let writable_by_group_or_other = (dir_mode & 0o022) != 0;
+    if writable_by_group_or_other {
+        let sticky_root_ancestor = !is_leaf_parent && dir_uid == 0 && (dir_mode & 0o1000) != 0;
+        if !sticky_root_ancestor {
+            return Err(CliError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "directory {} has insecure group/other-writable mode {:04o}; \
+                     remove group/other write permissions (chmod go-w)",
+                    dir_display.display(),
+                    dir_mode & 0o7777
+                ),
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+unsafe fn atomic_swap_in_dir(
+    dir_fd: libc::c_int,
+    first_name: *const libc::c_char,
+    second_name: *const libc::c_char,
+) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let rc = unsafe {
+            libc::renameatx_np(dir_fd, first_name, dir_fd, second_name, libc::RENAME_SWAP)
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        const RENAME_EXCHANGE: libc::c_uint = 2;
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                dir_fd,
+                first_name,
+                dir_fd,
+                second_name,
+                RENAME_EXCHANGE,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (dir_fd, first_name, second_name);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "atomic directory entry swap is not supported on this platform",
+        ))
+    }
+}
+
 struct BatchRecipientRefreshPlan {
     user_path: PathBuf,
     canon_parent: PathBuf,
@@ -4713,7 +4894,11 @@ fn open_dir_nofollow_anchored(
         use std::ffi::CString;
         use std::os::fd::{AsRawFd, FromRawFd};
         use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         use std::path::Component;
+
+        // SAFETY: `getuid` has no memory-safety preconditions and cannot fail.
+        let current_uid = unsafe { libc::getuid() };
 
         let base_path = if dir_path.is_relative() {
             let cwd = std::env::current_dir().map_err(CliError::Io)?;
@@ -4757,6 +4942,14 @@ fn open_dir_nofollow_anchored(
                     }
                     // SAFETY: `next_fd` is a valid newly opened directory FD.
                     cur_dir = unsafe { fs::File::from_raw_fd(next_fd) };
+                    let step_meta = cur_dir.metadata().map_err(CliError::Io)?;
+                    validate_unix_directory_owner_and_mode(
+                        current_uid,
+                        step_meta.uid(),
+                        step_meta.permissions().mode(),
+                        false,
+                        &cur_path,
+                    )?;
                 }
                 Component::Normal(part) => {
                     cur_path.push(part);
@@ -4802,9 +4995,25 @@ fn open_dir_nofollow_anchored(
                     }
                     // SAFETY: `next_fd` is a valid newly opened directory FD.
                     cur_dir = unsafe { fs::File::from_raw_fd(next_fd) };
+                    let step_meta = cur_dir.metadata().map_err(CliError::Io)?;
+                    validate_unix_directory_owner_and_mode(
+                        current_uid,
+                        step_meta.uid(),
+                        step_meta.permissions().mode(),
+                        false,
+                        &cur_path,
+                    )?;
                 }
             }
         }
+        let leaf_dir_meta = cur_dir.metadata().map_err(CliError::Io)?;
+        validate_unix_directory_owner_and_mode(
+            current_uid,
+            leaf_dir_meta.uid(),
+            leaf_dir_meta.permissions().mode(),
+            true,
+            dir_path,
+        )?;
         cur_dir
     };
 
@@ -5257,15 +5466,31 @@ fn commit_batch_recipient_refresh(plan: &BatchRecipientRefreshPlan) -> CliResult
                 });
             }
 
+            // Lock and keep `temp_file` open across publication so the staged inode
+            // cannot be modified or replaced before or during atomic exchange.
+            // SAFETY: `temp_file` is a valid open file descriptor.
+            let temp_lock_rc =
+                unsafe { libc::flock(temp_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if temp_lock_rc != 0 {
+                drop(temp_file);
+                cleanup_temp(&temp_cstr);
+                return Err(CliError::ConcurrentModification {
+                    path: plan.user_path.display().to_string(),
+                });
+            }
+
             if let Err(err) = temp_file
                 .write_all(&plan.content)
                 .and_then(|()| temp_file.sync_all())
             {
+                // SAFETY: `temp_file` is an open FD.
+                unsafe {
+                    let _ = libc::flock(temp_file.as_raw_fd(), libc::LOCK_UN);
+                }
                 drop(temp_file);
                 cleanup_temp(&temp_cstr);
                 return Err(CliError::Io(err));
             }
-            drop(temp_file);
 
             if let Some(expected_id) = plan.existing_file_id {
                 let expected_bytes = plan.prior_bytes.as_deref().unwrap_or(&[]);
@@ -5279,6 +5504,11 @@ fn commit_batch_recipient_refresh(plan: &BatchRecipientRefreshPlan) -> CliResult
                 };
                 if target_fd < 0 {
                     let err = std::io::Error::last_os_error();
+                    // SAFETY: `temp_file` is an open FD.
+                    unsafe {
+                        let _ = libc::flock(temp_file.as_raw_fd(), libc::LOCK_UN);
+                    }
+                    drop(temp_file);
                     cleanup_temp(&temp_cstr);
                     if err.kind() == std::io::ErrorKind::NotFound
                         || err.raw_os_error() == Some(libc::ELOOP)
@@ -5296,6 +5526,11 @@ fn commit_batch_recipient_refresh(plan: &BatchRecipientRefreshPlan) -> CliResult
                     unsafe { libc::flock(target_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
                 if lock_rc != 0 {
                     drop(target_file);
+                    // SAFETY: `temp_file` is an open FD.
+                    unsafe {
+                        let _ = libc::flock(temp_file.as_raw_fd(), libc::LOCK_UN);
+                    }
+                    drop(temp_file);
                     cleanup_temp(&temp_cstr);
                     return Err(CliError::ConcurrentModification {
                         path: plan.user_path.display().to_string(),
@@ -5358,34 +5593,131 @@ fn commit_batch_recipient_refresh(plan: &BatchRecipientRefreshPlan) -> CliResult
                             path: plan.user_path.display().to_string(),
                         });
                     }
-                    // SAFETY: `parent_fd`, `temp_cstr`, and `leaf_cstr` are valid; `flock` on
-                    // `target_file` remains held across `renameat`.
-                    let ren_rc = unsafe {
-                        libc::renameat(
+
+                    let mut pre_temp_st: libc::stat = unsafe { core::mem::zeroed() };
+                    // SAFETY: `parent_fd` and `temp_cstr` are valid.
+                    if unsafe {
+                        libc::fstatat(
                             parent_fd,
                             temp_cstr.as_ptr(),
+                            &mut pre_temp_st,
+                            libc::AT_SYMLINK_NOFOLLOW,
+                        )
+                    } != 0
+                    {
+                        return Err(CliError::ConcurrentModification {
+                            path: plan.user_path.display().to_string(),
+                        });
+                    }
+                    #[allow(clippy::unnecessary_cast)]
+                    let pre_temp_stat_id = (pre_temp_st.st_dev as u64, pre_temp_st.st_ino as u64);
+                    #[allow(clippy::unnecessary_cast)]
+                    let pre_temp_stat_nlink = pre_temp_st.st_nlink as u64;
+                    let (cur_temp_id, cur_temp_nlink) =
+                        file_identity_and_nlink(&temp_file).map_err(CliError::Io)?;
+                    if pre_temp_stat_id != temp_id
+                        || cur_temp_id != temp_id
+                        || pre_temp_stat_nlink != 1
+                        || cur_temp_nlink != 1
+                    {
+                        return Err(CliError::ConcurrentModification {
+                            path: plan.user_path.display().to_string(),
+                        });
+                    }
+
+                    #[cfg(test)]
+                    run_batch_recipient_post_stat_hook();
+
+                    // Atomically exchange `temp_cstr` and `leaf_cstr` inside `parent_fd`
+                    // while both `temp_file` (`temp_id`) and `target_file` (`expected_id`)
+                    // remain open and locked. After the exchange, `temp_cstr` names the
+                    // exact inode that was displaced from `leaf_cstr`.
+                    // SAFETY: `parent_fd`, `temp_cstr`, and `leaf_cstr` are valid.
+                    unsafe {
+                        atomic_swap_in_dir(parent_fd, temp_cstr.as_ptr(), plan.leaf_cstr.as_ptr())
+                            .map_err(CliError::Io)?;
+                    }
+
+                    let mut displaced_st: libc::stat = unsafe { core::mem::zeroed() };
+                    let mut published_st: libc::stat = unsafe { core::mem::zeroed() };
+                    // SAFETY: `parent_fd`, `temp_cstr`, and `leaf_cstr` are valid.
+                    let disp_rc = unsafe {
+                        libc::fstatat(
                             parent_fd,
-                            plan.leaf_cstr.as_ptr(),
+                            temp_cstr.as_ptr(),
+                            &mut displaced_st,
+                            libc::AT_SYMLINK_NOFOLLOW,
                         )
                     };
-                    if ren_rc != 0 {
-                        return Err(CliError::Io(std::io::Error::last_os_error()));
+                    // SAFETY: `parent_fd` and `leaf_cstr` are valid.
+                    let pub_rc = unsafe {
+                        libc::fstatat(
+                            parent_fd,
+                            plan.leaf_cstr.as_ptr(),
+                            &mut published_st,
+                            libc::AT_SYMLINK_NOFOLLOW,
+                        )
+                    };
+                    #[allow(clippy::unnecessary_cast)]
+                    let displaced_id = (displaced_st.st_dev as u64, displaced_st.st_ino as u64);
+                    #[allow(clippy::unnecessary_cast)]
+                    let displaced_nlink = displaced_st.st_nlink as u64;
+                    #[allow(clippy::unnecessary_cast)]
+                    let published_id = (published_st.st_dev as u64, published_st.st_ino as u64);
+                    #[allow(clippy::unnecessary_cast)]
+                    let published_nlink = published_st.st_nlink as u64;
+
+                    if disp_rc != 0
+                        || pub_rc != 0
+                        || displaced_id != expected_id
+                        || displaced_nlink != 1
+                        || published_id != temp_id
+                        || published_nlink != 1
+                    {
+                        // Roll back the swap so the substituted entry at `leaf_cstr` is restored.
+                        // SAFETY: `parent_fd`, `temp_cstr`, and `leaf_cstr` are valid.
+                        unsafe {
+                            let _ = atomic_swap_in_dir(
+                                parent_fd,
+                                temp_cstr.as_ptr(),
+                                plan.leaf_cstr.as_ptr(),
+                            );
+                        }
+                        return Err(CliError::ConcurrentModification {
+                            path: plan.user_path.display().to_string(),
+                        });
+                    }
+
+                    // The displaced entry at `temp_cstr` is proven to be `expected_id`;
+                    // unlink `temp_cstr` and verify `target_file`'s link count dropped to 0.
+                    cleanup_temp(&temp_cstr);
+                    let (after_target_id, after_target_nlink) =
+                        file_identity_and_nlink(&target_file).map_err(CliError::Io)?;
+                    if after_target_id != expected_id || after_target_nlink != 0 {
+                        return Err(CliError::ConcurrentModification {
+                            path: plan.user_path.display().to_string(),
+                        });
                     }
                     Ok(())
                 })();
-                // SAFETY: `target_file` is an open FD; unlock before dropping.
+                // SAFETY: `target_file` and `temp_file` are open FDs; unlock before dropping.
                 unsafe {
                     let _ = libc::flock(target_file.as_raw_fd(), libc::LOCK_UN);
                 }
                 drop(target_file);
                 if let Err(err) = cas_res {
+                    // SAFETY: `temp_file` is an open FD.
+                    unsafe {
+                        let _ = libc::flock(temp_file.as_raw_fd(), libc::LOCK_UN);
+                    }
+                    drop(temp_file);
                     cleanup_temp(&temp_cstr);
                     return Err(err);
                 }
             } else {
                 // Target did not exist at preparation time: publish with atomic no-clobber
-                // (`linkat` + `unlinkat`) relative to `parent_fd` so any racing file or
-                // symlink created at `leaf_cstr` after preparation is never overwritten.
+                // (`linkat` + `unlinkat`) relative to `parent_fd` while `temp_file` remains
+                // open, verifying `temp_file`'s link count transitions 1 -> 2 -> 1.
                 // SAFETY: `parent_fd`, `temp_cstr`, and `leaf_cstr` are valid.
                 let link_rc = unsafe {
                     libc::linkat(
@@ -5398,6 +5730,11 @@ fn commit_batch_recipient_refresh(plan: &BatchRecipientRefreshPlan) -> CliResult
                 };
                 if link_rc != 0 {
                     let err = std::io::Error::last_os_error();
+                    // SAFETY: `temp_file` is an open FD.
+                    unsafe {
+                        let _ = libc::flock(temp_file.as_raw_fd(), libc::LOCK_UN);
+                    }
+                    drop(temp_file);
                     cleanup_temp(&temp_cstr);
                     if err.kind() == std::io::ErrorKind::AlreadyExists {
                         return Err(CliError::ConcurrentModification {
@@ -5406,7 +5743,32 @@ fn commit_batch_recipient_refresh(plan: &BatchRecipientRefreshPlan) -> CliResult
                     }
                     return Err(CliError::Io(err));
                 }
+                let (linked_id, linked_nlink) =
+                    file_identity_and_nlink(&temp_file).map_err(CliError::Io)?;
                 cleanup_temp(&temp_cstr);
+                if linked_id != temp_id || linked_nlink != 2 {
+                    // SAFETY: `temp_file` is an open FD.
+                    unsafe {
+                        let _ = libc::flock(temp_file.as_raw_fd(), libc::LOCK_UN);
+                    }
+                    drop(temp_file);
+                    return Err(CliError::ConcurrentModification {
+                        path: plan.user_path.display().to_string(),
+                    });
+                }
+            }
+
+            let (final_temp_id, final_temp_nlink) =
+                file_identity_and_nlink(&temp_file).map_err(CliError::Io)?;
+            // SAFETY: `temp_file` is an open FD.
+            unsafe {
+                let _ = libc::flock(temp_file.as_raw_fd(), libc::LOCK_UN);
+            }
+            drop(temp_file);
+            if final_temp_id != temp_id || final_temp_nlink != 1 {
+                return Err(CliError::ConcurrentModification {
+                    path: plan.user_path.display().to_string(),
+                });
             }
 
             let mut pub_st: libc::stat = unsafe { core::mem::zeroed() };
@@ -8889,6 +9251,93 @@ mod tests {
             fs::remove_file(&swap_dir).unwrap();
             fs::remove_dir_all(&backup_swap_dir).unwrap();
             fs::remove_dir_all(&redirected_dir).unwrap();
+
+            // Group/other-writable parent directory on Unix must be rejected by handle-verified
+            // ownership/mode check.
+            validate_unix_directory_owner_and_mode(1000, 1000, 0o700, true, Path::new("/tmp/d"))
+                .expect("owner-only directory mode 0700 must pass");
+            validate_unix_directory_owner_and_mode(1000, 0, 0o1777, false, Path::new("/tmp"))
+                .expect("root-owned sticky ancestor /tmp (1777) must pass");
+            assert!(
+                validate_unix_directory_owner_and_mode(
+                    1000,
+                    9999,
+                    0o700,
+                    true,
+                    Path::new("/tmp/foreign")
+                )
+                .is_err(),
+                "foreign-owned directory must be rejected"
+            );
+            assert!(
+                validate_unix_directory_owner_and_mode(
+                    1000,
+                    1000,
+                    0o777,
+                    true,
+                    Path::new("/tmp/world-writable")
+                )
+                .is_err(),
+                "world-writable leaf parent directory must be rejected"
+            );
+            let writable_parent = dir.path().join("writable-parent");
+            fs::create_dir(&writable_parent).unwrap();
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&writable_parent, fs::Permissions::from_mode(0o777)).unwrap();
+            }
+            let err_writable_parent = prepare_batch_recipient_refresh(
+                &writable_parent.join("recipients.txt"),
+                &[],
+                &[],
+                None,
+                &[],
+                &[],
+                &[r.to_string()],
+            )
+            .err()
+            .expect("group/other-writable parent directory must be rejected");
+            assert!(err_writable_parent
+                .to_string()
+                .contains("group/other-writable"));
+            fs::remove_dir_all(&writable_parent).unwrap();
+
+            // Deterministic post-stat substitution test: inject a destination replacement
+            // immediately after the final pre-publication fstatat + byte read. Atomic swap
+            // (`RENAME_SWAP` / `RENAME_EXCHANGE`) must detect that the displaced inode is
+            // not `expected_id`, roll back the swap so the substituted entry remains intact,
+            // and fail closed.
+            let post_stat_wr = real_sub.join("post-stat-recipients.txt");
+            fs::write(&post_stat_wr, "age1old\n").unwrap();
+            let post_stat_plan = prepare_batch_recipient_refresh(
+                &post_stat_wr,
+                &[],
+                &[],
+                None,
+                &[],
+                &[],
+                &[r.to_string()],
+            )
+            .expect("prepare post-stat recipient file");
+            let post_stat_wr_clone = post_stat_wr.clone();
+            set_batch_recipient_post_stat_hook(Some(Box::new(move || {
+                let replacement = post_stat_wr_clone.with_extension("subst");
+                fs::write(&replacement, "substituted-after-final-stat\n").unwrap();
+                fs::rename(&replacement, &post_stat_wr_clone).unwrap();
+            })));
+            let post_stat_err = commit_batch_recipient_refresh(&post_stat_plan)
+                .expect_err("post-stat destination substitution must be caught and rolled back");
+            set_batch_recipient_post_stat_hook(None);
+            assert!(matches!(
+                post_stat_err,
+                CliError::RecipientRefreshFailed { .. }
+            ));
+            assert_eq!(
+                fs::read_to_string(&post_stat_wr).unwrap(),
+                "substituted-after-final-stat\n",
+                "rollback must preserve the substituted destination entry untouched"
+            );
+            fs::remove_file(&post_stat_wr).unwrap();
 
             let non_utf8_path = dir.path().join(OsStr::from_bytes(b"non-utf8-\xff.age"));
             let err_non_utf8 = collect_batch_files(&BlobRekeyBatchArgs {
