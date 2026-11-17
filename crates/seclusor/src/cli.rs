@@ -614,6 +614,10 @@ pub(crate) struct BlobCommand {
 pub(crate) enum BlobSubcommand {
     Encrypt(BlobEncryptArgs),
     Decrypt(BlobDecryptArgs),
+    /// Re-encrypt a whole-file blob to a new recipient set without writing plaintext to disk.
+    Rekey(BlobRekeyArgs),
+    /// Verify in memory that an identity decrypts and authenticates a whole-file blob.
+    Verify(BlobVerifyArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -649,6 +653,85 @@ pub(crate) struct BlobDecryptArgs {
     pub(crate) identities: IdentityArgs,
     #[command(flatten)]
     pub(crate) passphrase: PassphraseArgs,
+}
+
+#[derive(Debug, Parser)]
+pub(crate) struct BlobRekeyArgs {
+    #[arg(long, help = "Path to encrypted .age blob to rekey")]
+    pub(crate) input: PathBuf,
+    #[arg(
+        long,
+        help = "Write rekeyed output to this path (default: overwrite --input in place)"
+    )]
+    pub(crate) output: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "After blob rekey succeeds, atomically write the resulting public recipient set to PATH"
+    )]
+    pub(crate) write_recipients: Option<PathBuf>,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Allow rekey when no target-set private identity can decrypt and authenticate the new blob before commit"
+    )]
+    pub(crate) allow_self_lockout: bool,
+    #[arg(long, default_value_t = false, help = "Allow files larger than 10 MB")]
+    pub(crate) allow_large: bool,
+    #[command(flatten)]
+    pub(crate) recipients: RecipientArgs,
+    #[command(flatten)]
+    pub(crate) prior_recipients: PriorRecipientArgs,
+    #[command(flatten)]
+    pub(crate) identities: IdentityArgs,
+    #[command(flatten)]
+    pub(crate) verify_identities: VerifyIdentityArgs,
+    #[command(flatten)]
+    pub(crate) passphrase: PassphraseArgs,
+}
+
+#[derive(Debug, Parser)]
+pub(crate) struct BlobVerifyArgs {
+    #[arg(long, help = "Path to encrypted .age blob to verify")]
+    pub(crate) input: PathBuf,
+    #[arg(long, default_value_t = false, help = "Allow files larger than 10 MB")]
+    pub(crate) allow_large: bool,
+    #[command(flatten)]
+    pub(crate) identities: IdentityArgs,
+    #[command(flatten)]
+    pub(crate) passphrase: PassphraseArgs,
+}
+
+#[derive(Debug, Clone, Args, Default)]
+pub(crate) struct PriorRecipientArgs {
+    #[arg(
+        long = "prior-recipient",
+        help = "Asserted current age recipient (age1...) on the blob; repeatable"
+    )]
+    pub(crate) prior_recipients: Vec<String>,
+    #[arg(
+        long = "prior-recipient-file",
+        help = "Path to a file listing the asserted current age recipients on the blob; repeatable"
+    )]
+    pub(crate) prior_recipient_files: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args, Default)]
+pub(crate) struct VerifyIdentityArgs {
+    #[arg(
+        long = "verify-identity-file",
+        conflicts_with = "verify_identity_public_key",
+        help = "Path to a target-set age identity file for pre-commit verification; repeatable"
+    )]
+    pub(crate) verify_identity_files: Vec<PathBuf>,
+    #[arg(
+        long = "verify-identity-public-key",
+        value_name = "AGE1",
+        conflicts_with = "verify_identity_files",
+        value_parser = parse_identity_public_key_arg,
+        help = "Target-set age recipient (age1...) to locate and load for pre-commit verification"
+    )]
+    pub(crate) verify_identity_public_key: Option<String>,
 }
 
 #[derive(Debug, Parser)]

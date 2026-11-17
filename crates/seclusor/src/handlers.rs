@@ -19,7 +19,7 @@ fn reject_recipient_mismatch_override(allow_recipient_mismatch: bool) -> CliResu
     if allow_recipient_mismatch {
         return Err(CliError::Message(
             "--allow-recipient-mismatch is only valid for `set`, `import-env`, \
-             `rekey`, and `bundle encrypt`"
+             `rekey`, `bundle encrypt`, and `blob rekey`"
                 .to_string(),
         ));
     }
@@ -76,8 +76,7 @@ pub(crate) fn handle_secrets_command(
             inline::handle_inline_command(args.command)
         }
         SecretsSubcommand::Blob(args) => {
-            reject_recipient_mismatch_override(allow_recipient_mismatch)?;
-            blob::handle_blob_command(args.command)
+            blob::handle_blob_command_with_policy(args.command, allow_recipient_mismatch)
         }
         SecretsSubcommand::Convert(args) => {
             reject_recipient_mismatch_override(allow_recipient_mismatch)?;

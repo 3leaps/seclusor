@@ -1047,6 +1047,7 @@ dependencies = [
  "libc",
  "seclusor-core",
  "thiserror 2.0.18",
+ "zeroize",
 ]
 
 [[package]]

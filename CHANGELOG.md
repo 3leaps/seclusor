@@ -8,6 +8,20 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+### Added
+
+- `secrets blob rekey` and `secrets blob verify` for rotating recipients on
+  whole-file age blobs in memory without writing plaintext to disk. `blob rekey`
+  always generates a fresh file key, refuses seclusor bundle JSON documents
+  (pointing to `secrets rekey`), enforces recipient-delta and stanza-count /
+  opening-identity tripwires against `--prior-recipient` /
+  `--prior-recipient-file`, verifies in memory before commit that a target-set
+  private identity (`--identity-*` or `--verify-identity-*`) decrypts and
+  authenticates the new blob unless `--allow-self-lockout` is passed, supports
+  `--write-recipients`, and commits via the atomic private-ciphertext writer.
+  `blob verify` decrypts and authenticates a blob in memory, prints the opening
+  public key on `stdout`, and writes nothing to disk.
+
 ### Changed
 
 - `secrets blob encrypt` now writes output atomically (`0600` on Unix with macOS

@@ -44,6 +44,58 @@ seclusor secrets blob decrypt \
 
 The decrypted output is written with `0600` permissions on Unix.
 
+## 4. Verify a blob in memory
+
+To verify that an identity can decrypt and authenticate a `.age` blob without
+writing plaintext to disk:
+
+```bash
+seclusor secrets blob verify \
+  --input deploy-key.pem.age \
+  --identity-file ~/.config/seclusor/identity.txt
+```
+
+`blob verify` prints the opening recipient public key (`age1...`) on `stdout`
+and exits `0` on success.
+
+## 5. Rotate recipients (`blob rekey`)
+
+To re-encrypt a blob to a new recipient set in memory (with a fresh file key and
+no plaintext written to disk):
+
+```bash
+seclusor secrets blob rekey \
+  --input deploy-key.pem.age \
+  --identity-file ~/.config/seclusor/old-identity.txt \
+  --prior-recipient age1oldrecipient... \
+  --recipient-file ~/.config/seclusor/recipients.txt \
+  --verify-identity-file ~/.config/seclusor/new-identity.txt \
+  --write-recipients ~/.config/seclusor/recipients.txt \
+  --allow-recipient-mismatch
+```
+
+- **Recipient comparison**: Blobs do not store recipient metadata inside the
+  file. Pass `--prior-recipient` or `--prior-recipient-file` to assert the
+  current set; `blob rekey` checks the asserted count against the age header
+  stanza count and verifies that the opening identity is in the asserted prior
+  set (it cannot detect same-count recipient swaps in the age header). If no
+  `--prior-recipient*` is supplied, `--allow-recipient-mismatch` is required to
+  accept indeterminate comparison.
+- **Self-lockout protection**: Before replacing the target file, `blob rekey`
+  decrypts and authenticates the newly encrypted ciphertext in memory using a
+  loaded or `--verify-identity-*` private key in the target set (unless
+  `--allow-self-lockout` is explicitly passed).
+- **Important**: Rekeying a blob only protects future reads of the replaced
+  file. Any party that held a compromised identity and its passphrase could
+  already decrypt historical ciphertext copies; rotate the underlying secret
+  values or credentials inside the blob at their provider as well.
+- **Memory residual**: Decrypted plaintext is held in zeroizing process memory
+  buffers during `blob rekey` and `blob verify` (not `mlock`ed against OS swap
+  or core dumps; upstream `age` `StreamWriter` holds an internal 64 KiB chunk
+  buffer in heap memory during encryption; and JSON bundle-refusal probing can
+  leave `serde_json` string-unescape scratch in freed heap memory if an input
+  contains JSON escape sequences).
+
 ## Size limits
 
 Blob encryption has a **10 MB soft limit** by default. For larger files,

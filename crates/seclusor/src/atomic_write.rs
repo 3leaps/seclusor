@@ -265,11 +265,23 @@ fn atomic_write_with_permissions(
     {
         #[cfg(test)]
         if take_fault() == Some(AtomicFault::DirSyncFail) {
-            return Err(CliError::Message("fault: dir sync fail".into()));
+            return Err(CliError::PostCommitFailure {
+                path: path.display().to_string(),
+                step: "parent directory sync",
+                source: Box::new(CliError::Message("fault: dir sync fail".into())),
+            });
         }
         // Parent directory fsync for rename durability — fail loud on error.
-        let dir = File::open(parent).map_err(CliError::Io)?;
-        dir.sync_all().map_err(CliError::Io)?;
+        let dir = File::open(parent).map_err(|err| CliError::PostCommitFailure {
+            path: path.display().to_string(),
+            step: "parent directory open for sync",
+            source: Box::new(CliError::Io(err)),
+        })?;
+        dir.sync_all().map_err(|err| CliError::PostCommitFailure {
+            path: path.display().to_string(),
+            step: "parent directory sync",
+            source: Box::new(CliError::Io(err)),
+        })?;
     }
 
     Ok(())

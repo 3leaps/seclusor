@@ -538,3 +538,144 @@ fn unset_lenient_recovery_fails_when_other_malformed_credentials_remain() {
     assert!(!repaired.contains("cfat_one"));
     assert!(repaired.contains("BAD_TWO"));
 }
+
+#[test]
+fn blob_rekey_and_verify_stdout_purity_and_process_roundtrip() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let old_id = dir.path().join("old-identity.txt");
+    let new_id = dir.path().join("new-identity.txt");
+    let plain = dir.path().join("blob.txt");
+    let blob = dir.path().join("blob.age");
+    let recipients_out = dir.path().join("recipients.txt");
+
+    fs::write(&plain, b"SECRET_BLOB_CONTENT_42").expect("write plain");
+
+    let gen_old = run_seclusor(&[
+        "keys",
+        "age",
+        "identity",
+        "generate",
+        "--output",
+        old_id.to_str().expect("utf8"),
+    ]);
+    assert!(gen_old.status.success());
+    let old_recipient = String::from_utf8(gen_old.stdout)
+        .expect("utf8")
+        .trim()
+        .to_string();
+
+    let gen_new = run_seclusor(&[
+        "keys",
+        "age",
+        "identity",
+        "generate",
+        "--output",
+        new_id.to_str().expect("utf8"),
+    ]);
+    assert!(gen_new.status.success());
+    let new_recipient = String::from_utf8(gen_new.stdout)
+        .expect("utf8")
+        .trim()
+        .to_string();
+
+    let enc = run_seclusor(&[
+        "secrets",
+        "blob",
+        "encrypt",
+        "--input",
+        plain.to_str().expect("utf8"),
+        "--output",
+        blob.to_str().expect("utf8"),
+        "--recipient",
+        &old_recipient,
+    ]);
+    assert!(enc.status.success());
+    assert_eq!(String::from_utf8(enc.stdout).expect("utf8"), "");
+
+    // Verify with old identity: stdout is opening recipient + newline, stderr is empty.
+    let verify_old = run_seclusor(&[
+        "secrets",
+        "blob",
+        "verify",
+        "--input",
+        blob.to_str().expect("utf8"),
+        "--identity-file",
+        old_id.to_str().expect("utf8"),
+    ]);
+    assert!(verify_old.status.success());
+    assert_eq!(
+        String::from_utf8(verify_old.stdout).expect("utf8"),
+        format!("{old_recipient}\n")
+    );
+    assert_eq!(String::from_utf8(verify_old.stderr).expect("utf8"), "");
+
+    // Rekey in place to new_recipient with pre-commit verification via --verify-identity-file.
+    let rekey = run_seclusor(&[
+        "secrets",
+        "blob",
+        "rekey",
+        "--input",
+        blob.to_str().expect("utf8"),
+        "--identity-file",
+        old_id.to_str().expect("utf8"),
+        "--prior-recipient",
+        &old_recipient,
+        "--recipient",
+        &new_recipient,
+        "--verify-identity-file",
+        new_id.to_str().expect("utf8"),
+        "--write-recipients",
+        recipients_out.to_str().expect("utf8"),
+        "--allow-recipient-mismatch",
+    ]);
+    assert!(
+        rekey.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&rekey.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(rekey.stdout).expect("utf8"),
+        format!("{}\n", blob.display())
+    );
+    let rekey_stderr = String::from_utf8(rekey.stderr).expect("utf8");
+    assert!(rekey_stderr.contains("recipient set change accepted:"));
+    assert!(rekey_stderr.contains(&format!("+{new_recipient}")));
+    assert!(rekey_stderr.contains(&format!("-{old_recipient}")));
+    assert!(!rekey_stderr.contains("SECRET_BLOB_CONTENT_42"));
+    assert_eq!(
+        fs::read_to_string(&recipients_out).expect("read recipients"),
+        format!("{new_recipient}\n")
+    );
+
+    // Verify with old identity now fails with empty stdout; new identity succeeds.
+    let verify_old_after = run_seclusor(&[
+        "secrets",
+        "blob",
+        "verify",
+        "--input",
+        blob.to_str().expect("utf8"),
+        "--identity-file",
+        old_id.to_str().expect("utf8"),
+    ]);
+    assert!(!verify_old_after.status.success());
+    assert_eq!(
+        String::from_utf8(verify_old_after.stdout).expect("utf8"),
+        ""
+    );
+
+    let verify_new = run_seclusor(&[
+        "secrets",
+        "blob",
+        "verify",
+        "--input",
+        blob.to_str().expect("utf8"),
+        "--identity-file",
+        new_id.to_str().expect("utf8"),
+    ]);
+    assert!(verify_new.status.success());
+    assert_eq!(
+        String::from_utf8(verify_new.stdout).expect("utf8"),
+        format!("{new_recipient}\n")
+    );
+    assert_eq!(String::from_utf8(verify_new.stderr).expect("utf8"), "");
+}

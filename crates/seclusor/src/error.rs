@@ -28,6 +28,18 @@ pub(crate) enum CliError {
          Re-run the command against the current file."
     )]
     ConcurrentModification { path: String },
+    /// The target commit rename succeeded, but a post-commit durability or
+    /// verification step failed.
+    #[error(
+        "output was committed to {path}, but post-commit {step} failed; \
+         current durability or on-disk state at {path} is uncertain: {source}"
+    )]
+    PostCommitFailure {
+        path: String,
+        step: &'static str,
+        #[source]
+        source: Box<CliError>,
+    },
     /// The encrypted rekey target committed, but the separately named public
     /// recipient-list refresh did not. These two paths cannot be one atomic
     /// transaction, so the partial-success state must be explicit.
