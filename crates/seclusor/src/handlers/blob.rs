@@ -368,7 +368,7 @@ fn read_blob_input_for_rekey(
 ) -> CliResult<PrivateCiphertextPriorSnapshot> {
     if in_place {
         let meta = fs::symlink_metadata(path).map_err(CliError::Io)?;
-        if meta.file_type().is_symlink() {
+        if is_symlink_or_reparse_point(&meta) {
             return Err(CliError::Message(format!(
                 "refusing to overwrite symlink input path {} in place",
                 path.display()
@@ -388,6 +388,12 @@ fn read_blob_input_for_rekey(
             use std::os::unix::fs::OpenOptionsExt;
             options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
         let mut file = match options.open(path) {
             Ok(file) => file,
             #[cfg(unix)]
@@ -400,6 +406,12 @@ fn read_blob_input_for_rekey(
             Err(err) => return Err(CliError::Io(err)),
         };
         let open_meta = file.metadata().map_err(CliError::Io)?;
+        if is_symlink_or_reparse_point(&open_meta) {
+            return Err(CliError::Message(format!(
+                "refusing to overwrite symlink input path {} in place",
+                path.display()
+            )));
+        }
         if !open_meta.is_file() {
             return Err(CliError::Message(format!(
                 "input path {} must be a regular file",
@@ -413,6 +425,14 @@ fn read_blob_input_for_rekey(
                 return Err(CliError::ConcurrentModification {
                     path: path.display().to_string(),
                 });
+            }
+            if open_meta.nlink() != 1 {
+                return Err(CliError::Message(format!(
+                    "refusing in-place rekey of hardlinked input path {} (nlink = {}); \
+                     remove extra hardlinks before rekeying in place",
+                    path.display(),
+                    open_meta.nlink()
+                )));
             }
         }
 
@@ -2307,48 +2327,121 @@ fn is_skipped_dir_entry_name(name: &str) -> bool {
     name.starts_with('.') || name.starts_with(".seclusor-") || name.contains(".bak-")
 }
 
-/// Reject any explicit `FILE` or `--dir` path that traverses a symlinked
-/// component below the current working directory (when relative) or below its
-/// parent directory (when absolute), so symlinks are never followed during
-/// selection.
-fn reject_symlink_traversal_in_user_path(path: &Path, flag_label: &str) -> CliResult<()> {
+fn is_symlink_or_reparse_point(meta: &fs::Metadata) -> bool {
+    if meta.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn is_macos_system_root_symlink(cur: &Path, meta: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    if meta.uid() != 0 {
+        return false;
+    }
+    let expected_target = if cur == Path::new("/var") {
+        Some(Path::new("private/var"))
+    } else if cur == Path::new("/tmp") {
+        Some(Path::new("private/tmp"))
+    } else if cur == Path::new("/etc") {
+        Some(Path::new("private/etc"))
+    } else {
+        None
+    };
+    match (expected_target, fs::read_link(cur)) {
+        (Some(expected), Ok(target)) => target == expected,
+        _ => false,
+    }
+}
+
+/// Reject any path that traverses a symlink or Windows reparse point/junction
+/// in any ancestor or leaf component (whether relative or absolute).
+fn reject_symlink_traversal_in_path(
+    path: &Path,
+    flag_label: &str,
+    allow_missing_leaf: bool,
+) -> CliResult<()> {
     use std::path::Component;
-    if path.is_relative() {
-        let mut cur = std::env::current_dir().map_err(CliError::Io)?;
-        for comp in path.components() {
-            match comp {
-                Component::CurDir => {}
-                Component::ParentDir => {
-                    cur.pop();
-                }
-                Component::Normal(part) => {
-                    cur.push(part);
-                    let meta = fs::symlink_metadata(&cur).map_err(|err| {
-                        CliError::Message(format!(
-                            "cannot inspect {flag_label} path {}: {err}",
-                            path.display()
-                        ))
-                    })?;
-                    if meta.file_type().is_symlink() {
+    let components: Vec<Component<'_>> = path.components().collect();
+    if components.is_empty() {
+        return Err(CliError::Message(format!(
+            "invalid empty {flag_label} path"
+        )));
+    }
+
+    let mut cur = if path.is_relative() {
+        std::env::current_dir().map_err(CliError::Io)?
+    } else {
+        PathBuf::new()
+    };
+
+    for (idx, comp) in components.iter().enumerate() {
+        let is_last = idx + 1 == components.len();
+        match comp {
+            Component::Prefix(prefix) => {
+                cur.push(prefix.as_os_str());
+            }
+            Component::RootDir => {
+                cur.push(comp.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                cur.pop();
+            }
+            Component::Normal(part) => {
+                cur.push(part);
+                let meta = match fs::symlink_metadata(&cur) {
+                    Ok(m) => m,
+                    Err(err)
+                        if is_last
+                            && allow_missing_leaf
+                            && err.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        return Ok(());
+                    }
+                    Err(err) => {
                         return Err(CliError::Message(format!(
-                            "refusing symlink in {flag_label} path {}; symlinks are not followed",
+                            "cannot inspect {flag_label} path {}: {err}",
                             path.display()
                         )));
                     }
+                };
+                if is_symlink_or_reparse_point(&meta) {
+                    #[cfg(target_os = "macos")]
+                    if !is_last && is_macos_system_root_symlink(&cur, &meta) {
+                        continue;
+                    }
+                    return Err(CliError::Message(format!(
+                        "refusing symlink in {flag_label} path {}; symlinks are not followed",
+                        path.display()
+                    )));
                 }
-                Component::RootDir | Component::Prefix(_) => {}
             }
         }
-    } else {
-        let meta = fs::symlink_metadata(path).map_err(|err| {
-            CliError::Message(format!(
-                "cannot inspect {flag_label} path {}: {err}",
-                path.display()
-            ))
-        })?;
-        if meta.file_type().is_symlink() {
+    }
+
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if is_symlink_or_reparse_point(&meta) {
+                return Err(CliError::Message(format!(
+                    "refusing symlink in {flag_label} path {}; symlinks are not followed",
+                    path.display()
+                )));
+            }
+        }
+        Err(err) if allow_missing_leaf && err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
             return Err(CliError::Message(format!(
-                "refusing symlink {flag_label} path {}; symlinks are not followed",
+                "cannot inspect {flag_label} path {}: {err}",
                 path.display()
             )));
         }
@@ -2356,8 +2449,20 @@ fn reject_symlink_traversal_in_user_path(path: &Path, flag_label: &str) -> CliRe
     Ok(())
 }
 
+fn reject_symlink_traversal_in_user_path(path: &Path, flag_label: &str) -> CliResult<()> {
+    reject_symlink_traversal_in_path(path, flag_label, false)
+}
+
 fn is_valid_sha256_hex(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+#[derive(Debug, Clone)]
+struct SelectedBatchFile {
+    path: PathBuf,
+    user_path: PathBuf,
+    #[cfg(unix)]
+    identity: (u64, u64),
 }
 
 fn collect_dir_candidates(
@@ -2367,7 +2472,7 @@ fn collect_dir_candidates(
     out: &mut Vec<PathBuf>,
 ) -> CliResult<()> {
     let meta = fs::symlink_metadata(dir).map_err(CliError::Io)?;
-    if meta.file_type().is_symlink() {
+    if is_symlink_or_reparse_point(&meta) {
         return Err(CliError::Message(format!(
             "--dir path {} must not be a symlink",
             dir.display()
@@ -2380,6 +2485,7 @@ fn collect_dir_candidates(
         )));
     }
     let canon_dir = fs::canonicalize(dir).map_err(CliError::Io)?;
+    reject_symlink_traversal_in_user_path(&canon_dir, "--dir")?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -2405,10 +2511,10 @@ fn collect_dir_candidates(
         }
         let path = entry.path();
         let entry_meta = fs::symlink_metadata(&path).map_err(CliError::Io)?;
-        let file_type = entry_meta.file_type();
-        if file_type.is_symlink() {
+        if is_symlink_or_reparse_point(&entry_meta) {
             continue;
         }
+        let file_type = entry_meta.file_type();
         if file_type.is_dir() {
             if recursive {
                 collect_dir_candidates(&path, glob_pattern, true, out)?;
@@ -2422,7 +2528,7 @@ fn collect_dir_candidates(
     Ok(())
 }
 
-fn collect_batch_files(args: &BlobRekeyBatchArgs) -> CliResult<Vec<PathBuf>> {
+fn collect_batch_files(args: &BlobRekeyBatchArgs) -> CliResult<Vec<SelectedBatchFile>> {
     if args.files.is_empty() && args.dir.is_none() {
         return Err(CliError::Message(
             "blob rekey-batch requires at least one FILE or --dir <DIR>".to_string(),
@@ -2448,7 +2554,7 @@ fn collect_batch_files(args: &BlobRekeyBatchArgs) -> CliResult<Vec<PathBuf>> {
                 file.display()
             ))
         })?;
-        if meta.file_type().is_symlink() {
+        if is_symlink_or_reparse_point(&meta) {
             return Err(CliError::Message(format!(
                 "refusing symlink input path {} in blob rekey-batch; symlinks are not followed",
                 file.display()
@@ -2468,21 +2574,35 @@ fn collect_batch_files(args: &BlobRekeyBatchArgs) -> CliResult<Vec<PathBuf>> {
         collect_dir_candidates(dir, &args.glob, args.recursive, &mut raw_candidates)?;
     }
 
-    let mut canonical_paths: Vec<PathBuf> = Vec::with_capacity(raw_candidates.len());
+    let mut selected_files: Vec<SelectedBatchFile> = Vec::with_capacity(raw_candidates.len());
     for candidate in raw_candidates {
+        reject_symlink_traversal_in_user_path(&candidate, "input")?;
         let pre_meta = fs::symlink_metadata(&candidate).map_err(CliError::Io)?;
-        if pre_meta.file_type().is_symlink() || !pre_meta.is_file() {
+        if is_symlink_or_reparse_point(&pre_meta) || !pre_meta.is_file() {
             return Err(CliError::Message(format!(
                 "refusing symlink or non-regular input path {}",
                 candidate.display()
             )));
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if pre_meta.nlink() != 1 {
+                return Err(CliError::Message(format!(
+                    "refusing hardlinked input path {} (nlink = {}); \
+                     remove extra hardlinks before running blob rekey-batch",
+                    candidate.display(),
+                    pre_meta.nlink()
+                )));
+            }
+        }
         let canon = fs::canonicalize(&candidate).map_err(CliError::Io)?;
+        reject_symlink_traversal_in_user_path(&canon, "input")?;
         let post_meta = fs::symlink_metadata(&candidate).map_err(CliError::Io)?;
         let canon_meta = fs::symlink_metadata(&canon).map_err(CliError::Io)?;
-        if post_meta.file_type().is_symlink()
+        if is_symlink_or_reparse_point(&post_meta)
             || !post_meta.is_file()
-            || canon_meta.file_type().is_symlink()
+            || is_symlink_or_reparse_point(&canon_meta)
             || !canon_meta.is_file()
         {
             return Err(CliError::ConcurrentModification {
@@ -2490,7 +2610,7 @@ fn collect_batch_files(args: &BlobRekeyBatchArgs) -> CliResult<Vec<PathBuf>> {
             });
         }
         #[cfg(unix)]
-        {
+        let identity = {
             use std::os::unix::fs::MetadataExt;
             if pre_meta.dev() != post_meta.dev()
                 || pre_meta.ino() != post_meta.ino()
@@ -2501,27 +2621,525 @@ fn collect_batch_files(args: &BlobRekeyBatchArgs) -> CliResult<Vec<PathBuf>> {
                     path: candidate.display().to_string(),
                 });
             }
-        }
-        canonical_paths.push(canon);
+            if post_meta.nlink() != 1 || canon_meta.nlink() != 1 {
+                return Err(CliError::Message(format!(
+                    "refusing hardlinked input path {} (nlink = {}); \
+                     remove extra hardlinks before running blob rekey-batch",
+                    candidate.display(),
+                    canon_meta.nlink()
+                )));
+            }
+            (pre_meta.dev(), pre_meta.ino())
+        };
+        selected_files.push(SelectedBatchFile {
+            path: canon,
+            user_path: candidate,
+            #[cfg(unix)]
+            identity,
+        });
     }
-    canonical_paths.sort();
-    canonical_paths.dedup();
+    selected_files.sort_by(|a, b| a.path.cmp(&b.path));
+    selected_files.dedup_by(|a, b| a.path == b.path);
 
     // Reject distinct canonical paths that alias the same underlying inode (hardlinks).
-    for i in 0..canonical_paths.len() {
-        for j in (i + 1)..canonical_paths.len() {
-            if paths_alias(&canonical_paths[i], &canonical_paths[j])? {
+    for i in 0..selected_files.len() {
+        for j in (i + 1)..selected_files.len() {
+            if paths_alias(&selected_files[i].path, &selected_files[j].path)? {
                 return Err(CliError::Message(format!(
                     "selected blob path {} aliases selected blob path {} (hardlink to the same file); \
                      refusing batch rekey with hardlinked inputs",
-                    canonical_paths[i].display(),
-                    canonical_paths[j].display()
+                    selected_files[i].path.display(),
+                    selected_files[j].path.display()
                 )));
             }
         }
     }
 
-    Ok(canonical_paths)
+    Ok(selected_files)
+}
+
+#[cfg(windows)]
+mod windows_dacl {
+    use std::fs::File;
+    use std::io;
+    use std::os::windows::io::AsRawHandle;
+
+    #[repr(C)]
+    struct SidAndAttributes {
+        sid: *mut core::ffi::c_void,
+        attributes: u32,
+    }
+
+    #[repr(C)]
+    struct TokenUser {
+        user: SidAndAttributes,
+    }
+
+    #[repr(C)]
+    struct AclHeader {
+        acl_revision: u8,
+        sbz1: u8,
+        acl_size: u16,
+        ace_count: u16,
+        sbz2: u16,
+    }
+
+    #[repr(C)]
+    struct AceHeader {
+        ace_type: u8,
+        ace_flags: u8,
+        ace_size: u16,
+    }
+
+    #[repr(C)]
+    struct AccessAllowedAcePrefix {
+        header: AceHeader,
+        mask: u32,
+        sid_start: u32,
+    }
+
+    struct HandleGuard(*mut core::ffi::c_void);
+    impl Drop for HandleGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: `self.0` is an open Win32 handle owned by this guard.
+                unsafe {
+                    let _ = CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    struct LocalMemGuard(*mut core::ffi::c_void);
+    impl Drop for LocalMemGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: `self.0` was allocated by `GetSecurityInfo` via LocalAlloc.
+                unsafe {
+                    let _ = LocalFree(self.0);
+                }
+            }
+        }
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> *mut core::ffi::c_void;
+        fn CloseHandle(hObject: *mut core::ffi::c_void) -> i32;
+        fn LocalFree(hMem: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn OpenProcessToken(
+            ProcessHandle: *mut core::ffi::c_void,
+            DesiredAccess: u32,
+            TokenHandle: *mut *mut core::ffi::c_void,
+        ) -> i32;
+        fn GetTokenInformation(
+            TokenHandle: *mut core::ffi::c_void,
+            TokenInformationClass: u32,
+            TokenInformation: *mut core::ffi::c_void,
+            TokenInformationLength: u32,
+            ReturnLength: *mut u32,
+        ) -> i32;
+        fn IsValidSid(pSid: *mut core::ffi::c_void) -> i32;
+        fn GetLengthSid(pSid: *mut core::ffi::c_void) -> u32;
+        fn EqualSid(pSid1: *mut core::ffi::c_void, pSid2: *mut core::ffi::c_void) -> i32;
+        fn InitializeAcl(pAcl: *mut AclHeader, nAclLength: u32, dwAclRevision: u32) -> i32;
+        fn AddAccessAllowedAce(
+            pAcl: *mut AclHeader,
+            dwAceRevision: u32,
+            AccessMask: u32,
+            pSid: *mut core::ffi::c_void,
+        ) -> i32;
+        fn SetSecurityInfo(
+            handle: *mut core::ffi::c_void,
+            ObjectType: u32,
+            SecurityInfo: u32,
+            psidOwner: *mut core::ffi::c_void,
+            psidGroup: *mut core::ffi::c_void,
+            pDacl: *mut AclHeader,
+            pSacl: *mut AclHeader,
+        ) -> u32;
+        fn GetSecurityInfo(
+            handle: *mut core::ffi::c_void,
+            ObjectType: u32,
+            SecurityInfo: u32,
+            ppsidOwner: *mut *mut core::ffi::c_void,
+            ppsidGroup: *mut *mut core::ffi::c_void,
+            ppDacl: *mut *mut AclHeader,
+            ppSacl: *mut *mut AclHeader,
+            ppSecurityDescriptor: *mut *mut core::ffi::c_void,
+        ) -> u32;
+        fn GetSecurityDescriptorControl(
+            pSecurityDescriptor: *mut core::ffi::c_void,
+            pControl: *mut u16,
+            lpdwRevision: *mut u32,
+        ) -> i32;
+        fn GetAce(pAcl: *mut AclHeader, dwAceIndex: u32, pAce: *mut *mut AceHeader) -> i32;
+    }
+
+    const TOKEN_QUERY: u32 = 0x0008;
+    const TOKEN_USER_CLASS: u32 = 1;
+    const ACL_REVISION: u32 = 2;
+    const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
+    const SE_FILE_OBJECT: u32 = 1;
+    const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
+    const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
+    const SE_DACL_PRESENT: u16 = 0x0004;
+    const SE_DACL_PROTECTED: u16 = 0x1000;
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+
+    fn current_process_user_token_buf() -> io::Result<Vec<u64>> {
+        let mut token: *mut core::ffi::c_void = core::ptr::null_mut();
+        // SAFETY: `GetCurrentProcess()` returns a pseudo-handle; `token` is valid on success.
+        let ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let _token_guard = HandleGuard(token);
+
+        let mut needed: u32 = 0;
+        // SAFETY: probing required buffer size with null buffer and zero length.
+        unsafe {
+            let _ = GetTokenInformation(
+                token,
+                TOKEN_USER_CLASS,
+                core::ptr::null_mut(),
+                0,
+                &mut needed,
+            );
+        }
+        if needed == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut buf = vec![0u64; (needed as usize).div_ceil(8)];
+        let byte_len = (buf.len() * 8) as u32;
+        // SAFETY: `buf` is 8-byte aligned and holds at least `needed` bytes.
+        let ok = unsafe {
+            GetTokenInformation(
+                token,
+                TOKEN_USER_CLASS,
+                buf.as_mut_ptr().cast(),
+                byte_len,
+                &mut needed,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let token_user = buf.as_ptr().cast::<TokenUser>();
+        // SAFETY: `GetTokenInformation` initialized `TokenUser` inside `buf`.
+        let sid = unsafe { (*token_user).user.sid };
+        if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "invalid Windows process user SID",
+            ));
+        }
+        Ok(buf)
+    }
+
+    pub(super) fn restrict_private_file_dacl(file: &File) -> io::Result<()> {
+        let user_buf = current_process_user_token_buf()?;
+        let token_user = user_buf.as_ptr().cast::<TokenUser>();
+        // SAFETY: `user_buf` lives for this function and holds a valid `TokenUser`.
+        let user_sid = unsafe { (*token_user).user.sid };
+        // SAFETY: `user_sid` was validated by `IsValidSid`.
+        let sid_len = unsafe { GetLengthSid(user_sid) } as usize;
+        let acl_bytes_len = (core::mem::size_of::<AclHeader>() + 8 + sid_len + 3) & !3;
+        let mut acl_buf = vec![0u64; acl_bytes_len.div_ceil(8)];
+        let acl_ptr = acl_buf.as_mut_ptr().cast::<AclHeader>();
+
+        // SAFETY: `acl_buf` has at least `acl_bytes_len` bytes and is 8-byte aligned.
+        if unsafe { InitializeAcl(acl_ptr, acl_bytes_len as u32, ACL_REVISION) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `acl_ptr` is initialized and `user_sid` is valid.
+        if unsafe { AddAccessAllowedAce(acl_ptr, ACL_REVISION, FILE_ALL_ACCESS, user_sid) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `file` is an open file handle and `acl_ptr` is a valid ACL.
+        let rc = unsafe {
+            SetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                acl_ptr,
+                core::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc as i32));
+        }
+        Ok(())
+    }
+
+    pub(super) fn verify_private_file_dacl(file: &File) -> io::Result<()> {
+        let user_buf = current_process_user_token_buf()?;
+        let token_user = user_buf.as_ptr().cast::<TokenUser>();
+        // SAFETY: `user_buf` lives for this function and holds a valid `TokenUser`.
+        let user_sid = unsafe { (*token_user).user.sid };
+
+        let mut dacl: *mut AclHeader = core::ptr::null_mut();
+        let mut sd: *mut core::ffi::c_void = core::ptr::null_mut();
+        // SAFETY: `file` is an open file handle; `sd` is freed by `LocalMemGuard`.
+        let rc = unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                &mut dacl,
+                core::ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc as i32));
+        }
+        let _sd_guard = LocalMemGuard(sd);
+
+        let mut control: u16 = 0;
+        let mut revision: u32 = 0;
+        // SAFETY: `sd` was returned by `GetSecurityInfo`.
+        if unsafe { GetSecurityDescriptorControl(sd, &mut control, &mut revision) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if (control & SE_DACL_PRESENT) == 0 || (control & SE_DACL_PROTECTED) == 0 || dacl.is_null()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private file on Windows does not have a protected owner-only DACL",
+            ));
+        }
+
+        // SAFETY: `dacl` is non-null and points into `sd`.
+        let ace_count = unsafe { (*dacl).ace_count };
+        if ace_count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private file on Windows has an empty DACL",
+            ));
+        }
+        for idx in 0..(ace_count as u32) {
+            let mut ace_ptr: *mut AceHeader = core::ptr::null_mut();
+            // SAFETY: `dacl` is valid and `idx < ace_count`.
+            if unsafe { GetAce(dacl, idx, &mut ace_ptr) } == 0 || ace_ptr.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: `ace_ptr` points to a valid ACE header inside `dacl`.
+            let ace_type = unsafe { (*ace_ptr).ace_type };
+            if ace_type != ACCESS_ALLOWED_ACE_TYPE {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "private file on Windows contains unexpected ACE type in DACL",
+                ));
+            }
+            let allowed_ptr = ace_ptr.cast::<AccessAllowedAcePrefix>();
+            // SAFETY: `ACCESS_ALLOWED_ACE_TYPE` has layout `AccessAllowedAcePrefix` where `sid_start` is the first DWORD of the SID.
+            let ace_sid = unsafe { core::ptr::addr_of_mut!((*allowed_ptr).sid_start).cast() };
+            if unsafe { IsValidSid(ace_sid) } == 0 || unsafe { EqualSid(ace_sid, user_sid) } == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "private file on Windows grants DACL access to a non-owner SID",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Read an existing `--state` journal with file-descriptor-bound ownership,
+/// `0600` permission, single-hardlink (`nlink == 1`), and strict non-owner
+/// ACL rejection. Returns `Ok(None)` if `state_path` does not exist yet.
+fn read_existing_state_journal_for_cas(
+    state_path: &Path,
+) -> CliResult<Option<PrivateCiphertextPriorSnapshot>> {
+    reject_symlink_traversal_in_path(state_path, "--state", true)?;
+    let parent = state_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    seclusor_crypto::acl::reject_writable_directory_acl(parent)?;
+
+    let pre_meta = match fs::symlink_metadata(state_path) {
+        Ok(m) => m,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(CliError::Io(err)),
+    };
+    if is_symlink_or_reparse_point(&pre_meta) {
+        return Err(CliError::Message(format!(
+            "refusing symlink --state journal path {}",
+            state_path.display()
+        )));
+    }
+    if !pre_meta.is_file() {
+        return Err(CliError::Message(format!(
+            "--state journal path {} must be a regular file",
+            state_path.display()
+        )));
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = match options.open(state_path) {
+        Ok(f) => f,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(CliError::ConcurrentModification {
+                path: state_path.display().to_string(),
+            });
+        }
+        #[cfg(unix)]
+        Err(err) if err.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(CliError::Message(format!(
+                "refusing symlink --state journal path {}",
+                state_path.display()
+            )));
+        }
+        Err(err) => return Err(CliError::Io(err)),
+    };
+
+    let open_meta = file.metadata().map_err(CliError::Io)?;
+    if is_symlink_or_reparse_point(&open_meta) {
+        return Err(CliError::Message(format!(
+            "refusing symlink --state journal path {}",
+            state_path.display()
+        )));
+    }
+    if !open_meta.is_file() {
+        return Err(CliError::Message(format!(
+            "--state journal path {} must be a regular file",
+            state_path.display()
+        )));
+    }
+
+    #[cfg(unix)]
+    let open_identity = {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if open_meta.dev() != pre_meta.dev() || open_meta.ino() != pre_meta.ino() {
+            return Err(CliError::ConcurrentModification {
+                path: state_path.display().to_string(),
+            });
+        }
+        if open_meta.nlink() != 1 {
+            return Err(CliError::Message(format!(
+                "refusing hardlinked --state journal path {} (nlink = {})",
+                state_path.display(),
+                open_meta.nlink()
+            )));
+        }
+        let file_uid = open_meta.uid();
+        // SAFETY: `getuid` has no memory-safety preconditions and cannot fail.
+        let current_uid = unsafe { libc::getuid() };
+        if file_uid != current_uid {
+            return Err(CliError::Crypto(
+                seclusor_crypto::CryptoError::IdentityFileNotOwnedByCurrentUser {
+                    file_uid,
+                    current_uid,
+                },
+            ));
+        }
+        let mode = open_meta.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            return Err(CliError::Crypto(
+                seclusor_crypto::CryptoError::InsecureIdentityFilePermissions { actual: mode },
+            ));
+        }
+        (open_meta.dev(), open_meta.ino(), mode)
+    };
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let has_non_owner_acl = seclusor_crypto::acl::has_non_owner_file_acl(state_path)?;
+        let post_acl_meta = fs::symlink_metadata(state_path).map_err(CliError::Io)?;
+        if is_symlink_or_reparse_point(&post_acl_meta)
+            || !post_acl_meta.is_file()
+            || post_acl_meta.dev() != open_identity.0
+            || post_acl_meta.ino() != open_identity.1
+        {
+            return Err(CliError::ConcurrentModification {
+                path: state_path.display().to_string(),
+            });
+        }
+        if has_non_owner_acl {
+            return Err(CliError::Message(format!(
+                "--state journal {} has a non-owner extended ACL grant; inspect with ls -le and remove with chmod -N",
+                state_path.display()
+            )));
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        windows_dacl::verify_private_file_dacl(&file).map_err(CliError::Io)?;
+    }
+
+    let hint_len = open_meta.len();
+    if hint_len > MAX_STATE_JOURNAL_BYTES {
+        return Err(CliError::Message(format!(
+            "--state journal {} exceeds maximum size of {} bytes",
+            state_path.display(),
+            MAX_STATE_JOURNAL_BYTES
+        )));
+    }
+    let cap = (hint_len as usize)
+        .saturating_add(1)
+        .min((MAX_STATE_JOURNAL_BYTES as usize).saturating_add(1));
+    let mut buf = Zeroizing::new(vec![0u8; cap]);
+    let mut total = 0usize;
+    while total < buf.len() {
+        match file.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(err) => return Err(CliError::Io(err)),
+        }
+    }
+    buf.truncate(total);
+    if total == cap || (buf.len() as u64) > MAX_STATE_JOURNAL_BYTES {
+        return Err(CliError::Message(format!(
+            "--state journal {} exceeds maximum size of {} bytes or changed size during read",
+            state_path.display(),
+            MAX_STATE_JOURNAL_BYTES
+        )));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let after_read_meta = file.metadata().map_err(CliError::Io)?;
+        if after_read_meta.dev() != open_identity.0
+            || after_read_meta.ino() != open_identity.1
+            || after_read_meta.nlink() != 1
+            || (after_read_meta.permissions().mode() & 0o777) != 0o600
+        {
+            return Err(CliError::ConcurrentModification {
+                path: state_path.display().to_string(),
+            });
+        }
+    }
+
+    Ok(Some(PrivateCiphertextPriorSnapshot {
+        bytes: buf,
+        #[cfg(unix)]
+        identity: open_identity,
+    }))
 }
 
 fn load_or_init_state_journal(
@@ -2532,37 +3150,8 @@ fn load_or_init_state_journal(
     allow_self_lockout: bool,
     allow_large: bool,
 ) -> CliResult<(BatchStateJournal, Option<PrivateCiphertextPriorSnapshot>)> {
-    if let Ok(meta) = fs::symlink_metadata(state_path) {
-        if meta.file_type().is_symlink() {
-            return Err(CliError::Message(format!(
-                "refusing symlink --state journal path {}",
-                state_path.display()
-            )));
-        }
-        if !meta.is_file() {
-            return Err(CliError::Message(format!(
-                "--state journal path {} must be a regular file",
-                state_path.display()
-            )));
-        }
-        seclusor_crypto::assert_identity_file_access(state_path)?;
-    } else {
-        let parent = state_path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        seclusor_crypto::acl::reject_writable_directory_acl(parent)?;
-    }
-    let prior_snapshot = read_existing_output_for_cas(state_path)?;
+    let prior_snapshot = read_existing_state_journal_for_cas(state_path)?;
     if let Some(snapshot) = prior_snapshot {
-        seclusor_crypto::assert_identity_file_access(state_path)?;
-        if (snapshot.bytes.len() as u64) > MAX_STATE_JOURNAL_BYTES {
-            return Err(CliError::Message(format!(
-                "--state journal {} exceeds maximum size of {} bytes",
-                state_path.display(),
-                MAX_STATE_JOURNAL_BYTES
-            )));
-        }
         let journal: BatchStateJournal =
             serde_json::from_slice(&snapshot.bytes).map_err(|err| {
                 CliError::Message(format!(
@@ -2625,12 +3214,25 @@ fn persist_state_journal(
     journal: &BatchStateJournal,
     prior_snapshot: Option<PrivateCiphertextPriorSnapshot>,
 ) -> CliResult<PrivateCiphertextPriorSnapshot> {
+    reject_symlink_traversal_in_path(state_path, "--state", true)?;
     let mut bytes = serde_json::to_vec_pretty(journal)?;
     if !bytes.ends_with(b"\n") {
         bytes.push(b'\n');
     }
     atomic_write_private_ciphertext(state_path, &bytes, prior_snapshot)?;
-    let refreshed = read_existing_output_for_cas(state_path)?.ok_or_else(|| {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const WRITE_DAC: u32 = 0x0004_0000;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        let file = fs::OpenOptions::new()
+            .access_mode(WRITE_DAC)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(state_path)
+            .map_err(CliError::Io)?;
+        windows_dacl::restrict_private_file_dacl(&file).map_err(CliError::Io)?;
+    }
+    let refreshed = read_existing_state_journal_for_cas(state_path)?.ok_or_else(|| {
         CliError::Message(format!(
             "--state journal {} disappeared immediately after write",
             state_path.display()
@@ -2672,12 +3274,24 @@ fn create_private_backup_file(path: &Path, prior_bytes: &[u8]) -> CliResult<Path
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
     let mut file = options.open(&backup_path).map_err(CliError::Io)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         file.set_permissions(fs::Permissions::from_mode(0o600))
             .map_err(CliError::Io)?;
+    }
+    #[cfg(windows)]
+    if let Err(err) = windows_dacl::restrict_private_file_dacl(&file) {
+        drop(file);
+        let _ = fs::remove_file(&backup_path);
+        return Err(CliError::Io(err));
     }
     if let Err(err) = seclusor_crypto::acl::prepare_private_file(&file, &backup_path) {
         drop(file);
@@ -2765,7 +3379,7 @@ pub(crate) fn handle_blob_rekey_batch_with_policy(
         ));
     }
 
-    let selected_paths = collect_batch_files(&args)?;
+    let selected_files = collect_batch_files(&args)?;
     let target_recipients = resolve_recipients(&args.recipients)?;
     let target_strings = recipient_strings(&target_recipients);
     let prior_strings = resolve_prior_recipients(&args.prior_recipients)?;
@@ -2795,7 +3409,8 @@ pub(crate) fn handle_blob_rekey_batch_with_policy(
     }
 
     // Alias checks for batch files, --state, and --write-recipients before any writes.
-    for blob_path in &selected_paths {
+    for selected in &selected_files {
+        let blob_path = &selected.path;
         for rfile in &args.recipients.recipient_files {
             if paths_alias(blob_path, rfile)? {
                 return Err(CliError::Message(format!(
@@ -2835,7 +3450,8 @@ pub(crate) fn handle_blob_rekey_batch_with_policy(
     }
 
     if let Some(state_path) = &args.state {
-        for blob_path in &selected_paths {
+        for selected in &selected_files {
+            let blob_path = &selected.path;
             if paths_alias(state_path, blob_path)? {
                 return Err(CliError::Message(format!(
                     "--state path {} aliases selected blob path {}",
@@ -2892,7 +3508,8 @@ pub(crate) fn handle_blob_rekey_batch_with_policy(
     }
 
     let recipient_refresh = if let Some(wr_path) = &args.write_recipients {
-        for blob_path in &selected_paths {
+        for selected in &selected_files {
+            let blob_path = &selected.path;
             if paths_alias(wr_path, blob_path)? {
                 return Err(CliError::Message(format!(
                     "--write-recipients path {} aliases selected blob path {}",
@@ -2901,10 +3518,10 @@ pub(crate) fn handle_blob_rekey_batch_with_policy(
                 )));
             }
         }
-        // Use a dummy non-aliasing sentinel if selected_paths is empty, or the first selected path.
-        let dummy_or_first = selected_paths
+        // Use a dummy non-aliasing sentinel if selected_files is empty, or the first selected path.
+        let dummy_or_first = selected_files
             .first()
-            .cloned()
+            .map(|s| s.path.clone())
             .unwrap_or_else(|| PathBuf::from(".seclusor-batch-nonexistent-sentinel"));
         let target = prepare_recipient_refresh_target_with_flag(
             Some(wr_path.as_path()),
@@ -2954,24 +3571,38 @@ pub(crate) fn handle_blob_rekey_batch_with_policy(
         Some(BLOB_MAX_FILE_BYTES)
     };
 
-    let mut report_files: Vec<BatchReportFileEntry> = Vec::with_capacity(selected_paths.len());
+    let mut report_files: Vec<BatchReportFileEntry> = Vec::with_capacity(selected_files.len());
     let mut summary = BatchReportSummary {
-        selected: selected_paths.len(),
+        selected: selected_files.len(),
         ..BatchReportSummary::default()
     };
     #[cfg(test)]
     let mut commits_completed = 0usize;
 
-    for blob_path in &selected_paths {
+    for selected in &selected_files {
+        let blob_path = &selected.path;
         let path_str = blob_path.display().to_string();
 
-        // Step 1: Bounded read of the candidate file.
-        let prior_snapshot = match read_blob_input_for_rekey(
-            blob_path,
-            soft_limit,
-            BLOB_MAX_CIPHERTEXT_HARD_BYTES,
-            true,
-        ) {
+        // Step 1: Re-verify no ancestor component was swapped to a symlink after selection,
+        // then perform a bounded read of the candidate file and verify selection identity.
+        let read_res = (|| -> CliResult<PrivateCiphertextPriorSnapshot> {
+            reject_symlink_traversal_in_user_path(&selected.user_path, "input")?;
+            reject_symlink_traversal_in_user_path(blob_path, "input")?;
+            let snap = read_blob_input_for_rekey(
+                blob_path,
+                soft_limit,
+                BLOB_MAX_CIPHERTEXT_HARD_BYTES,
+                true,
+            )?;
+            #[cfg(unix)]
+            if (snap.identity.0, snap.identity.1) != selected.identity {
+                return Err(CliError::ConcurrentModification {
+                    path: path_str.clone(),
+                });
+            }
+            Ok(snap)
+        })();
+        let prior_snapshot = match read_res {
             Ok(snap) => snap,
             Err(CliError::Message(msg))
                 if msg.contains("MB limit") || msg.contains("maximum size") =>
@@ -3443,6 +4074,7 @@ pub(crate) fn handle_blob_rekey_batch_with_policy(
 
         summary.affected += 1;
         let new_sha256 = sha256_hex(&new_ciphertext);
+        emit_blob_delta_notice(&delta_notice);
 
         if !args.apply {
             eprintln!(
@@ -3575,6 +4207,8 @@ pub(crate) fn handle_blob_rekey_batch_with_policy(
 
         // Step 10 (apply): Atomic replacement + post-commit re-read check.
         let commit_res: CliResult<()> = (|| {
+            reject_symlink_traversal_in_user_path(&selected.user_path, "input")?;
+            reject_symlink_traversal_in_user_path(blob_path, "input")?;
             atomic_write_private_ciphertext(blob_path, &new_ciphertext, Some(prior_snapshot))?;
             let post_commit_bytes =
                 read_file_bounded_zeroizing(blob_path, None, BLOB_MAX_CIPHERTEXT_HARD_BYTES)
@@ -3670,7 +4304,6 @@ pub(crate) fn handle_blob_rekey_batch_with_policy(
             commits_completed += 1;
         }
         summary.rekeyed += 1;
-        emit_blob_delta_notice(&delta_notice);
         eprintln!("rekeyed {path_str} (opened_with: {opened_with})");
         report_files.push(BatchReportFileEntry {
             path: path_str,
@@ -3690,8 +4323,8 @@ pub(crate) fn handle_blob_rekey_batch_with_policy(
 
     // `--write-recipients` is written once, ONLY if every selected file ended
     // `rekeyed` or `already-done` (and at least one file was selected).
-    let all_selected_rekeyed_or_done = !selected_paths.is_empty()
-        && report_files.len() == selected_paths.len()
+    let all_selected_rekeyed_or_done = !selected_files.is_empty()
+        && report_files.len() == selected_files.len()
         && report_files
             .iter()
             .all(|f| f.status == "rekeyed" || f.status == "already-done");
@@ -5804,11 +6437,12 @@ mod tests {
         })
         .expect("handle_blob_rekey_batch with matching prior set must succeed");
 
-        // Reject hardlinked inputs in batch selection.
+        // Reject hardlinked inputs in batch selection (both when both links are selected
+        // and when only one link is selected while an unselected hardlink exists).
         let hardlink_path = dir.path().join("single-hardlink.age");
         fs::hard_link(&blob_path, &hardlink_path).expect("create hardlink");
-        let err_hardlink = handle_blob_rekey_batch(BlobRekeyBatchArgs {
-            files: vec![blob_path.clone(), hardlink_path],
+        let err_hardlink_single = handle_blob_rekey_batch(BlobRekeyBatchArgs {
+            files: vec![blob_path.clone()],
             dir: None,
             glob: "*.age".to_string(),
             recursive: false,
@@ -5835,9 +6469,34 @@ mod tests {
             },
             verify_identities: VerifyIdentityArgs::default(),
             passphrase: PassphraseArgs::default(),
-        })
-        .expect_err("hardlinked batch inputs must be rejected");
-        assert!(err_hardlink.to_string().contains("hardlink"));
+        });
+        #[cfg(unix)]
+        {
+            let err = err_hardlink_single
+                .expect_err("blob with unselected hardlink (nlink > 1) must be rejected on Unix");
+            assert!(err.to_string().contains("hardlink"));
+        }
+        fs::remove_file(&hardlink_path).expect("remove hardlink");
+
+        // Reject intermediate symlink traversal in absolute FILE and --dir paths.
+        #[cfg(unix)]
+        {
+            let real_sub = dir.path().join("real-sub");
+            fs::create_dir(&real_sub).unwrap();
+            let sub_blob = real_sub.join("pack.age");
+            fs::copy(&blob_path, &sub_blob).unwrap();
+            let link_sub = dir.path().join("link-sub");
+            std::os::unix::fs::symlink(&real_sub, &link_sub).unwrap();
+
+            let err_abs_dir = reject_symlink_traversal_in_user_path(&link_sub, "--dir")
+                .expect_err("symlinked --dir must be rejected");
+            assert!(err_abs_dir.to_string().contains("symlink"));
+
+            let via_link_blob = link_sub.join("pack.age");
+            let err_abs_file = reject_symlink_traversal_in_user_path(&via_link_blob, "input")
+                .expect_err("absolute FILE traversing a symlinked parent must be rejected");
+            assert!(err_abs_file.to_string().contains("symlink"));
+        }
 
         // Reject malformed --state journal where sha256_before == sha256_after.
         let bad_state_path = dir.path().join("bad-state.json");
@@ -5873,13 +6532,23 @@ mod tests {
             None,
         )
         .unwrap();
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const WRITE_DAC: u32 = 0x0004_0000;
+            let file = fs::OpenOptions::new()
+                .access_mode(WRITE_DAC)
+                .open(&bad_state_path)
+                .unwrap();
+            windows_dacl::restrict_private_file_dacl(&file).unwrap();
+        }
         let err_bad_state = handle_blob_rekey_batch(BlobRekeyBatchArgs {
-            files: vec![blob_path],
+            files: vec![blob_path.clone()],
             dir: None,
             glob: "*.age".to_string(),
             recursive: false,
             apply: false,
-            state: Some(bad_state_path),
+            state: Some(bad_state_path.clone()),
             backup: false,
             fail_fast: false,
             json: false,
@@ -5896,7 +6565,7 @@ mod tests {
                 prior_recipient_files: vec![],
             },
             identities: IdentityArgs {
-                identity_files: vec![id_path],
+                identity_files: vec![id_path.clone()],
                 identity_public_key: None,
             },
             verify_identities: VerifyIdentityArgs::default(),
@@ -5904,5 +6573,34 @@ mod tests {
         })
         .expect_err("journal record with sha256_before == sha256_after must be rejected");
         assert!(err_bad_state.to_string().contains("malformed record"));
+
+        // On macOS, a --state journal with a non-owner extended ACL must be rejected (not merely warned).
+        #[cfg(target_os = "macos")]
+        {
+            let acl_state_path = dir.path().join("acl-state.json");
+            let valid_journal = BatchStateJournal {
+                schema: STATE_JOURNAL_SCHEMA.to_string(),
+                operation: "blob-rekey-batch".to_string(),
+                target_recipients: vec![r.to_string()],
+                prior_recipients: Some(vec![r.to_string()]),
+                allow_recipient_mismatch: false,
+                allow_self_lockout: false,
+                allow_large: false,
+                records: std::collections::BTreeMap::new(),
+            };
+            persist_state_journal(&acl_state_path, &valid_journal, None).unwrap();
+            let status = std::process::Command::new("/bin/chmod")
+                .args(["+a", "user:root allow read,write"])
+                .arg(&acl_state_path)
+                .status()
+                .expect("run /bin/chmod +a");
+            assert!(status.success(), "set non-owner ACL on state journal");
+            let acl_err = read_existing_state_journal_for_cas(&acl_state_path)
+                .expect_err("non-owner ACL on --state journal must be refused");
+            assert!(
+                acl_err.to_string().contains("non-owner extended ACL"),
+                "unexpected error: {acl_err}"
+            );
+        }
     }
 }
