@@ -2658,11 +2658,79 @@ fn collect_batch_files(args: &BlobRekeyBatchArgs) -> CliResult<Vec<SelectedBatch
     Ok(selected_files)
 }
 
+#[cfg(any(windows, test))]
+const WINDOWS_SE_DACL_PRESENT: u16 = 0x0004;
+#[cfg(any(windows, test))]
+const WINDOWS_SE_DACL_PROTECTED: u16 = 0x1000;
+#[cfg(any(windows, test))]
+const WINDOWS_ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+
+/// Validate that a Windows security descriptor has an owner SID equal to the
+/// current process user SID, a present and protected DACL (`SE_DACL_PROTECTED`,
+/// blocking inherited parent ACEs), and at least one ACE where every ACE is an
+/// `ACCESS_ALLOWED_ACE_TYPE` granting access solely to `expected_user_sid`.
+#[cfg(any(windows, test))]
+fn validate_windows_owner_and_dacl_sids(
+    expected_user_sid: &[u8],
+    file_owner_sid: Option<&[u8]>,
+    control: u16,
+    aces: &[(u8, &[u8])],
+) -> std::io::Result<()> {
+    if expected_user_sid.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "invalid empty Windows process user SID",
+        ));
+    }
+    if file_owner_sid != Some(expected_user_sid) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "private file on Windows is not owned by the current user SID",
+        ));
+    }
+    if (control & WINDOWS_SE_DACL_PRESENT) == 0 || (control & WINDOWS_SE_DACL_PROTECTED) == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "private file on Windows does not have a protected owner-only DACL",
+        ));
+    }
+    if aces.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "private file on Windows has an empty DACL",
+        ));
+    }
+    for (ace_type, ace_sid) in aces {
+        if *ace_type != WINDOWS_ACCESS_ALLOWED_ACE_TYPE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "private file on Windows contains unexpected ACE type in DACL",
+            ));
+        }
+        if *ace_sid != expected_user_sid {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "private file on Windows grants DACL access to a non-owner SID",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 mod windows_dacl {
-    use std::fs::File;
-    use std::io;
-    use std::os::windows::io::AsRawHandle;
+    use std::fs::{self, File};
+    use std::io::{self, Read, Write};
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use std::path::Path;
+
+    use crate::atomic_write::PrivateCiphertextPriorSnapshot;
+    use crate::error::{CliError, CliResult};
+
+    use super::{
+        validate_windows_owner_and_dacl_sids, WINDOWS_SE_DACL_PRESENT, WINDOWS_SE_DACL_PROTECTED,
+    };
 
     #[repr(C)]
     struct SidAndAttributes {
@@ -2698,6 +2766,24 @@ mod windows_dacl {
         sid_start: u32,
     }
 
+    #[repr(C)]
+    struct SecurityDescriptor {
+        revision: u8,
+        sbz1: u8,
+        control: u16,
+        owner: *mut core::ffi::c_void,
+        group: *mut core::ffi::c_void,
+        sacl: *mut AclHeader,
+        dacl: *mut AclHeader,
+    }
+
+    #[repr(C)]
+    struct SecurityAttributes {
+        n_length: u32,
+        lp_security_descriptor: *mut core::ffi::c_void,
+        b_inherit_handle: i32,
+    }
+
     struct HandleGuard(*mut core::ffi::c_void);
     impl Drop for HandleGuard {
         fn drop(&mut self) {
@@ -2727,6 +2813,28 @@ mod windows_dacl {
         fn GetCurrentProcess() -> *mut core::ffi::c_void;
         fn CloseHandle(hObject: *mut core::ffi::c_void) -> i32;
         fn LocalFree(hMem: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+        fn CreateFileW(
+            lpFileName: *const u16,
+            dwDesiredAccess: u32,
+            dwShareMode: u32,
+            lpSecurityAttributes: *mut SecurityAttributes,
+            dwCreationDisposition: u32,
+            dwFlagsAndAttributes: u32,
+            hTemplateFile: *mut core::ffi::c_void,
+        ) -> *mut core::ffi::c_void;
+        fn MoveFileExW(
+            lpExistingFileName: *const u16,
+            lpNewFileName: *const u16,
+            dwFlags: u32,
+        ) -> i32;
+        fn ReplaceFileW(
+            lpReplacedFileName: *const u16,
+            lpReplacementFileName: *const u16,
+            lpBackupFileName: *const u16,
+            dwReplaceFlags: u32,
+            lpExclude: *mut core::ffi::c_void,
+            lpReserved: *mut core::ffi::c_void,
+        ) -> i32;
     }
 
     #[link(name = "advapi32")]
@@ -2752,6 +2860,26 @@ mod windows_dacl {
             dwAceRevision: u32,
             AccessMask: u32,
             pSid: *mut core::ffi::c_void,
+        ) -> i32;
+        fn InitializeSecurityDescriptor(
+            pSecurityDescriptor: *mut SecurityDescriptor,
+            dwRevision: u32,
+        ) -> i32;
+        fn SetSecurityDescriptorOwner(
+            pSecurityDescriptor: *mut SecurityDescriptor,
+            pOwner: *mut core::ffi::c_void,
+            bOwnerDefaulted: i32,
+        ) -> i32;
+        fn SetSecurityDescriptorDacl(
+            pSecurityDescriptor: *mut SecurityDescriptor,
+            bDaclPresent: i32,
+            pDacl: *mut AclHeader,
+            bDaclDefaulted: i32,
+        ) -> i32;
+        fn SetSecurityDescriptorControl(
+            pSecurityDescriptor: *mut SecurityDescriptor,
+            wControlBitsOfInterest: u16,
+            wControlBitsToSet: u16,
         ) -> i32;
         fn SetSecurityInfo(
             handle: *mut core::ffi::c_void,
@@ -2783,13 +2911,28 @@ mod windows_dacl {
     const TOKEN_QUERY: u32 = 0x0008;
     const TOKEN_USER_CLASS: u32 = 1;
     const ACL_REVISION: u32 = 2;
+    const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
     const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const WRITE_DAC: u32 = 0x0004_0000;
+    const WRITE_OWNER: u32 = 0x0008_0000;
+    const CREATE_NEW: u32 = 1;
+    const OPEN_EXISTING: u32 = 3;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
     const SE_FILE_OBJECT: u32 = 1;
+    const OWNER_SECURITY_INFORMATION: u32 = 0x0000_0001;
     const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
     const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
-    const SE_DACL_PRESENT: u16 = 0x0004;
-    const SE_DACL_PROTECTED: u16 = 0x1000;
-    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+
+    fn encode_wide_null(path: &Path) -> Vec<u16> {
+        path.as_os_str()
+            .encode_wide()
+            .chain(core::iter::once(0))
+            .collect()
+    }
 
     fn current_process_user_token_buf() -> io::Result<Vec<u64>> {
         let mut token: *mut core::ffi::c_void = core::ptr::null_mut();
@@ -2841,11 +2984,7 @@ mod windows_dacl {
         Ok(buf)
     }
 
-    pub(super) fn restrict_private_file_dacl(file: &File) -> io::Result<()> {
-        let user_buf = current_process_user_token_buf()?;
-        let token_user = user_buf.as_ptr().cast::<TokenUser>();
-        // SAFETY: `user_buf` lives for this function and holds a valid `TokenUser`.
-        let user_sid = unsafe { (*token_user).user.sid };
+    fn build_owner_only_acl_buf(user_sid: *mut core::ffi::c_void) -> io::Result<Vec<u64>> {
         // SAFETY: `user_sid` was validated by `IsValidSid`.
         let sid_len = unsafe { GetLengthSid(user_sid) } as usize;
         let acl_bytes_len = (core::mem::size_of::<AclHeader>() + 8 + sid_len + 3) & !3;
@@ -2860,22 +2999,144 @@ mod windows_dacl {
         if unsafe { AddAccessAllowedAce(acl_ptr, ACL_REVISION, FILE_ALL_ACCESS, user_sid) } == 0 {
             return Err(io::Error::last_os_error());
         }
-        // SAFETY: `file` is an open file handle and `acl_ptr` is a valid ACL.
-        let rc = unsafe {
+        Ok(acl_buf)
+    }
+
+    unsafe fn sid_bytes<'a>(sid: *mut core::ffi::c_void) -> Option<&'a [u8]> {
+        if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
+            return None;
+        }
+        let len = unsafe { GetLengthSid(sid) } as usize;
+        if len == 0 {
+            return None;
+        }
+        Some(unsafe { core::slice::from_raw_parts(sid.cast::<u8>(), len) })
+    }
+
+    /// Create a brand-new private file atomically bound to a protected
+    /// current-user-only security descriptor (`owner = user_sid`,
+    /// `SE_DACL_PROTECTED`, single `FILE_ALL_ACCESS` ACE for `user_sid`) and
+    /// `dwShareMode = 0` (exclusive) at `CreateFileW` time so no other user can
+    /// open or retain a handle during creation.
+    pub(super) fn create_new_private_file(path: &Path) -> io::Result<File> {
+        let user_buf = current_process_user_token_buf()?;
+        let token_user = user_buf.as_ptr().cast::<TokenUser>();
+        // SAFETY: `user_buf` lives for this function and holds a valid `TokenUser`.
+        let user_sid = unsafe { (*token_user).user.sid };
+        let mut acl_buf = build_owner_only_acl_buf(user_sid)?;
+        let acl_ptr = acl_buf.as_mut_ptr().cast::<AclHeader>();
+
+        let mut sd = SecurityDescriptor {
+            revision: 0,
+            sbz1: 0,
+            control: 0,
+            owner: core::ptr::null_mut(),
+            group: core::ptr::null_mut(),
+            sacl: core::ptr::null_mut(),
+            dacl: core::ptr::null_mut(),
+        };
+        // SAFETY: `sd` is stack-allocated and lives across `CreateFileW`.
+        if unsafe { InitializeSecurityDescriptor(&mut sd, SECURITY_DESCRIPTOR_REVISION) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `sd` is initialized and `user_sid` is valid.
+        if unsafe { SetSecurityDescriptorOwner(&mut sd, user_sid, 0) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `sd` is initialized and `acl_ptr` is valid.
+        if unsafe { SetSecurityDescriptorDacl(&mut sd, 1, acl_ptr, 0) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: mark DACL as protected (`SE_DACL_PROTECTED`) so parent ACEs are not inherited.
+        if unsafe {
+            SetSecurityDescriptorControl(
+                &mut sd,
+                WINDOWS_SE_DACL_PROTECTED,
+                WINDOWS_SE_DACL_PROTECTED,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut sa = SecurityAttributes {
+            n_length: core::mem::size_of::<SecurityAttributes>() as u32,
+            lp_security_descriptor: (&mut sd as *mut SecurityDescriptor).cast(),
+            b_inherit_handle: 0,
+        };
+        let wide_path = encode_wide_null(path);
+        // SAFETY: `wide_path` is null-terminated and `sa` points to `sd` which is live.
+        let handle = unsafe {
+            CreateFileW(
+                wide_path.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE | WRITE_DAC | WRITE_OWNER,
+                0, // dwShareMode = 0 (exclusive; no concurrent handles permitted)
+                &mut sa,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                core::ptr::null_mut(),
+            )
+        };
+        let invalid = (-1isize) as *mut core::ffi::c_void;
+        if handle.is_null() || handle == invalid {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `handle` is a valid newly opened Win32 file handle.
+        let file = unsafe { File::from_raw_handle(handle) };
+        if let Err(err) =
+            restrict_private_file_dacl(&file).and_then(|()| verify_private_file_dacl(&file))
+        {
+            drop(file);
+            let _ = fs::remove_file(path);
+            return Err(err);
+        }
+        Ok(file)
+    }
+
+    pub(super) fn restrict_private_file_dacl(file: &File) -> io::Result<()> {
+        let user_buf = current_process_user_token_buf()?;
+        let token_user = user_buf.as_ptr().cast::<TokenUser>();
+        // SAFETY: `user_buf` lives for this function and holds a valid `TokenUser`.
+        let user_sid = unsafe { (*token_user).user.sid };
+        let mut acl_buf = build_owner_only_acl_buf(user_sid)?;
+        let acl_ptr = acl_buf.as_mut_ptr().cast::<AclHeader>();
+
+        // Attempt to set both owner SID and protected owner-only DACL first; if
+        // setting owner is not permitted because the handle was opened with
+        // WRITE_DAC only, fall back to setting the protected DACL and require
+        // `verify_private_file_dacl` to confirm `owner_sid == user_sid`.
+        // SAFETY: `file` is an open file handle and `user_sid` / `acl_ptr` are valid.
+        let rc_owner = unsafe {
             SetSecurityInfo(
                 file.as_raw_handle(),
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                core::ptr::null_mut(),
+                OWNER_SECURITY_INFORMATION
+                    | DACL_SECURITY_INFORMATION
+                    | PROTECTED_DACL_SECURITY_INFORMATION,
+                user_sid,
                 core::ptr::null_mut(),
                 acl_ptr,
                 core::ptr::null_mut(),
             )
         };
-        if rc != 0 {
-            return Err(io::Error::from_raw_os_error(rc as i32));
+        if rc_owner != 0 {
+            // SAFETY: `file` is an open file handle and `acl_ptr` is a valid ACL.
+            let rc_dacl = unsafe {
+                SetSecurityInfo(
+                    file.as_raw_handle(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                    acl_ptr,
+                    core::ptr::null_mut(),
+                )
+            };
+            if rc_dacl != 0 {
+                return Err(io::Error::from_raw_os_error(rc_dacl as i32));
+            }
         }
-        Ok(())
+        verify_private_file_dacl(file)
     }
 
     pub(super) fn verify_private_file_dacl(file: &File) -> io::Result<()> {
@@ -2883,7 +3144,14 @@ mod windows_dacl {
         let token_user = user_buf.as_ptr().cast::<TokenUser>();
         // SAFETY: `user_buf` lives for this function and holds a valid `TokenUser`.
         let user_sid = unsafe { (*token_user).user.sid };
+        let expected_user_bytes = unsafe { sid_bytes(user_sid) }.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "invalid Windows process user SID",
+            )
+        })?;
 
+        let mut owner_sid: *mut core::ffi::c_void = core::ptr::null_mut();
         let mut dacl: *mut AclHeader = core::ptr::null_mut();
         let mut sd: *mut core::ffi::c_void = core::ptr::null_mut();
         // SAFETY: `file` is an open file handle; `sd` is freed by `LocalMemGuard`.
@@ -2891,8 +3159,8 @@ mod windows_dacl {
             GetSecurityInfo(
                 file.as_raw_handle(),
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                core::ptr::null_mut(),
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner_sid,
                 core::ptr::null_mut(),
                 &mut dacl,
                 core::ptr::null_mut(),
@@ -2904,13 +3172,23 @@ mod windows_dacl {
         }
         let _sd_guard = LocalMemGuard(sd);
 
+        let file_owner_bytes = unsafe { sid_bytes(owner_sid) };
+        if file_owner_bytes.is_none() || unsafe { EqualSid(owner_sid, user_sid) } == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private file on Windows is not owned by the current user SID",
+            ));
+        }
+
         let mut control: u16 = 0;
         let mut revision: u32 = 0;
         // SAFETY: `sd` was returned by `GetSecurityInfo`.
         if unsafe { GetSecurityDescriptorControl(sd, &mut control, &mut revision) } == 0 {
             return Err(io::Error::last_os_error());
         }
-        if (control & SE_DACL_PRESENT) == 0 || (control & SE_DACL_PROTECTED) == 0 || dacl.is_null()
+        if (control & WINDOWS_SE_DACL_PRESENT) == 0
+            || (control & WINDOWS_SE_DACL_PROTECTED) == 0
+            || dacl.is_null()
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -2920,12 +3198,7 @@ mod windows_dacl {
 
         // SAFETY: `dacl` is non-null and points into `sd`.
         let ace_count = unsafe { (*dacl).ace_count };
-        if ace_count == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "private file on Windows has an empty DACL",
-            ));
-        }
+        let mut aces: Vec<(u8, &[u8])> = Vec::with_capacity(ace_count as usize);
         for idx in 0..(ace_count as u32) {
             let mut ace_ptr: *mut AceHeader = core::ptr::null_mut();
             // SAFETY: `dacl` is valid and `idx < ace_count`.
@@ -2934,20 +3207,155 @@ mod windows_dacl {
             }
             // SAFETY: `ace_ptr` points to a valid ACE header inside `dacl`.
             let ace_type = unsafe { (*ace_ptr).ace_type };
-            if ace_type != ACCESS_ALLOWED_ACE_TYPE {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "private file on Windows contains unexpected ACE type in DACL",
-                ));
-            }
             let allowed_ptr = ace_ptr.cast::<AccessAllowedAcePrefix>();
             // SAFETY: `ACCESS_ALLOWED_ACE_TYPE` has layout `AccessAllowedAcePrefix` where `sid_start` is the first DWORD of the SID.
             let ace_sid = unsafe { core::ptr::addr_of_mut!((*allowed_ptr).sid_start).cast() };
+            let ace_sid_slice = unsafe { sid_bytes(ace_sid) }.unwrap_or(&[]);
             if unsafe { IsValidSid(ace_sid) } == 0 || unsafe { EqualSid(ace_sid, user_sid) } == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "private file on Windows grants DACL access to a non-owner SID",
                 ));
+            }
+            aces.push((ace_type, ace_sid_slice));
+        }
+        validate_windows_owner_and_dacl_sids(expected_user_bytes, file_owner_bytes, control, &aces)
+    }
+
+    /// Atomically write `--state` on Windows by creating the temporary file
+    /// with a protected current-user-only security descriptor and `dwShareMode = 0`
+    /// at `CreateFileW` time, verifying any existing target with `dwShareMode = 0`
+    /// (rejecting retained handles) and owner/DACL checks, and publishing via
+    /// `MoveFileExW` (create-new) or `ReplaceFileW` (rewrite).
+    pub(super) fn atomic_write_private_journal(
+        state_path: &Path,
+        content: &[u8],
+        prior: Option<&PrivateCiphertextPriorSnapshot>,
+    ) -> CliResult<()> {
+        let parent = state_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+
+        if prior.is_none() && fs::symlink_metadata(state_path).is_ok() {
+            return Err(CliError::Message(format!(
+                "refusing to create {}: path already exists",
+                state_path.display()
+            )));
+        }
+
+        let pid = std::process::id();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let mut temp_path = None;
+        let mut temp_file = None;
+        for attempt in 0..64u32 {
+            let candidate = parent.join(format!(".seclusor-state-{pid}-{ts}-{attempt}.tmp"));
+            match create_new_private_file(&candidate) {
+                Ok(f) => {
+                    temp_path = Some(candidate);
+                    temp_file = Some(f);
+                    break;
+                }
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(CliError::Io(err)),
+            }
+        }
+        let temp_path = temp_path.ok_or_else(|| {
+            CliError::Message("failed to allocate unique temporary state journal path".to_string())
+        })?;
+        let mut temp_file = temp_file.expect("temp_file set with temp_path");
+
+        if let Err(err) = temp_file
+            .write_all(content)
+            .and_then(|()| temp_file.sync_all())
+            .and_then(|()| verify_private_file_dacl(&temp_file))
+        {
+            drop(temp_file);
+            let _ = fs::remove_file(&temp_path);
+            return Err(CliError::Io(err));
+        }
+        drop(temp_file);
+
+        if let Some(expected_snap) = prior {
+            // Open existing target with dwShareMode = 0 so any retained handle by
+            // another process fails immediately with ERROR_SHARING_VIOLATION.
+            let wide_target = encode_wide_null(state_path);
+            // SAFETY: `wide_target` is null-terminated.
+            let handle = unsafe {
+                CreateFileW(
+                    wide_target.as_ptr(),
+                    GENERIC_READ,
+                    0, // dwShareMode = 0 (rejects any retained handle)
+                    core::ptr::null_mut(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_OPEN_REPARSE_POINT,
+                    core::ptr::null_mut(),
+                )
+            };
+            let invalid = (-1isize) as *mut core::ffi::c_void;
+            if handle.is_null() || handle == invalid {
+                let err = io::Error::last_os_error();
+                let _ = fs::remove_file(&temp_path);
+                return Err(CliError::Io(err));
+            }
+            // SAFETY: `handle` is a valid open file handle.
+            let mut existing = unsafe { File::from_raw_handle(handle) };
+            if let Err(err) = verify_private_file_dacl(&existing) {
+                drop(existing);
+                let _ = fs::remove_file(&temp_path);
+                return Err(CliError::Io(err));
+            }
+            let mut current_bytes = Vec::with_capacity(expected_snap.bytes.len().saturating_add(1));
+            if let Err(err) = existing.read_to_end(&mut current_bytes) {
+                drop(existing);
+                let _ = fs::remove_file(&temp_path);
+                return Err(CliError::Io(err));
+            }
+            drop(existing);
+            if current_bytes.as_slice() != expected_snap.bytes.as_slice() {
+                let _ = fs::remove_file(&temp_path);
+                return Err(CliError::ConcurrentModification {
+                    path: state_path.display().to_string(),
+                });
+            }
+
+            let wide_temp = encode_wide_null(&temp_path);
+            // SAFETY: `wide_target` and `wide_temp` are null-terminated UTF-16 paths.
+            let ok = unsafe {
+                ReplaceFileW(
+                    wide_target.as_ptr(),
+                    wide_temp.as_ptr(),
+                    core::ptr::null(),
+                    0,
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                let err = io::Error::last_os_error();
+                let _ = fs::remove_file(&temp_path);
+                return Err(CliError::Io(err));
+            }
+        } else {
+            let wide_temp = encode_wide_null(&temp_path);
+            let wide_target = encode_wide_null(state_path);
+            // SAFETY: `wide_temp` and `wide_target` are null-terminated UTF-16 paths;
+            // omitting MOVEFILE_REPLACE_EXISTING enforces no-clobber semantics while
+            // moving the temp file's protected owner-only security descriptor to `state_path`.
+            let ok = unsafe {
+                MoveFileExW(
+                    wide_temp.as_ptr(),
+                    wide_target.as_ptr(),
+                    MOVEFILE_WRITE_THROUGH,
+                )
+            };
+            if ok == 0 {
+                let err = io::Error::last_os_error();
+                let _ = fs::remove_file(&temp_path);
+                return Err(CliError::Io(err));
             }
         }
         Ok(())
@@ -2996,7 +3404,12 @@ fn read_existing_state_journal_for_cas(
     {
         use std::os::windows::fs::OpenOptionsExt;
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        // `share_mode(0)` is exclusive: if any other process retains an open
+        // handle (writable or otherwise) to `--state`, `CreateFileW` fails
+        // closed with `ERROR_SHARING_VIOLATION`.
+        options
+            .share_mode(0)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
     let mut file = match options.open(state_path) {
         Ok(f) => f,
@@ -3209,28 +3622,72 @@ fn load_or_init_state_journal(
     Ok((journal, None))
 }
 
+struct BoundedJournalWriter {
+    buf: Vec<u8>,
+    max_bytes: usize,
+}
+
+impl std::io::Write for BoundedJournalWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.buf.len().saturating_add(data.len()) > self.max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "--state journal exceeds maximum size of {} bytes",
+                    self.max_bytes
+                ),
+            ));
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialize_state_journal_bounded(
+    journal: &BatchStateJournal,
+    max_bytes: usize,
+) -> CliResult<Vec<u8>> {
+    let mut writer = BoundedJournalWriter {
+        buf: Vec::with_capacity(max_bytes.min(4096)),
+        max_bytes,
+    };
+    serde_json::to_writer_pretty(&mut writer, journal).map_err(|err| {
+        if err.is_io() {
+            CliError::Message(format!(
+                "--state journal exceeds maximum size of {max_bytes} bytes"
+            ))
+        } else {
+            CliError::from(err)
+        }
+    })?;
+    if !writer.buf.ends_with(b"\n") {
+        std::io::Write::write_all(&mut writer, b"\n").map_err(|_| {
+            CliError::Message(format!(
+                "--state journal exceeds maximum size of {max_bytes} bytes"
+            ))
+        })?;
+    }
+    Ok(writer.buf)
+}
+
 fn persist_state_journal(
     state_path: &Path,
     journal: &BatchStateJournal,
-    prior_snapshot: Option<PrivateCiphertextPriorSnapshot>,
+    prior_snapshot: Option<&PrivateCiphertextPriorSnapshot>,
 ) -> CliResult<PrivateCiphertextPriorSnapshot> {
     reject_symlink_traversal_in_path(state_path, "--state", true)?;
-    let mut bytes = serde_json::to_vec_pretty(journal)?;
-    if !bytes.ends_with(b"\n") {
-        bytes.push(b'\n');
+    let bytes = serialize_state_journal_bounded(journal, MAX_STATE_JOURNAL_BYTES as usize)?;
+    #[cfg(unix)]
+    {
+        atomic_write_private_ciphertext(state_path, &bytes, prior_snapshot.cloned())?;
     }
-    atomic_write_private_ciphertext(state_path, &bytes, prior_snapshot)?;
     #[cfg(windows)]
     {
-        use std::os::windows::fs::OpenOptionsExt;
-        const WRITE_DAC: u32 = 0x0004_0000;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        let file = fs::OpenOptions::new()
-            .access_mode(WRITE_DAC)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(state_path)
-            .map_err(CliError::Io)?;
-        windows_dacl::restrict_private_file_dacl(&file).map_err(CliError::Io)?;
+        windows_dacl::atomic_write_private_journal(state_path, &bytes, prior_snapshot)?;
     }
     let refreshed = read_existing_state_journal_for_cas(state_path)?.ok_or_else(|| {
         CliError::Message(format!(
@@ -3267,32 +3724,22 @@ fn create_private_backup_file(path: &Path, prior_bytes: &[u8]) -> CliResult<Path
         )));
     }
 
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let mut file = options.open(&backup_path).map_err(CliError::Io)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
+    let mut file = {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut options = fs::OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW);
+        let file = options.open(&backup_path).map_err(CliError::Io)?;
         file.set_permissions(fs::Permissions::from_mode(0o600))
             .map_err(CliError::Io)?;
-    }
+        file
+    };
     #[cfg(windows)]
-    if let Err(err) = windows_dacl::restrict_private_file_dacl(&file) {
-        drop(file);
-        let _ = fs::remove_file(&backup_path);
-        return Err(CliError::Io(err));
-    }
+    let mut file = windows_dacl::create_new_private_file(&backup_path).map_err(CliError::Io)?;
     if let Err(err) = seclusor_crypto::acl::prepare_private_file(&file, &backup_path) {
         drop(file);
         let _ = fs::remove_file(&backup_path);
@@ -3667,13 +4114,21 @@ pub(crate) fn handle_blob_rekey_batch_with_policy(
                     // atomic rename before the post-commit journal update, upgrade it to `rekeyed`
                     // when running under `--apply`.
                     if args.apply && rec.status != "rekeyed" {
+                        let prev_rec = journal.records.get(&path_str).cloned();
                         if let Some(entry) = journal.records.get_mut(&path_str) {
                             entry.status = "rekeyed".to_string();
                         }
                         if let Some(state_path) = &args.state {
-                            let new_snap =
-                                persist_state_journal(state_path, journal, journal_snap.take())?;
-                            *journal_snap = Some(new_snap);
+                            match persist_state_journal(state_path, journal, journal_snap.as_ref())
+                            {
+                                Ok(new_snap) => *journal_snap = Some(new_snap),
+                                Err(err) => {
+                                    if let Some(prev) = prev_rec {
+                                        journal.records.insert(path_str.clone(), prev);
+                                    }
+                                    return Err(err);
+                                }
+                            }
                         }
                     }
                     summary.already_done += 1;
@@ -4160,7 +4615,7 @@ pub(crate) fn handle_blob_rekey_batch_with_policy(
         if let (Some(state_path), Some((ref mut journal, ref mut journal_snap))) =
             (&args.state, &mut journal_state)
         {
-            journal.records.insert(
+            let prev_record = journal.records.insert(
                 path_str.clone(),
                 BatchJournalRecord {
                     path: path_str.clone(),
@@ -4177,9 +4632,14 @@ pub(crate) fn handle_blob_rekey_batch_with_policy(
                     backup: backup_path_str.clone(),
                 },
             );
-            match persist_state_journal(state_path, journal, journal_snap.take()) {
+            match persist_state_journal(state_path, journal, journal_snap.as_ref()) {
                 Ok(new_snap) => *journal_snap = Some(new_snap),
                 Err(err) => {
+                    if let Some(prev) = prev_record {
+                        journal.records.insert(path_str.clone(), prev);
+                    } else {
+                        journal.records.remove(&path_str);
+                    }
                     summary.failed += 1;
                     let msg = format!("pre-commit state journal write failed: {err}");
                     eprintln!("failed {path_str}: {msg}");
@@ -4265,13 +4725,17 @@ pub(crate) fn handle_blob_rekey_batch_with_policy(
         if let (Some(state_path), Some((ref mut journal, ref mut journal_snap))) =
             (&args.state, &mut journal_state)
         {
+            let prev_record = journal.records.get(&path_str).cloned();
             if let Some(entry) = journal.records.get_mut(&path_str) {
                 entry.status = "rekeyed".to_string();
                 entry.ts = utc_compact_timestamp_now();
             }
-            if let Err(err) = persist_state_journal(state_path, journal, journal_snap.take())
+            if let Err(err) = persist_state_journal(state_path, journal, journal_snap.as_ref())
                 .map(|snap| *journal_snap = Some(snap))
             {
+                if let Some(prev) = prev_record {
+                    journal.records.insert(path_str.clone(), prev);
+                }
                 summary.failed += 1;
                 let msg = format!(
                     "output was committed to {path_str}, but post-commit state journal update at {} failed: {err}",
@@ -6536,8 +7000,9 @@ mod tests {
         {
             use std::os::windows::fs::OpenOptionsExt;
             const WRITE_DAC: u32 = 0x0004_0000;
+            const WRITE_OWNER: u32 = 0x0008_0000;
             let file = fs::OpenOptions::new()
-                .access_mode(WRITE_DAC)
+                .access_mode(WRITE_DAC | WRITE_OWNER)
                 .open(&bad_state_path)
                 .unwrap();
             windows_dacl::restrict_private_file_dacl(&file).unwrap();
@@ -6573,6 +7038,109 @@ mod tests {
         })
         .expect_err("journal record with sha256_before == sha256_after must be rejected");
         assert!(err_bad_state.to_string().contains("malformed record"));
+
+        // Regression test (GR-06 / devrev GR-03): foreign-owned journal with victim-only
+        // protected DACL must be rejected; unprotected or non-owner ACEs must also be rejected.
+        let victim_sid: &[u8] = &[1, 2, 0, 0, 0, 0, 0, 5, 21, 10, 20, 30];
+        let attacker_sid: &[u8] = &[1, 2, 0, 0, 0, 0, 0, 5, 21, 99, 99, 99];
+        let protected_ctrl = WINDOWS_SE_DACL_PRESENT | WINDOWS_SE_DACL_PROTECTED;
+        validate_windows_owner_and_dacl_sids(
+            victim_sid,
+            Some(victim_sid),
+            protected_ctrl,
+            &[(WINDOWS_ACCESS_ALLOWED_ACE_TYPE, victim_sid)],
+        )
+        .expect("owner-owned protected victim-only DACL must pass");
+        let foreign_owner_err = validate_windows_owner_and_dacl_sids(
+            victim_sid,
+            Some(attacker_sid),
+            protected_ctrl,
+            &[(WINDOWS_ACCESS_ALLOWED_ACE_TYPE, victim_sid)],
+        )
+        .expect_err("foreign-owned journal with victim-only DACL must be rejected");
+        assert!(foreign_owner_err
+            .to_string()
+            .contains("not owned by the current user SID"));
+        let unprotected_err = validate_windows_owner_and_dacl_sids(
+            victim_sid,
+            Some(victim_sid),
+            WINDOWS_SE_DACL_PRESENT,
+            &[(WINDOWS_ACCESS_ALLOWED_ACE_TYPE, victim_sid)],
+        )
+        .expect_err("unprotected DACL must be rejected");
+        assert!(unprotected_err.to_string().contains("protected owner-only"));
+        let non_owner_ace_err = validate_windows_owner_and_dacl_sids(
+            victim_sid,
+            Some(victim_sid),
+            protected_ctrl,
+            &[
+                (WINDOWS_ACCESS_ALLOWED_ACE_TYPE, victim_sid),
+                (WINDOWS_ACCESS_ALLOWED_ACE_TYPE, attacker_sid),
+            ],
+        )
+        .expect_err("non-owner ACE in DACL must be rejected");
+        assert!(non_owner_ace_err.to_string().contains("non-owner SID"));
+
+        // Regression test (GR-08): bounded journal serialization rejects overflow before
+        // allocation growth or publication and preserves the previous readable journal.
+        let preserved_state_path = dir.path().join("preserved-state.json");
+        let mut bounded_journal = BatchStateJournal {
+            schema: STATE_JOURNAL_SCHEMA.to_string(),
+            operation: "blob-rekey-batch".to_string(),
+            target_recipients: vec![r.to_string()],
+            prior_recipients: Some(vec![r.to_string()]),
+            allow_recipient_mismatch: false,
+            allow_self_lockout: false,
+            allow_large: false,
+            records: std::collections::BTreeMap::new(),
+        };
+        let initial_snap =
+            persist_state_journal(&preserved_state_path, &bounded_journal, None).unwrap();
+        let initial_on_disk = fs::read(&preserved_state_path).unwrap();
+        let small_cap = initial_on_disk.len();
+        serialize_state_journal_bounded(&bounded_journal, small_cap)
+            .expect("exact-fit journal serialization must succeed");
+        bounded_journal.records.insert(
+            "/tmp/extra.age".to_string(),
+            BatchJournalRecord {
+                path: "/tmp/extra.age".to_string(),
+                sha256_before: "a".repeat(64),
+                sha256_after: "b".repeat(64),
+                status: "in_progress".to_string(),
+                ts: "20261117T000000Z".to_string(),
+                opened_with: r.to_string(),
+                stanzas_before: 1,
+                stanzas_after: 1,
+                delta: None,
+                mode_before: Some("0600".to_string()),
+                mode_after: Some("0600".to_string()),
+                backup: None,
+            },
+        );
+        let overflow_err = serialize_state_journal_bounded(&bounded_journal, small_cap)
+            .expect_err("journal crossing size limit must be rejected before write");
+        assert!(overflow_err.to_string().contains("exceeds maximum size"));
+        assert_eq!(
+            fs::read(&preserved_state_path).unwrap(),
+            initial_on_disk,
+            "previous readable journal on disk must remain intact when serialization overflows"
+        );
+        assert_eq!(initial_snap.bytes.as_slice(), initial_on_disk.as_slice());
+
+        // Regression test (GR-07 / devrev GR-04 on Windows): retained open handle on --state
+        // is rejected by exclusive share_mode(0) open on read and rewrite.
+        #[cfg(windows)]
+        {
+            let retained_handle = fs::File::open(&preserved_state_path).expect("open retained");
+            let retained_read_err = read_existing_state_journal_for_cas(&preserved_state_path)
+                .expect_err("retained handle on --state must be rejected by share_mode(0)");
+            let _ = retained_read_err;
+            let retained_write_err =
+                persist_state_journal(&preserved_state_path, &bounded_journal, Some(&initial_snap))
+                    .expect_err("retained handle on --state must be rejected before rewrite");
+            let _ = retained_write_err;
+            drop(retained_handle);
+        }
 
         // On macOS, a --state journal with a non-owner extended ACL must be rejected (not merely warned).
         #[cfg(target_os = "macos")]
