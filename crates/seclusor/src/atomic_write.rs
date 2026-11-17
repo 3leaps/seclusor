@@ -279,29 +279,6 @@ fn atomic_write_with_permissions(
             }
         }
     }
-    #[cfg(windows)]
-    if prior_snapshot.is_some() {
-        if let Some(ref guard) = _cas_guard {
-            let (_, displaced_nlink) =
-                windows_file_identity_and_nlink(&guard.file).map_err(|err| {
-                    CliError::PostCommitFailure {
-                        path: path.display().to_string(),
-                        step: "displaced ciphertext link count check",
-                        source: Box::new(CliError::Io(err)),
-                    }
-                })?;
-            if displaced_nlink != 0 {
-                return Err(CliError::PostCommitFailure {
-                    path: path.display().to_string(),
-                    step: "displaced ciphertext link count verification",
-                    source: Box::new(CliError::Message(
-                        "displaced ciphertext inode retained unexpected hardlink after replacement"
-                            .to_string(),
-                    )),
-                });
-            }
-        }
-    }
     drop(_cas_guard);
 
     if let Some((old_mode, new_mode)) = tightened_mode {
