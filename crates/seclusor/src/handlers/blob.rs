@@ -2413,8 +2413,34 @@ fn filename_glob_matches(pattern: &str, name: &str) -> bool {
     dp[t.len()]
 }
 
+fn strip_case_insensitive_recovery_prefix<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    if s.len() < prefix.len() || !s.is_char_boundary(prefix.len()) {
+        return None;
+    }
+    #[cfg(windows)]
+    {
+        if windows_dacl::windows_filenames_equal_ordinal_ignore_case(
+            std::ffi::OsStr::new(&s[..prefix.len()]),
+            std::ffi::OsStr::new(prefix),
+        ) {
+            return Some(&s[prefix.len()..]);
+        }
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        if s[..prefix.len()].eq_ignore_ascii_case(prefix) {
+            Some(&s[prefix.len()..])
+        } else {
+            None
+        }
+    }
+}
+
 fn is_skipped_dir_entry_name(name: &str) -> bool {
-    name.starts_with('.') || name.starts_with(".seclusor-") || name.contains(".bak-")
+    name.starts_with('.')
+        || strip_case_insensitive_recovery_prefix(name, ".seclusor-").is_some()
+        || name.to_ascii_lowercase().contains(".bak-")
 }
 
 fn is_symlink_or_reparse_point(meta: &fs::Metadata) -> bool {
@@ -2753,7 +2779,9 @@ fn recover_pending_windows_displaced_blobs_in_dir(
                 entry.path().display()
             )));
         };
-        if let Some(stale_rest) = name_str.strip_prefix(".seclusor-stale-displaced-") {
+        if let Some(stale_rest) =
+            strip_case_insensitive_recovery_prefix(name_str, ".seclusor-stale-displaced-")
+        {
             if let Some((stale_leaf, _)) = stale_rest.rsplit_once('.') {
                 if !path_matches_optional_target_in_dir(&canon_dir, stale_leaf, state_path)
                     && !path_matches_optional_target_in_dir(
@@ -2771,7 +2799,9 @@ fn recover_pending_windows_displaced_blobs_in_dir(
                 }
             }
         }
-        if let Some(restored_leaf) = name_str.strip_prefix(".seclusor-displaced-") {
+        if let Some(restored_leaf) =
+            strip_case_insensitive_recovery_prefix(name_str, ".seclusor-displaced-")
+        {
             if restored_leaf.is_empty()
                 || restored_leaf == "."
                 || restored_leaf == ".."
@@ -2882,7 +2912,9 @@ fn recover_pending_windows_displaced_for_file_in_parent(
 
     for entry in &entries {
         if let Some(name_str) = entry.file_name().to_str() {
-            if let Some(stale_rest) = name_str.strip_prefix(".seclusor-stale-displaced-") {
+            if let Some(stale_rest) =
+                strip_case_insensitive_recovery_prefix(name_str, ".seclusor-stale-displaced-")
+            {
                 if let Some((stale_leaf, _)) = stale_rest.rsplit_once('.') {
                     if !path_matches_optional_target_in_dir(&canon_parent, stale_leaf, state_path)
                         && !path_matches_optional_target_in_dir(
@@ -2905,7 +2937,9 @@ fn recover_pending_windows_displaced_for_file_in_parent(
 
     for entry in &entries {
         if let Some(name_str) = entry.file_name().to_str() {
-            if let Some(restored_leaf) = name_str.strip_prefix(".seclusor-displaced-") {
+            if let Some(restored_leaf) =
+                strip_case_insensitive_recovery_prefix(name_str, ".seclusor-displaced-")
+            {
                 if restored_leaf.is_empty()
                     || restored_leaf == "."
                     || restored_leaf == ".."
@@ -13318,7 +13352,129 @@ mod tests {
             assert!(win_blob_path.exists() && !displaced_win_blob.exists());
 
             // Also verify explicit `FILE` selection recovers a missing leaf when only
-            // `.seclusor-displaced-pack2.age` exists (with an inherited parent DACL).
+            // `.seclusor-displaced-pack2.age` exists (with an inherited parent DACL),
+            // and `--dir` discovery recovers a missing leaf when the displaced entry prefix
+            // was case-renamed to `.SECLUSOR-DISPLACED-pack3.age`, while a case-renamed stale
+            // marker `.SECLUSOR-STALE-DISPLACED-pack.age.123-456-0` refuses `--apply`.
+            let stale_upper_marker =
+                win_blob_dir.join(".SECLUSOR-STALE-DISPLACED-pack.age.123-456-0");
+            fs::copy(&blob_path, &stale_upper_marker).unwrap();
+            assert!(
+                handle_blob_rekey_batch(BlobRekeyBatchArgs {
+                    files: vec![],
+                    dir: Some(win_blob_dir.clone()),
+                    glob: "*.age".to_string(),
+                    recursive: false,
+                    apply: true,
+                    state: None,
+                    backup: false,
+                    fail_fast: false,
+                    json: false,
+                    write_recipients: None,
+                    allow_self_lockout: false,
+                    allow_large: false,
+                    recipients: RecipientArgs {
+                        recipients: vec![rotated_gen.recipient.clone()],
+                        recipient_files: vec![],
+                        recipient_env_var: None,
+                    },
+                    prior_recipients: PriorRecipientArgs {
+                        prior_recipients: vec![r.to_string()],
+                        prior_recipient_files: vec![],
+                    },
+                    identities: IdentityArgs {
+                        identity_files: vec![id_path.clone()],
+                        identity_public_key: None,
+                    },
+                    verify_identities: VerifyIdentityArgs {
+                        verify_identity_files: vec![rotated_id_path.clone()],
+                        verify_identity_public_key: None,
+                    },
+                    passphrase: PassphraseArgs::default(),
+                })
+                .is_err(),
+                "case-renamed .SECLUSOR-STALE-DISPLACED- marker must refuse --dir --apply"
+            );
+            assert!(
+                handle_blob_rekey_batch(BlobRekeyBatchArgs {
+                    files: vec![win_blob_path.clone()],
+                    dir: None,
+                    glob: "*.age".to_string(),
+                    recursive: false,
+                    apply: true,
+                    state: None,
+                    backup: false,
+                    fail_fast: false,
+                    json: false,
+                    write_recipients: None,
+                    allow_self_lockout: false,
+                    allow_large: false,
+                    recipients: RecipientArgs {
+                        recipients: vec![rotated_gen.recipient.clone()],
+                        recipient_files: vec![],
+                        recipient_env_var: None,
+                    },
+                    prior_recipients: PriorRecipientArgs {
+                        prior_recipients: vec![r.to_string()],
+                        prior_recipient_files: vec![],
+                    },
+                    identities: IdentityArgs {
+                        identity_files: vec![id_path.clone()],
+                        identity_public_key: None,
+                    },
+                    verify_identities: VerifyIdentityArgs {
+                        verify_identity_files: vec![rotated_id_path.clone()],
+                        verify_identity_public_key: None,
+                    },
+                    passphrase: PassphraseArgs::default(),
+                })
+                .is_err(),
+                "case-renamed .SECLUSOR-STALE-DISPLACED- marker must refuse explicit FILE --apply"
+            );
+            let _ = fs::remove_file(&stale_upper_marker);
+
+            let win_blob3_path = win_blob_dir.join("pack3.age");
+            let displaced_upper_blob3 = win_blob_dir.join(".SECLUSOR-DISPLACED-pack3.age");
+            fs::copy(&blob_path, &displaced_upper_blob3).unwrap();
+            assert!(!win_blob3_path.exists() && displaced_upper_blob3.exists());
+            handle_blob_rekey_batch(BlobRekeyBatchArgs {
+                files: vec![],
+                dir: Some(win_blob_dir.clone()),
+                glob: "pack3.age".to_string(),
+                recursive: false,
+                apply: true,
+                state: None,
+                backup: false,
+                fail_fast: false,
+                json: false,
+                write_recipients: None,
+                allow_self_lockout: false,
+                allow_large: false,
+                recipients: RecipientArgs {
+                    recipients: vec![rotated_gen.recipient.clone()],
+                    recipient_files: vec![],
+                    recipient_env_var: None,
+                },
+                prior_recipients: PriorRecipientArgs {
+                    prior_recipients: vec![r.to_string()],
+                    prior_recipient_files: vec![],
+                },
+                identities: IdentityArgs {
+                    identity_files: vec![id_path.clone()],
+                    identity_public_key: None,
+                },
+                verify_identities: VerifyIdentityArgs {
+                    verify_identity_files: vec![rotated_id_path.clone()],
+                    verify_identity_public_key: None,
+                },
+                passphrase: PassphraseArgs::default(),
+            })
+            .expect(
+                "Windows --dir apply must recover missing leaf from .SECLUSOR-DISPLACED- entry",
+            );
+            assert!(win_blob3_path.exists() && !displaced_upper_blob3.exists());
+            let _ = fs::remove_file(&win_blob3_path);
+
             let win_blob2_path = win_blob_dir.join("pack2.age");
             let displaced_win_blob2 = win_blob_dir.join(".seclusor-displaced-pack2.age");
             fs::copy(&blob_path, &displaced_win_blob2).unwrap();
@@ -13448,6 +13604,23 @@ mod tests {
             }
             let _ = fs::remove_dir_all(&win_blob_dir);
         }
+
+        assert_eq!(
+            strip_case_insensitive_recovery_prefix(
+                ".SECLUSOR-STALE-DISPLACED-pack.age.123-456-0",
+                ".seclusor-stale-displaced-"
+            ),
+            Some("pack.age.123-456-0")
+        );
+        assert_eq!(
+            strip_case_insensitive_recovery_prefix(
+                ".SeClUsOr-DiSpLaCeD-Pack.age",
+                ".seclusor-displaced-"
+            ),
+            Some("Pack.age")
+        );
+        assert!(is_skipped_dir_entry_name("pack.age.BAK-20260401T000000Z"));
+        assert!(is_skipped_dir_entry_name(".SECLUSOR-DISPLACED-pack.age"));
 
         // On macOS, a --state journal with a non-owner extended ACL must be rejected (not merely warned).
         #[cfg(target_os = "macos")]
