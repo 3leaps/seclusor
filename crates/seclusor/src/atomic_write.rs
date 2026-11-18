@@ -261,6 +261,11 @@ fn open_unix_dir_nofollow_and_validate_ancestors(dir_path: &Path) -> CliResult<F
                     false,
                     &cur_path,
                 )?;
+                let fd_path = PathBuf::from(format!("/dev/fd/{}", cur_dir.as_raw_fd()));
+                seclusor_crypto::acl::reject_writable_directory_acl(&fd_path)
+                    .map_err(CliError::Io)?;
+                seclusor_crypto::acl::reject_writable_directory_acl(&cur_path)
+                    .map_err(CliError::Io)?;
             }
             Component::Normal(part) => {
                 cur_path.push(part);
@@ -299,6 +304,11 @@ fn open_unix_dir_nofollow_and_validate_ancestors(dir_path: &Path) -> CliResult<F
                     false,
                     &cur_path,
                 )?;
+                let fd_path = PathBuf::from(format!("/dev/fd/{}", cur_dir.as_raw_fd()));
+                seclusor_crypto::acl::reject_writable_directory_acl(&fd_path)
+                    .map_err(CliError::Io)?;
+                seclusor_crypto::acl::reject_writable_directory_acl(&cur_path)
+                    .map_err(CliError::Io)?;
             }
         }
     }
@@ -311,6 +321,9 @@ fn open_unix_dir_nofollow_and_validate_ancestors(dir_path: &Path) -> CliResult<F
         true,
         &cur_path,
     )?;
+    let final_fd_path = PathBuf::from(format!("/dev/fd/{}", cur_dir.as_raw_fd()));
+    seclusor_crypto::acl::reject_writable_directory_acl(&final_fd_path).map_err(CliError::Io)?;
+    seclusor_crypto::acl::reject_writable_directory_acl(&cur_path).map_err(CliError::Io)?;
     let path_meta = fs::symlink_metadata(dir_path).map_err(CliError::Io)?;
     if path_meta.file_type().is_symlink()
         && !is_macos_system_root_symlink_in_atomic_write(&cur_path, &path_meta)
@@ -758,6 +771,60 @@ fn atomic_write_with_permissions(
                 source: Box::new(CliError::Message(
                     "on-disk bytes read via O_NOFOLLOW did not match written ciphertext"
                         .to_string(),
+                )),
+            });
+        }
+
+        // Re-verify destination namespace binding from root so a moved or replaced
+        // parent/ancestor directory cannot cause completion to be reported for a stale path.
+        let recheck_parent =
+            open_unix_dir_nofollow_and_validate_ancestors(parent).map_err(|err| {
+                CliError::PostCommitFailure {
+                    path: path.display().to_string(),
+                    step: "post-commit ancestor namespace re-verification",
+                    source: Box::new(err),
+                }
+            })?;
+        let parent_meta = parent_dir
+            .metadata()
+            .map_err(|err| CliError::PostCommitFailure {
+                path: path.display().to_string(),
+                step: "post-commit parent metadata check",
+                source: Box::new(CliError::Io(err)),
+            })?;
+        let recheck_parent_meta =
+            recheck_parent
+                .metadata()
+                .map_err(|err| CliError::PostCommitFailure {
+                    path: path.display().to_string(),
+                    step: "post-commit re-opened parent metadata check",
+                    source: Box::new(CliError::Io(err)),
+                })?;
+        let mut recheck_st: libc::stat = unsafe { core::mem::zeroed() };
+        // SAFETY: `recheck_parent` and `target_cstr` are valid.
+        let recheck_rc = unsafe {
+            libc::fstatat(
+                recheck_parent.as_raw_fd(),
+                target_cstr.as_ptr(),
+                &mut recheck_st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        #[allow(clippy::unnecessary_cast)]
+        let recheck_id = (recheck_st.st_dev as u64, recheck_st.st_ino as u64);
+        #[allow(clippy::unnecessary_cast)]
+        let recheck_nlink = recheck_st.st_nlink as u64;
+        if (recheck_parent_meta.dev(), recheck_parent_meta.ino())
+            != (parent_meta.dev(), parent_meta.ino())
+            || recheck_rc != 0
+            || recheck_id != *expected_temp_id
+            || recheck_nlink != 1
+        {
+            return Err(CliError::PostCommitFailure {
+                path: path.display().to_string(),
+                step: "post-commit destination namespace binding check",
+                source: Box::new(CliError::Message(
+                    "destination directory or entry binding changed during publication".to_string(),
                 )),
             });
         }

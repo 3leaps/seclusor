@@ -2850,6 +2850,26 @@ fn recover_pending_windows_displaced_blobs(
                 .filter(|p| !p.as_os_str().is_empty())
                 .unwrap_or_else(|| Path::new("."));
             let parent_dir = windows_dacl::open_dir_nofollow_anchored_windows(parent, "input")?;
+            if let Some(leaf_str) = leaf_os.to_str() {
+                for entry in fs::read_dir(parent).map_err(CliError::Io)? {
+                    let entry = entry.map_err(CliError::Io)?;
+                    if let Some(name_str) = entry.file_name().to_str() {
+                        if let Some(stale_rest) =
+                            name_str.strip_prefix(".seclusor-stale-displaced-")
+                        {
+                            if let Some((stale_leaf, _)) = stale_rest.rsplit_once('.') {
+                                if stale_leaf.eq_ignore_ascii_case(leaf_str) {
+                                    return Err(CliError::Message(format!(
+                                        "unresolved stale displaced blob entry {} remains in {}; inspect and resolve before running blob rekey-batch --apply",
+                                        entry.path().display(),
+                                        parent.display()
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             windows_dacl::recover_displaced_blob_windows_entry_in_dir(
                 &parent_dir,
                 leaf_os,
@@ -5137,7 +5157,7 @@ mod windows_dacl {
         validate_displaced: F,
     ) -> io::Result<()>
     where
-        F: FnOnce(&File) -> io::Result<()>,
+        F: Fn(&File) -> io::Result<()>,
     {
         let displaced_name = displaced_windows_leaf_name(leaf_name);
         match open_relative_entry_nofollow(
@@ -5164,8 +5184,31 @@ mod windows_dacl {
                         rename_open_handle_in_dir(&displaced_file, parent_dir, leaf_name, false)?;
                     }
                     Err(err) => return Err(err),
-                    Ok(_) => {
+                    Ok((_, live_nlink)) => {
                         if validate_displaced(&displaced_file).is_ok() {
+                            if live_nlink != 1 {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::PermissionDenied,
+                                    "refusing hardlinked live Windows entry while displaced recovery entry exists",
+                                ));
+                            }
+                            let live_file = open_relative_entry_nofollow(
+                                parent_dir,
+                                leaf_name,
+                                GENERIC_READ,
+                                FILE_SHARE_READ,
+                                FILE_OPEN,
+                                false,
+                            )?;
+                            let (_, open_live_nlink) = file_identity_and_nlink(&live_file)?;
+                            if open_live_nlink != 1 {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::PermissionDenied,
+                                    "refusing hardlinked live Windows entry while displaced recovery entry exists",
+                                ));
+                            }
+                            validate_displaced(&live_file)?;
+                            drop(live_file);
                             delete_open_handle_on_close(&displaced_file)?;
                             drop(displaced_file);
                             match open_relative_entry_nofollow(
@@ -6647,6 +6690,9 @@ fn open_dir_nofollow_anchored(
                         false,
                         &cur_path,
                     )?;
+                    let fd_path = PathBuf::from(format!("/dev/fd/{}", cur_dir.as_raw_fd()));
+                    seclusor_crypto::acl::reject_writable_directory_acl(&fd_path)?;
+                    seclusor_crypto::acl::reject_writable_directory_acl(&cur_path)?;
                 }
                 Component::Normal(part) => {
                     cur_path.push(part);
@@ -6700,6 +6746,9 @@ fn open_dir_nofollow_anchored(
                         false,
                         &cur_path,
                     )?;
+                    let fd_path = PathBuf::from(format!("/dev/fd/{}", cur_dir.as_raw_fd()));
+                    seclusor_crypto::acl::reject_writable_directory_acl(&fd_path)?;
+                    seclusor_crypto::acl::reject_writable_directory_acl(&cur_path)?;
                 }
             }
         }
@@ -6711,6 +6760,8 @@ fn open_dir_nofollow_anchored(
             true,
             dir_path,
         )?;
+        let leaf_fd_path = PathBuf::from(format!("/dev/fd/{}", cur_dir.as_raw_fd()));
+        seclusor_crypto::acl::reject_writable_directory_acl(&leaf_fd_path)?;
         cur_dir
     };
 
@@ -8068,6 +8119,34 @@ fn commit_batch_recipient_refresh(plan: &BatchRecipientRefreshPlan) -> CliResult
                 });
             }
             plan.parent_dir.sync_all().map_err(CliError::Io)?;
+            // Re-verify destination namespace binding after publication so a renamed or
+            // replaced ancestor directory cannot report success for a stale path.
+            let (recheck_parent_dir, recheck_canon_parent, recheck_parent_id) =
+                open_dir_nofollow_anchored(user_parent, "--write-recipients")?;
+            let mut recheck_st: libc::stat = unsafe { core::mem::zeroed() };
+            // SAFETY: `recheck_parent_dir` and `leaf_cstr` are valid.
+            let recheck_rc = unsafe {
+                libc::fstatat(
+                    recheck_parent_dir.as_raw_fd(),
+                    plan.leaf_cstr.as_ptr(),
+                    &mut recheck_st,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            #[allow(clippy::unnecessary_cast)]
+            let recheck_id = (recheck_st.st_dev as u64, recheck_st.st_ino as u64);
+            #[allow(clippy::unnecessary_cast)]
+            let recheck_nlink = recheck_st.st_nlink as u64;
+            if recheck_parent_id != plan.parent_id
+                || recheck_canon_parent != plan.canon_parent
+                || recheck_rc != 0
+                || recheck_id != temp_id
+                || recheck_nlink != 1
+            {
+                return Err(CliError::ConcurrentModification {
+                    path: plan.user_path.display().to_string(),
+                });
+            }
         }
 
         #[cfg(windows)]
@@ -8134,6 +8213,42 @@ pub(crate) fn handle_blob_rekey_batch_with_policy(
         return Err(CliError::Message(
             "--glob pattern must not be empty".to_string(),
         ));
+    }
+
+    // On Windows during `--apply`, recover a displaced `--write-recipients` file before
+    // resolving `--recipient-file` / `--prior-recipient-file` so a retry where the same
+    // file is used as both input and `--write-recipients` restores `.seclusor-displaced-<leaf>`
+    // before reading recipient inputs.
+    #[cfg(windows)]
+    if args.apply {
+        if let Some(wr_path) = &args.write_recipients {
+            if wr_path.to_str().is_none() {
+                return Err(CliError::Message(format!(
+                    "refusing non-UTF-8 --write-recipients path {}; batch paths must be valid UTF-8",
+                    wr_path.display()
+                )));
+            }
+            reject_symlink_traversal_in_path(wr_path, "--write-recipients", true)?;
+            if let Some(wr_leaf) = wr_path
+                .file_name()
+                .filter(|n| !n.is_empty() && *n != "." && *n != "..")
+            {
+                let wr_parent_path = wr_path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                let wr_parent_dir = windows_dacl::open_dir_nofollow_anchored_windows(
+                    wr_parent_path,
+                    "--write-recipients",
+                )?;
+                windows_dacl::recover_displaced_windows_entry_in_dir(
+                    &wr_parent_dir,
+                    wr_leaf,
+                    windows_dacl::validate_displaced_recipient_handle,
+                )
+                .map_err(CliError::Io)?;
+            }
+        }
     }
 
     let target_recipients = resolve_recipients(&args.recipients)?;
