@@ -13152,24 +13152,14 @@ mod tests {
             );
             drop(retained_data_handle);
 
-            // Any retained handle on `--state` (even a `WRITE_DAC`-only handle) is rejected by
-            // `ShareAccess = 0` during `atomic_write_private_journal` and `read_existing_state_journal_for_cas`.
+            // A retained `WRITE_DAC`-only handle on `--state` is orphaned onto the displaced
+            // old file object when `atomic_write_private_journal` publishes a fresh temp file
+            // object (`replaced_snap.file_id != old_handle_id`).
             let retained_write_dac = fs::OpenOptions::new()
                 .access_mode(WRITE_DAC)
                 .share_mode(FILE_SHARE_ALL)
                 .open(&preserved_state_path)
                 .expect("open retained WRITE_DAC handle");
-            assert!(
-                persist_state_journal(
-                    &preserved_state_path,
-                    &mut bounded_journal,
-                    &test_auth_key,
-                    Some(&initial_snap),
-                )
-                .is_err(),
-                "retained WRITE_DAC handle on --state must be rejected by ShareAccess = 0"
-            );
-            drop(retained_write_dac);
 
             let (old_handle_id, _) =
                 path_identity_and_nlink_nofollow(&preserved_state_path).unwrap();
@@ -13186,6 +13176,13 @@ mod tests {
                 replaced_snap.file_id, old_handle_id,
                 "handle-bound replacement must bind state_path to a new file object"
             );
+            let (orphaned_id, _) = windows_dacl::file_identity_and_nlink(&retained_write_dac)
+                .expect("inspect orphaned WRITE_DAC handle identity");
+            assert_eq!(
+                orphaned_id, old_handle_id,
+                "retained WRITE_DAC handle must remain bound to the displaced old file object"
+            );
+            drop(retained_write_dac);
 
             // Windows runtime test for batch --write-recipients creation, replacement, and
             // automatic crash-recovery of `.seclusor-displaced-<leaf>` via SetFileInformationByHandle.

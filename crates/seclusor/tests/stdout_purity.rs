@@ -891,6 +891,14 @@ fn blob_rekey_batch_json_stdout_purity_schema_and_single_passphrase_unlock() {
         );
         fs::write(&ro_state_file, final_journal_str.as_bytes()).unwrap();
         fs::set_permissions(&ro_state_file, fs::Permissions::from_mode(0o600)).unwrap();
+        let ro_state_lock = fs::File::open(&ro_state_file).unwrap();
+        unsafe {
+            use std::os::fd::AsRawFd;
+            assert_eq!(
+                libc::flock(ro_state_lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB),
+                0
+            );
+        }
         fs::set_permissions(&state_ro_dir, fs::Permissions::from_mode(0o500)).unwrap();
 
         let promo_fail_out = run_seclusor(&[
@@ -914,6 +922,7 @@ fn blob_rekey_batch_json_stdout_purity_schema_and_single_passphrase_unlock() {
             new_id.to_str().unwrap(),
         ]);
         fs::set_permissions(&state_ro_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        drop(ro_state_lock);
         assert!(
             !promo_fail_out.status.success(),
             "resumed in_progress journal promotion failure must exit non-zero"
