@@ -4546,7 +4546,7 @@ mod windows_dacl {
     ///   with `GENERIC_READ | DELETE` and `ShareAccess = 0` (excluding ALL concurrent
     ///   opens and preventing any other process from renaming or deleting `leaf_name`
     ///   because `FILE_SHARE_DELETE` is omitted), verifies `(volume_serial, file_index)`
-    ///   + `nlink == 1` + owner/DACL + bounded content, displaces `guard.file` by handle
+    ///   `nlink == 1`, owner/DACL, and bounded content, displaces `guard.file` by handle
     ///   to `.seclusor-displaced-<leaf>` (`ReplaceIfExists = false`), publishes `temp_file`
     ///   by handle to `leaf_name` (`ReplaceIfExists = false`), and deletes the displaced
     ///   `guard.file` by handle (`delete_open_handle_on_close`).
@@ -4846,7 +4846,7 @@ mod windows_dacl {
     /// - Opens `leaf_os` relative to `parent_dir` with `GENERIC_READ | DELETE` and
     ///   `ShareAccess = 0` (excluding `FILE_SHARE_DELETE` as well as read/write so
     ///   no hardlink, rename, or open can race), verifies `(volume_serial, file_index)`
-    ///   + `nlink == 1` + bounded prior bytes, displaces `guard.file` by handle to
+    ///   `nlink == 1`, and bounded prior bytes, displaces `guard.file` by handle to
     ///   `.seclusor-displaced-<leaf>` (`ReplaceIfExists = false`), publishes `temp_file`
     ///   by handle to `leaf_os` (`ReplaceIfExists = false`), marks `guard.file`
     ///   delete-on-close (`delete_open_handle_on_close` error checked), and verifies
@@ -6626,13 +6626,13 @@ fn is_json_secrets_document(bytes: &[u8]) -> bool {
 
 const MAX_BATCH_RECIPIENT_FILE_BYTES: u64 = 1024 * 1024;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 type PostStatHook = Box<dyn FnOnce()>;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 type InnerFdHook = Box<dyn FnOnce(i32)>;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 thread_local! {
     static BATCH_RECIPIENT_POST_STAT_HOOK: std::cell::RefCell<Option<PostStatHook>> =
         std::cell::RefCell::new(None);
@@ -6644,12 +6644,12 @@ thread_local! {
         std::cell::RefCell::new(None);
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn set_batch_recipient_post_stat_hook(hook: Option<PostStatHook>) {
     BATCH_RECIPIENT_POST_STAT_HOOK.with(|h| *h.borrow_mut() = hook);
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn set_batch_recipient_post_exchange_hook(hook: Option<PostStatHook>) {
     BATCH_RECIPIENT_POST_EXCHANGE_HOOK.with(|h| *h.borrow_mut() = hook);
 }
@@ -6708,6 +6708,7 @@ fn run_batch_recipient_pre_unlink_hook(inner_fd: libc::c_int) {
 ///   kernel forbids non-owners from renaming or unlinking child directories
 ///   owned by `current_uid`.
 #[cfg(any(unix, test))]
+#[allow(dead_code)]
 fn validate_unix_directory_owner_and_mode(
     current_uid: u32,
     dir_uid: u32,
@@ -6950,6 +6951,7 @@ fn open_dir_nofollow_anchored(
                 Component::Normal(part) => {
                     cur_path.push(part);
                     let meta = fs::symlink_metadata(&cur_path).map_err(CliError::Io)?;
+                    #[allow(unused_mut)]
                     let mut flags =
                         libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
                     if is_symlink_or_reparse_point(&meta) {
@@ -13197,7 +13199,7 @@ mod tests {
                 None,
                 &[],
                 &[],
-                &[rotated_gen.recipient.clone()],
+                std::slice::from_ref(&rotated_gen.recipient),
             )
             .expect("prepare existing Windows recipient file");
             commit_batch_recipient_refresh(&replace_plan)
@@ -13246,7 +13248,7 @@ mod tests {
                 None,
                 &[],
                 &[],
-                &[rotated_gen.recipient.clone()],
+                std::slice::from_ref(&rotated_gen.recipient),
             )
             .expect("recover when both leaf and validated displaced file exist");
             assert!(
