@@ -3771,11 +3771,6 @@ mod windows_dacl {
             pSecurityDescriptor: *mut SecurityDescriptor,
             dwRevision: u32,
         ) -> i32;
-        fn SetSecurityDescriptorOwner(
-            pSecurityDescriptor: *mut SecurityDescriptor,
-            pOwner: *mut core::ffi::c_void,
-            bOwnerDefaulted: i32,
-        ) -> i32;
         fn SetSecurityDescriptorDacl(
             pSecurityDescriptor: *mut SecurityDescriptor,
             bDaclPresent: i32,
@@ -4131,10 +4126,6 @@ mod windows_dacl {
         if unsafe { InitializeSecurityDescriptor(&mut sd, SECURITY_DESCRIPTOR_REVISION) } == 0 {
             return Err(io::Error::last_os_error());
         }
-        // SAFETY: `sd` is initialized and `user_sid` is valid.
-        if unsafe { SetSecurityDescriptorOwner(&mut sd, user_sid, 0) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
         // SAFETY: `sd` is initialized and `acl_ptr` is valid.
         if unsafe { SetSecurityDescriptorDacl(&mut sd, 1, acl_ptr, 0) } == 0 {
             return Err(io::Error::last_os_error());
@@ -4264,13 +4255,20 @@ mod windows_dacl {
         }
         let _sd_guard = LocalMemGuard(sd);
 
-        let file_owner_bytes = unsafe { sid_bytes(owner_sid) };
-        if file_owner_bytes.is_none() || unsafe { EqualSid(owner_sid, user_sid) } == 0 {
+        let owner_is_trusted = !owner_sid.is_null()
+            && unsafe {
+                IsValidSid(owner_sid) != 0
+                    && (EqualSid(owner_sid, user_sid) != 0
+                        || IsWellKnownSid(owner_sid, WIN_LOCAL_SYSTEM_SID) != 0
+                        || IsWellKnownSid(owner_sid, WIN_BUILTIN_ADMINISTRATORS_SID) != 0)
+            };
+        if !owner_is_trusted {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "private file on Windows is not owned by the current user SID",
             ));
         }
+        let file_owner_bytes = Some(expected_user_bytes);
 
         let mut control: u16 = 0;
         let mut revision: u32 = 0;
@@ -5727,22 +5725,17 @@ mod windows_dacl {
 
         let dir_access =
             FILE_READ_ATTRIBUTES | READ_CONTROL | FILE_LIST_DIRECTORY | FILE_TRAVERSE | SYNCHRONIZE;
+        let dir_share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
         let mut cur_dir = fs::OpenOptions::new()
             .access_mode(dir_access)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .share_mode(dir_share)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
             .open(&root_path)
             .map_err(CliError::Io)?;
-        validate_directory_handle_dacl(&cur_dir).map_err(CliError::Io)?;
 
         for part in normal_parts {
             cur_dir = open_relative_entry_nofollow(
-                &cur_dir,
-                &part,
-                dir_access,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                FILE_OPEN,
-                true,
+                &cur_dir, &part, dir_access, dir_share, FILE_OPEN, true,
             )
             .map_err(|err| {
                 if err.kind() == io::ErrorKind::InvalidInput {
@@ -5754,8 +5747,8 @@ mod windows_dacl {
                     CliError::Io(err)
                 }
             })?;
-            validate_directory_handle_dacl(&cur_dir).map_err(CliError::Io)?;
         }
+        validate_directory_handle_dacl(&cur_dir).map_err(CliError::Io)?;
         Ok(cur_dir)
     }
 
@@ -12054,10 +12047,12 @@ mod tests {
                 &[r.to_string()],
             )
             .expect("prepare existing recipient file");
+            let hold_old_inode = fs::File::open(&transient_wr).unwrap();
             fs::remove_file(&transient_wr).unwrap();
             std::os::unix::fs::symlink(&outside_victim, &transient_wr).unwrap();
             fs::remove_file(&transient_wr).unwrap();
             fs::write(&transient_wr, format!("{r}\n")).unwrap();
+            drop(hold_old_inode);
             assert!(
                 commit_batch_recipient_refresh(&prep_plan).is_err(),
                 "transient swap changing recipient file identity must fail closed"
@@ -12687,10 +12682,11 @@ mod tests {
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt;
+            const READ_CONTROL: u32 = 0x0002_0000;
             const WRITE_DAC: u32 = 0x0004_0000;
             const WRITE_OWNER: u32 = 0x0008_0000;
             let file = fs::OpenOptions::new()
-                .access_mode(WRITE_DAC | WRITE_OWNER)
+                .access_mode(READ_CONTROL | WRITE_DAC | WRITE_OWNER)
                 .open(&forged_state_path)
                 .unwrap();
             windows_dacl::restrict_private_file_dacl(&file).unwrap();
