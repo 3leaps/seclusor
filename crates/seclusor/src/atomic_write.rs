@@ -145,6 +145,190 @@ enum PermissionPolicy {
     PublicData,
 }
 
+#[cfg(unix)]
+fn is_macos_system_root_symlink_in_atomic_write(path: &Path, meta: &fs::Metadata) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.uid() == 0
+            && matches!(
+                path.to_str(),
+                Some("/var") | Some("/tmp") | Some("/etc") | Some("/private")
+            )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (path, meta);
+        false
+    }
+}
+
+#[cfg(unix)]
+fn validate_unix_dir_owner_and_mode_in_atomic_write(
+    current_uid: u32,
+    dir_uid: u32,
+    dir_mode: u32,
+    is_leaf_parent: bool,
+    dir_display: &Path,
+) -> CliResult<()> {
+    if dir_uid != current_uid && dir_uid != 0 {
+        return Err(CliError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "directory {} is owned by uid {dir_uid} (expected current uid {current_uid} or 0)",
+                dir_display.display()
+            ),
+        )));
+    }
+    if (dir_mode & 0o022) != 0 {
+        let sticky_root_ancestor = !is_leaf_parent && dir_uid == 0 && (dir_mode & 0o1000) != 0;
+        if !sticky_root_ancestor {
+            return Err(CliError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "directory {} has insecure group/other-writable mode {:04o}; \
+                     remove group/other write permissions (chmod go-w)",
+                    dir_display.display(),
+                    dir_mode & 0o7777
+                ),
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Open `dir_path` on Unix via step-by-step `openat(..., O_DIRECTORY | O_NOFOLLOW)`
+/// from `/` and validate ownership (`uid == current_uid || uid == 0`) and mode bits
+/// (no `0o022` group/other write bits on the leaf parent directory; sticky root-owned
+/// allowance only on intermediate ancestors) on every traversed component.
+#[cfg(unix)]
+fn open_unix_dir_nofollow_and_validate_ancestors(dir_path: &Path) -> CliResult<File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::path::{Component, PathBuf};
+
+    // SAFETY: `getuid` has no memory-safety preconditions and cannot fail.
+    let current_uid = unsafe { libc::getuid() };
+
+    let base_path = if dir_path.is_relative() {
+        let cwd = std::env::current_dir().map_err(CliError::Io)?;
+        cwd.join(dir_path)
+    } else {
+        dir_path.to_path_buf()
+    };
+
+    let root_cstr = CString::new("/").expect("valid root CString");
+    // SAFETY: `root_cstr` is a valid NUL-terminated string.
+    let root_fd = unsafe {
+        libc::open(
+            root_cstr.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if root_fd < 0 {
+        return Err(CliError::Io(std::io::Error::last_os_error()));
+    }
+    // SAFETY: `root_fd` is a valid newly opened directory FD.
+    let mut cur_dir = unsafe { File::from_raw_fd(root_fd) };
+    let mut cur_path = PathBuf::from("/");
+
+    for comp in base_path.components() {
+        match comp {
+            Component::Prefix(_) | Component::RootDir | Component::CurDir => {}
+            Component::ParentDir => {
+                cur_path.pop();
+                let parent_cstr = CString::new("..").expect("valid .. CString");
+                // SAFETY: `cur_dir` is an open directory FD and `parent_cstr` is valid.
+                let next_fd = unsafe {
+                    libc::openat(
+                        cur_dir.as_raw_fd(),
+                        parent_cstr.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                if next_fd < 0 {
+                    return Err(CliError::Io(std::io::Error::last_os_error()));
+                }
+                // SAFETY: `next_fd` is a valid newly opened directory FD.
+                cur_dir = unsafe { File::from_raw_fd(next_fd) };
+                let step_meta = cur_dir.metadata().map_err(CliError::Io)?;
+                validate_unix_dir_owner_and_mode_in_atomic_write(
+                    current_uid,
+                    step_meta.uid(),
+                    step_meta.permissions().mode(),
+                    false,
+                    &cur_path,
+                )?;
+            }
+            Component::Normal(part) => {
+                cur_path.push(part);
+                let meta = fs::symlink_metadata(&cur_path).map_err(CliError::Io)?;
+                let mut flags =
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+                if meta.file_type().is_symlink() {
+                    if is_macos_system_root_symlink_in_atomic_write(&cur_path, &meta) {
+                        flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+                    } else {
+                        return Err(CliError::Io(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            format!(
+                                "refusing symlink directory component {} in private ciphertext path {}",
+                                cur_path.display(),
+                                dir_path.display()
+                            ),
+                        )));
+                    }
+                }
+                let c_part = CString::new(part.as_bytes()).map_err(|_| {
+                    CliError::Message(format!("invalid NUL byte in path {}", dir_path.display()))
+                })?;
+                // SAFETY: `cur_dir` is an open directory FD and `c_part` is valid.
+                let next_fd = unsafe { libc::openat(cur_dir.as_raw_fd(), c_part.as_ptr(), flags) };
+                if next_fd < 0 {
+                    return Err(CliError::Io(std::io::Error::last_os_error()));
+                }
+                // SAFETY: `next_fd` is a valid newly opened directory FD.
+                cur_dir = unsafe { File::from_raw_fd(next_fd) };
+                let step_meta = cur_dir.metadata().map_err(CliError::Io)?;
+                validate_unix_dir_owner_and_mode_in_atomic_write(
+                    current_uid,
+                    step_meta.uid(),
+                    step_meta.permissions().mode(),
+                    false,
+                    &cur_path,
+                )?;
+            }
+        }
+    }
+
+    let final_meta = cur_dir.metadata().map_err(CliError::Io)?;
+    validate_unix_dir_owner_and_mode_in_atomic_write(
+        current_uid,
+        final_meta.uid(),
+        final_meta.permissions().mode(),
+        true,
+        &cur_path,
+    )?;
+    let path_meta = fs::symlink_metadata(dir_path).map_err(CliError::Io)?;
+    if path_meta.file_type().is_symlink()
+        && !is_macos_system_root_symlink_in_atomic_write(&cur_path, &path_meta)
+    {
+        return Err(CliError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("refusing symlink parent directory {}", dir_path.display()),
+        )));
+    }
+    let direct_meta = fs::metadata(dir_path).map_err(CliError::Io)?;
+    if final_meta.dev() != direct_meta.dev() || final_meta.ino() != direct_meta.ino() {
+        return Err(CliError::ConcurrentModification {
+            path: dir_path.display().to_string(),
+        });
+    }
+    Ok(cur_dir)
+}
+
 fn atomic_write_with_permissions(
     path: &Path,
     content: &[u8],
@@ -157,6 +341,14 @@ fn atomic_write_with_permissions(
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
 
+    #[cfg(unix)]
+    let anchored_parent_dir = if permission_policy == PermissionPolicy::CiphertextTightenPrivate {
+        seclusor_crypto::acl::reject_writable_directory_acl(parent).map_err(CliError::Io)?;
+        Some(open_unix_dir_nofollow_and_validate_ancestors(parent)?)
+    } else {
+        None
+    };
+    #[cfg(not(unix))]
     if permission_policy == PermissionPolicy::CiphertextTightenPrivate {
         seclusor_crypto::acl::reject_writable_directory_acl(parent).map_err(CliError::Io)?;
     }
@@ -183,6 +375,37 @@ fn atomic_write_with_permissions(
         builder.permissions(fs::Permissions::from_mode(fresh_mode));
     }
     let mut temp = builder.tempfile_in(parent).map_err(CliError::Io)?;
+
+    #[cfg(unix)]
+    let unix_temp_guard = if permission_policy == PermissionPolicy::CiphertextTightenPrivate {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        let cloned = temp.as_file().try_clone().map_err(CliError::Io)?;
+        // SAFETY: `cloned` is a valid open file descriptor.
+        if unsafe { libc::flock(cloned.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(CliError::ConcurrentModification {
+                path: path.display().to_string(),
+            });
+        }
+        let meta = cloned.metadata().map_err(CliError::Io)?;
+        if meta.nlink() != 1 {
+            return Err(CliError::ConcurrentModification {
+                path: path.display().to_string(),
+            });
+        }
+        let temp_leaf = temp
+            .path()
+            .file_name()
+            .ok_or_else(|| CliError::Message("invalid temporary filename".to_string()))?
+            .to_os_string();
+        Some((
+            LockedTargetGuard { file: cloned },
+            (meta.dev(), meta.ino()),
+            temp_leaf,
+        ))
+    } else {
+        None
+    };
 
     let tightened_mode = apply_target_permissions(
         path,
@@ -253,6 +476,132 @@ fn atomic_write_with_permissions(
         return Err(CliError::Message("fault: replace fail".into()));
     }
 
+    #[cfg(unix)]
+    if let (Some(ref parent_dir), Some((ref temp_guard, expected_temp_id, ref temp_leaf))) =
+        (&anchored_parent_dir, &unix_temp_guard)
+    {
+        use std::ffi::CString;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        // SAFETY: `getuid` cannot fail.
+        let current_uid = unsafe { libc::getuid() };
+        let parent_meta = parent_dir.metadata().map_err(CliError::Io)?;
+        validate_unix_dir_owner_and_mode_in_atomic_write(
+            current_uid,
+            parent_meta.uid(),
+            parent_meta.permissions().mode(),
+            true,
+            parent,
+        )?;
+        let temp_handle_meta = temp_guard.file.metadata().map_err(CliError::Io)?;
+        let temp_cstr = CString::new(temp_leaf.as_bytes())
+            .map_err(|_| CliError::Message("invalid temporary filename".to_string()))?;
+        let target_leaf = path
+            .file_name()
+            .ok_or_else(|| CliError::Message("invalid target filename".to_string()))?;
+        let target_cstr = CString::new(target_leaf.as_bytes())
+            .map_err(|_| CliError::Message("invalid NUL in target filename".to_string()))?;
+        let mut temp_st: libc::stat = unsafe { core::mem::zeroed() };
+        // SAFETY: `parent_dir` is an open directory FD and `temp_cstr` is valid.
+        let stat_rc = unsafe {
+            libc::fstatat(
+                parent_dir.as_raw_fd(),
+                temp_cstr.as_ptr(),
+                &mut temp_st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        #[allow(clippy::unnecessary_cast)]
+        let stat_id = (temp_st.st_dev as u64, temp_st.st_ino as u64);
+        #[allow(clippy::unnecessary_cast)]
+        let stat_nlink = temp_st.st_nlink as u64;
+        #[allow(clippy::unnecessary_cast)]
+        let is_reg = ((temp_st.st_mode as u32) & (libc::S_IFMT as u32)) == (libc::S_IFREG as u32);
+        if stat_rc != 0
+            || !is_reg
+            || stat_id != *expected_temp_id
+            || stat_nlink != 1
+            || (temp_handle_meta.dev(), temp_handle_meta.ino()) != *expected_temp_id
+            || temp_handle_meta.nlink() != 1
+        {
+            return Err(CliError::ConcurrentModification {
+                path: path.display().to_string(),
+            });
+        }
+
+        let parent_fd = parent_dir.as_raw_fd();
+        if options.create_new {
+            #[cfg(target_os = "macos")]
+            let rc = unsafe {
+                libc::renameatx_np(
+                    parent_fd,
+                    temp_cstr.as_ptr(),
+                    parent_fd,
+                    target_cstr.as_ptr(),
+                    libc::RENAME_EXCL,
+                )
+            };
+            #[cfg(target_os = "linux")]
+            let rc = unsafe {
+                const RENAME_NOREPLACE: libc::c_uint = 1;
+                libc::syscall(
+                    libc::SYS_renameat2,
+                    parent_fd,
+                    temp_cstr.as_ptr(),
+                    parent_fd,
+                    target_cstr.as_ptr(),
+                    RENAME_NOREPLACE,
+                ) as libc::c_int
+            };
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            let rc = unsafe {
+                libc::linkat(
+                    parent_fd,
+                    temp_cstr.as_ptr(),
+                    parent_fd,
+                    target_cstr.as_ptr(),
+                    0,
+                )
+            };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::AlreadyExists {
+                    return Err(CliError::Message(format!(
+                        "refusing to create {}: path already exists",
+                        path.display()
+                    )));
+                }
+                return Err(CliError::Io(err));
+            }
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            {
+                let _ = temp.into_temp_path().keep();
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            {
+                drop(temp);
+            }
+        } else {
+            // SAFETY: `parent_fd`, `temp_cstr`, and `target_cstr` are valid.
+            let rc = unsafe {
+                libc::renameat(
+                    parent_fd,
+                    temp_cstr.as_ptr(),
+                    parent_fd,
+                    target_cstr.as_ptr(),
+                )
+            };
+            if rc != 0 {
+                return Err(CliError::Io(std::io::Error::last_os_error()));
+            }
+            let _ = temp.into_temp_path().keep();
+        }
+    } else {
+        commit_replace(temp, path, options.create_new, expected_slice.is_some())?;
+    }
+    #[cfg(not(unix))]
     commit_replace(temp, path, options.create_new, expected_slice.is_some())?;
     #[cfg(unix)]
     if prior_snapshot.is_some() {
@@ -281,6 +630,141 @@ fn atomic_write_with_permissions(
     }
     drop(_cas_guard);
 
+    #[cfg(unix)]
+    if let (Some(ref parent_dir), Some((ref temp_guard, expected_temp_id, _))) =
+        (&anchored_parent_dir, &unix_temp_guard)
+    {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+
+        let target_leaf = path
+            .file_name()
+            .ok_or_else(|| CliError::PostCommitFailure {
+                path: path.display().to_string(),
+                step: "post-commit leaf name validation",
+                source: Box::new(CliError::Message("invalid target filename".to_string())),
+            })?;
+        let target_cstr =
+            CString::new(target_leaf.as_bytes()).map_err(|_| CliError::PostCommitFailure {
+                path: path.display().to_string(),
+                step: "post-commit leaf CString",
+                source: Box::new(CliError::Message("invalid NUL in filename".to_string())),
+            })?;
+        let mut pub_st: libc::stat = unsafe { core::mem::zeroed() };
+        // SAFETY: `parent_dir` is an open directory FD and `target_cstr` is valid.
+        let stat_rc = unsafe {
+            libc::fstatat(
+                parent_dir.as_raw_fd(),
+                target_cstr.as_ptr(),
+                &mut pub_st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        #[allow(clippy::unnecessary_cast)]
+        let pub_id = (pub_st.st_dev as u64, pub_st.st_ino as u64);
+        #[allow(clippy::unnecessary_cast)]
+        let pub_nlink = pub_st.st_nlink as u64;
+        #[allow(clippy::unnecessary_cast)]
+        let pub_is_reg =
+            ((pub_st.st_mode as u32) & (libc::S_IFMT as u32)) == (libc::S_IFREG as u32);
+        let handle_meta =
+            temp_guard
+                .file
+                .metadata()
+                .map_err(|err| CliError::PostCommitFailure {
+                    path: path.display().to_string(),
+                    step: "post-commit staged descriptor metadata check",
+                    source: Box::new(CliError::Io(err)),
+                })?;
+        if stat_rc != 0
+            || !pub_is_reg
+            || pub_id != *expected_temp_id
+            || pub_nlink != 1
+            || (handle_meta.dev(), handle_meta.ino()) != *expected_temp_id
+            || handle_meta.nlink() != 1
+        {
+            return Err(CliError::PostCommitFailure {
+                path: path.display().to_string(),
+                step: "post-commit no-follow identity verification",
+                source: Box::new(CliError::Message(
+                    "published ciphertext entry did not match staged descriptor identity or link count"
+                        .to_string(),
+                )),
+            });
+        }
+
+        // Open the published entry relative to `parent_dir` with `O_NOFOLLOW` and verify
+        // its identity and exact written bytes so a symlink or substituted file is rejected.
+        // SAFETY: `parent_dir` and `target_cstr` are valid.
+        let verify_fd = unsafe {
+            libc::openat(
+                parent_dir.as_raw_fd(),
+                target_cstr.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if verify_fd < 0 {
+            return Err(CliError::PostCommitFailure {
+                path: path.display().to_string(),
+                step: "post-commit no-follow re-open",
+                source: Box::new(CliError::Io(std::io::Error::last_os_error())),
+            });
+        }
+        // SAFETY: `verify_fd` is a valid newly opened file descriptor.
+        let mut verify_file = unsafe { File::from_raw_fd(verify_fd) };
+        let verify_meta = verify_file
+            .metadata()
+            .map_err(|err| CliError::PostCommitFailure {
+                path: path.display().to_string(),
+                step: "post-commit no-follow metadata",
+                source: Box::new(CliError::Io(err)),
+            })?;
+        if !verify_meta.is_file()
+            || verify_meta.file_type().is_symlink()
+            || (verify_meta.dev(), verify_meta.ino()) != *expected_temp_id
+            || verify_meta.nlink() != 1
+            || verify_meta.len() != content.len() as u64
+        {
+            return Err(CliError::PostCommitFailure {
+                path: path.display().to_string(),
+                step: "post-commit no-follow descriptor verification",
+                source: Box::new(CliError::Message(
+                    "post-commit no-follow descriptor did not match staged ciphertext".to_string(),
+                )),
+            });
+        }
+        let cap = content.len().saturating_add(1);
+        let mut buf = Zeroizing::new(vec![0u8; cap]);
+        let mut total = 0usize;
+        while total < buf.len() {
+            match verify_file.read(&mut buf[total..]) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(err) => {
+                    return Err(CliError::PostCommitFailure {
+                        path: path.display().to_string(),
+                        step: "post-commit no-follow read",
+                        source: Box::new(CliError::Io(err)),
+                    });
+                }
+            }
+        }
+        if total != content.len() || &buf[..total] != content {
+            return Err(CliError::PostCommitFailure {
+                path: path.display().to_string(),
+                step: "post-commit no-follow byte comparison",
+                source: Box::new(CliError::Message(
+                    "on-disk bytes read via O_NOFOLLOW did not match written ciphertext"
+                        .to_string(),
+                )),
+            });
+        }
+    }
+    #[cfg(unix)]
+    drop(unix_temp_guard);
+
     if let Some((old_mode, new_mode)) = tightened_mode {
         eprintln!(
             "warning: tightened permissions on {} from {:04o} to {:04o}",
@@ -301,16 +785,24 @@ fn atomic_write_with_permissions(
             });
         }
         // Parent directory fsync for rename durability — fail loud on error.
-        let dir = File::open(parent).map_err(|err| CliError::PostCommitFailure {
-            path: path.display().to_string(),
-            step: "parent directory open for sync",
-            source: Box::new(CliError::Io(err)),
-        })?;
-        dir.sync_all().map_err(|err| CliError::PostCommitFailure {
-            path: path.display().to_string(),
-            step: "parent directory sync",
-            source: Box::new(CliError::Io(err)),
-        })?;
+        if let Some(dir) = anchored_parent_dir {
+            dir.sync_all().map_err(|err| CliError::PostCommitFailure {
+                path: path.display().to_string(),
+                step: "parent directory sync",
+                source: Box::new(CliError::Io(err)),
+            })?;
+        } else {
+            let dir = File::open(parent).map_err(|err| CliError::PostCommitFailure {
+                path: path.display().to_string(),
+                step: "parent directory open for sync",
+                source: Box::new(CliError::Io(err)),
+            })?;
+            dir.sync_all().map_err(|err| CliError::PostCommitFailure {
+                path: path.display().to_string(),
+                step: "parent directory sync",
+                source: Box::new(CliError::Io(err)),
+            })?;
+        }
     }
 
     Ok(())

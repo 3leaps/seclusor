@@ -540,6 +540,8 @@ fn read_blob_input_for_rekey_with_id(
     ))
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn read_blob_input_for_rekey(
     path: &Path,
     soft_limit: Option<u64>,
@@ -2003,8 +2005,12 @@ pub(crate) fn handle_blob_rekey_with_policy(
     } else {
         Some(BLOB_MAX_FILE_BYTES)
     };
-    let prior_snapshot =
-        read_blob_input_for_rekey(&input_path, limit, BLOB_MAX_CIPHERTEXT_HARD_BYTES, in_place)?;
+    let (prior_snapshot, prior_id) = read_blob_input_for_rekey_with_id(
+        &input_path,
+        limit,
+        BLOB_MAX_CIPHERTEXT_HARD_BYTES,
+        in_place,
+    )?;
     let stanzas_before = classify_blob_ciphertext_header(&prior_snapshot.bytes)?;
 
     let (identities, mut identity_paths) =
@@ -2148,16 +2154,32 @@ pub(crate) fn handle_blob_rekey_with_policy(
         atomic_write_private_ciphertext(commit_target, &new_ciphertext, None)?;
     }
 
-    // Post-commit check: fresh-open re-read must equal the bytes written.
-    let post_commit_bytes =
-        read_file_bounded_zeroizing(commit_target, None, BLOB_MAX_CIPHERTEXT_HARD_BYTES).map_err(
-            |err| CliError::PostCommitFailure {
-                path: output_path.display().to_string(),
-                step: "re-read verification",
-                source: Box::new(err),
-            },
-        )?;
-    if post_commit_bytes.as_slice() != new_ciphertext.as_slice() {
+    // Post-commit check: no-follow open (`O_NOFOLLOW`) + identity/single-link check + byte comparison.
+    let (post_commit_snap, post_commit_id) = read_blob_input_for_rekey_with_id(
+        commit_target,
+        None,
+        BLOB_MAX_CIPHERTEXT_HARD_BYTES,
+        true,
+    )
+    .map_err(|err| CliError::PostCommitFailure {
+        path: output_path.display().to_string(),
+        step: "re-read verification",
+        source: Box::new(match err {
+            BlobReadForRekeyError::TooLarge(m) => CliError::Message(m),
+            BlobReadForRekeyError::Other(e) => e,
+        }),
+    })?;
+    if in_place && post_commit_id == prior_id {
+        return Err(CliError::PostCommitFailure {
+            path: output_path.display().to_string(),
+            step: "re-read identity verification",
+            source: Box::new(CliError::Message(
+                "on-disk file identity did not change after in-place atomic replacement"
+                    .to_string(),
+            )),
+        });
+    }
+    if post_commit_snap.bytes.as_slice() != new_ciphertext.as_slice() {
         return Err(CliError::PostCommitFailure {
             path: output_path.display().to_string(),
             step: "re-read byte comparison",
@@ -2166,19 +2188,28 @@ pub(crate) fn handle_blob_rekey_with_policy(
             )),
         });
     }
-    drop(post_commit_bytes);
+    drop(post_commit_snap);
 
     commit_recipient_refresh(recipient_refresh.as_ref(), &output_path)?;
 
     if recipient_refresh.is_some() {
-        let post_refresh_bytes =
-            read_file_bounded_zeroizing(commit_target, None, BLOB_MAX_CIPHERTEXT_HARD_BYTES)
-                .map_err(|err| CliError::PostCommitFailure {
-                    path: output_path.display().to_string(),
-                    step: "post-refresh output re-read verification",
-                    source: Box::new(err),
-                })?;
-        if post_refresh_bytes.as_slice() != new_ciphertext.as_slice() {
+        let (post_refresh_snap, post_refresh_id) = read_blob_input_for_rekey_with_id(
+            commit_target,
+            None,
+            BLOB_MAX_CIPHERTEXT_HARD_BYTES,
+            true,
+        )
+        .map_err(|err| CliError::PostCommitFailure {
+            path: output_path.display().to_string(),
+            step: "post-refresh output re-read verification",
+            source: Box::new(match err {
+                BlobReadForRekeyError::TooLarge(m) => CliError::Message(m),
+                BlobReadForRekeyError::Other(e) => e,
+            }),
+        })?;
+        if post_refresh_id != post_commit_id
+            || post_refresh_snap.bytes.as_slice() != new_ciphertext.as_slice()
+        {
             return Err(CliError::PostCommitFailure {
                 path: output_path.display().to_string(),
                 step: "post-refresh output byte comparison",
@@ -2645,12 +2676,17 @@ fn path_matches_optional_target_in_dir(
 }
 
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
 fn recover_pending_windows_displaced_blobs_in_dir(
     dir: &Path,
     glob_pattern: &str,
     recursive: bool,
     state_path: Option<&Path>,
     write_recipients_path: Option<&Path>,
+    target_stanza_count: usize,
+    all_identities: &[Identity],
+    target_verify_candidates: &[Identity],
+    retired_source_identities: &[Identity],
 ) -> CliResult<()> {
     let meta = fs::symlink_metadata(dir).map_err(CliError::Io)?;
     if is_symlink_or_reparse_point(&meta) {
@@ -2696,6 +2732,24 @@ fn recover_pending_windows_displaced_blobs_in_dir(
                 entry.path().display()
             )));
         };
+        if let Some(stale_rest) = name_str.strip_prefix(".seclusor-stale-displaced-") {
+            if let Some((stale_leaf, _)) = stale_rest.rsplit_once('.') {
+                if !path_matches_optional_target_in_dir(&canon_dir, stale_leaf, state_path)
+                    && !path_matches_optional_target_in_dir(
+                        &canon_dir,
+                        stale_leaf,
+                        write_recipients_path,
+                    )
+                    && filename_glob_matches(glob_pattern, stale_leaf)
+                {
+                    return Err(CliError::Message(format!(
+                        "unresolved stale displaced blob entry {} remains in {}; inspect and resolve before running blob rekey-batch --apply",
+                        entry.path().display(),
+                        canon_dir.display()
+                    )));
+                }
+            }
+        }
         if let Some(restored_leaf) = name_str.strip_prefix(".seclusor-displaced-") {
             if restored_leaf.is_empty()
                 || restored_leaf == "."
@@ -2719,6 +2773,10 @@ fn recover_pending_windows_displaced_blobs_in_dir(
                 windows_dacl::recover_displaced_blob_windows_entry_in_dir(
                     &dir_handle,
                     std::ffi::OsStr::new(restored_leaf),
+                    target_stanza_count,
+                    all_identities,
+                    target_verify_candidates,
+                    retired_source_identities,
                 )
                 .map_err(CliError::Io)?;
             }
@@ -2746,6 +2804,10 @@ fn recover_pending_windows_displaced_blobs_in_dir(
                     true,
                     state_path,
                     write_recipients_path,
+                    target_stanza_count,
+                    all_identities,
+                    target_verify_candidates,
+                    retired_source_identities,
                 )?;
             }
         }
@@ -2754,7 +2816,13 @@ fn recover_pending_windows_displaced_blobs_in_dir(
 }
 
 #[cfg(windows)]
-fn recover_pending_windows_displaced_blobs(args: &BlobRekeyBatchArgs) -> CliResult<()> {
+fn recover_pending_windows_displaced_blobs(
+    args: &BlobRekeyBatchArgs,
+    target_stanza_count: usize,
+    all_identities: &[Identity],
+    target_verify_candidates: &[Identity],
+    retired_source_identities: &[Identity],
+) -> CliResult<()> {
     if (args.files.is_empty() && args.dir.is_none())
         || (args.recursive && args.dir.is_none())
         || args.glob.trim().is_empty()
@@ -2769,7 +2837,10 @@ fn recover_pending_windows_displaced_blobs(args: &BlobRekeyBatchArgs) -> CliResu
                 file.display()
             )));
         }
-        reject_symlink_traversal_in_user_path(file, "input")?;
+        // Allow the leaf itself to be missing (`allow_missing_leaf = true`) so an explicit
+        // FILE that was displaced to `.seclusor-displaced-<leaf>` before a crash can be
+        // recovered before `collect_batch_files` requires the leaf to exist.
+        reject_symlink_traversal_in_path(file, "input", true)?;
         if let Some(leaf_os) = file
             .file_name()
             .filter(|n| !n.is_empty() && *n != "." && *n != "..")
@@ -2779,8 +2850,15 @@ fn recover_pending_windows_displaced_blobs(args: &BlobRekeyBatchArgs) -> CliResu
                 .filter(|p| !p.as_os_str().is_empty())
                 .unwrap_or_else(|| Path::new("."));
             let parent_dir = windows_dacl::open_dir_nofollow_anchored_windows(parent, "input")?;
-            windows_dacl::recover_displaced_blob_windows_entry_in_dir(&parent_dir, leaf_os)
-                .map_err(CliError::Io)?;
+            windows_dacl::recover_displaced_blob_windows_entry_in_dir(
+                &parent_dir,
+                leaf_os,
+                target_stanza_count,
+                all_identities,
+                target_verify_candidates,
+                retired_source_identities,
+            )
+            .map_err(CliError::Io)?;
         }
     }
 
@@ -2798,6 +2876,10 @@ fn recover_pending_windows_displaced_blobs(args: &BlobRekeyBatchArgs) -> CliResu
             args.recursive,
             args.state.as_deref(),
             args.write_recipients.as_deref(),
+            target_stanza_count,
+            all_identities,
+            target_verify_candidates,
+            retired_source_identities,
         )?;
     }
     Ok(())
@@ -3651,15 +3733,7 @@ mod windows_dacl {
         Some(unsafe { core::slice::from_raw_parts(sid.cast::<u8>(), len) })
     }
 
-    pub(super) fn validate_directory_handle_dacl(dir_file: &File) -> io::Result<()> {
-        let dir_meta = dir_file.metadata()?;
-        if is_symlink_or_reparse_point(&dir_meta) || !dir_meta.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "private file parent directory on Windows must be a non-reparse directory",
-            ));
-        }
-
+    pub(super) fn validate_trusted_handle_dacl(handle_file: &File) -> io::Result<()> {
         let user_buf = current_process_user_token_buf()?;
         let token_user = user_buf.as_ptr().cast::<TokenUser>();
         // SAFETY: `user_buf` holds a valid `TokenUser`.
@@ -3668,10 +3742,10 @@ mod windows_dacl {
         let mut owner_sid: *mut core::ffi::c_void = core::ptr::null_mut();
         let mut dacl: *mut AclHeader = core::ptr::null_mut();
         let mut sd: *mut core::ffi::c_void = core::ptr::null_mut();
-        // SAFETY: `dir_file` is an open directory handle; `sd` is freed by `LocalMemGuard`.
+        // SAFETY: `handle_file` is an open handle; `sd` is freed by `LocalMemGuard`.
         let rc = unsafe {
             GetSecurityInfo(
-                dir_file.as_raw_handle(),
+                handle_file.as_raw_handle(),
                 SE_FILE_OBJECT,
                 OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
                 &mut owner_sid,
@@ -3740,6 +3814,17 @@ mod windows_dacl {
             parsed_aces.push((ace_type, mask, is_trusted));
         }
         validate_windows_directory_owner_and_dacl(owner_is_trusted, control, &parsed_aces)
+    }
+
+    pub(super) fn validate_directory_handle_dacl(dir_file: &File) -> io::Result<()> {
+        let dir_meta = dir_file.metadata()?;
+        if is_symlink_or_reparse_point(&dir_meta) || !dir_meta.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private file parent directory on Windows must be a non-reparse directory",
+            ));
+        }
+        validate_trusted_handle_dacl(dir_file)
     }
 
     /// Reject a Windows parent directory whose DACL grants write, file-add,
@@ -4143,7 +4228,7 @@ mod windows_dacl {
         Ok(())
     }
 
-    pub(super) fn validate_displaced_blob_handle(file: &File) -> io::Result<()> {
+    pub(super) fn validate_displaced_blob_handle(file: &File) -> io::Result<Zeroizing<Vec<u8>>> {
         let open_meta = file.metadata()?;
         if !open_meta.is_file() || is_symlink_or_reparse_point(&open_meta) {
             return Err(io::Error::new(
@@ -4151,7 +4236,10 @@ mod windows_dacl {
                 "displaced Windows blob entry is not a regular file",
             ));
         }
-        verify_private_file_dacl(file)?;
+        // Validate that the displaced original blob is owned by a trusted principal and
+        // grants no write/modify/DACL-change access to untrusted SIDs (`validate_trusted_handle_dacl`),
+        // accepting both inherited parent DACLs on pre-rekey originals and protected owner-only DACLs.
+        validate_trusted_handle_dacl(file)?;
         if open_meta.len() > super::BLOB_MAX_CIPHERTEXT_HARD_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -4184,7 +4272,7 @@ mod windows_dacl {
                 "displaced Windows blob entry is not a valid age X25519 ciphertext",
             )
         })?;
-        Ok(())
+        Ok(buf)
     }
 
     /// Atomically write `--state` on Windows:
@@ -4522,7 +4610,6 @@ mod windows_dacl {
                 ))
             })?;
         let parent_dir = open_dir_nofollow_anchored_windows(parent, "input")?;
-        recover_displaced_blob_windows_entry_in_dir(&parent_dir, leaf_os).map_err(CliError::Io)?;
 
         let pid = std::process::id();
         let ts = std::time::SystemTime::now()
@@ -5112,14 +5199,27 @@ mod windows_dacl {
     }
 
     /// Recover `.seclusor-displaced-<leaf_name>` for a ciphertext blob during `--apply`:
-    /// unlike journal/recipient recovery (which rotates an unvalidated both-present file
-    /// and continues so a fresh journal/recipient write can proceed), an unvalidated
-    /// displaced blob entry is rotated to `.seclusor-stale-displaced-<leaf_name>.*` to
-    /// preserve evidence AND returns an error so unresolved blob displacements prevent
-    /// successful batch completion.
+    /// - Never rotates a displaced blob into `.seclusor-stale-displaced-*`: any validation
+    ///   or survivor-authentication failure leaves `.seclusor-displaced-<leaf_name>` in
+    ///   place and returns an error so subsequent retries continue to block until resolved.
+    /// - When `leaf_name` is absent (`NotFound`), validates `displaced_file` via
+    ///   `validate_displaced_blob_handle` (accepting inherited parent DACLs from the
+    ///   trusted directory as well as protected owner-only DACLs) and restores it to
+    ///   `leaf_name`.
+    /// - When BOTH `leaf_name` and `.seclusor-displaced-<leaf_name>` exist, authenticates
+    ///   the surviving live `leaf_name` (protected owner-only DACL, `nlink == 1`,
+    ///   `stanzas == target_stanza_count`, decrypts under `target_verify_candidates` to
+    ///   the exact same plaintext as `displaced_file`, is not a secrets bundle document,
+    ///   and is not decryptable by `retired_source_identities`) BEFORE deleting
+    ///   `displaced_file`; if verification is unavailable or fails, preserves both files
+    ///   and returns an error.
     pub(super) fn recover_displaced_blob_windows_entry_in_dir(
         parent_dir: &File,
         leaf_name: &std::ffi::OsStr,
+        target_stanza_count: usize,
+        all_identities: &[super::Identity],
+        target_verify_candidates: &[super::Identity],
+        retired_source_identities: &[super::Identity],
     ) -> io::Result<()> {
         let displaced_name = displaced_windows_leaf_name(leaf_name);
         match open_relative_entry_nofollow(
@@ -5140,42 +5240,166 @@ mod windows_dacl {
                         "refusing hardlinked displaced Windows blob recovery entry",
                     ));
                 }
+                let displaced_bytes = validate_displaced_blob_handle(&displaced_file)?;
                 match stat_relative_nofollow(parent_dir, leaf_name) {
                     Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                        validate_displaced_blob_handle(&displaced_file)?;
                         rename_open_handle_in_dir(&displaced_file, parent_dir, leaf_name, false)?;
                     }
                     Err(err) => return Err(err),
-                    Ok(_) => match validate_displaced_blob_handle(&displaced_file) {
-                        Ok(()) => {
-                            delete_open_handle_on_close(&displaced_file)?;
-                            drop(displaced_file);
-                            match open_relative_entry_nofollow(
-                                parent_dir,
-                                &displaced_name,
-                                FILE_READ_ATTRIBUTES,
-                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                FILE_OPEN,
-                                false,
-                            ) {
-                                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                                Ok(_) => {
-                                    return Err(io::Error::other(
-                                        "displaced Windows blob entry remained present after handle close",
-                                    ));
-                                }
+                    Ok((_, live_nlink)) => {
+                        if live_nlink != 1 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "refusing hardlinked live Windows blob during displaced recovery",
+                            ));
+                        }
+                        if target_verify_candidates.is_empty() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "cannot authenticate surviving Windows blob against displaced copy without a target-set verification identity; preserving both files",
+                            ));
+                        }
+                        let mut live_file = open_relative_entry_nofollow(
+                            parent_dir,
+                            leaf_name,
+                            GENERIC_READ,
+                            FILE_SHARE_READ,
+                            FILE_OPEN,
+                            false,
+                        )?;
+                        let live_meta = live_file.metadata()?;
+                        if !live_meta.is_file() || is_symlink_or_reparse_point(&live_meta) {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "surviving Windows blob entry is not a regular file",
+                            ));
+                        }
+                        let (_, open_live_nlink) = file_identity_and_nlink(&live_file)?;
+                        if open_live_nlink != 1 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "surviving Windows blob entry has multiple links",
+                            ));
+                        }
+                        verify_private_file_dacl(&live_file)?;
+                        if live_meta.len() > super::BLOB_MAX_CIPHERTEXT_HARD_BYTES {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "surviving Windows blob entry exceeds hard size limit",
+                            ));
+                        }
+                        let cap = (live_meta.len() as usize).saturating_add(1).min(
+                            (super::BLOB_MAX_CIPHERTEXT_HARD_BYTES as usize).saturating_add(1),
+                        );
+                        let mut live_bytes = Zeroizing::new(vec![0u8; cap]);
+                        let mut total = 0usize;
+                        while total < live_bytes.len() {
+                            match live_file.read(&mut live_bytes[total..]) {
+                                Ok(0) => break,
+                                Ok(n) => total += n,
                                 Err(err) => return Err(err),
                             }
                         }
-                        Err(val_err) => {
-                            let _ = rotate_stale_displaced_windows_entry_in_dir(
-                                parent_dir,
-                                &displaced_file,
-                                leaf_name,
-                            );
-                            return Err(val_err);
+                        live_bytes.truncate(total);
+                        if total == cap
+                            || (live_bytes.len() as u64) > super::BLOB_MAX_CIPHERTEXT_HARD_BYTES
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "surviving Windows blob entry exceeds hard size limit",
+                            ));
                         }
-                    },
+                        let live_stanzas =
+                            super::classify_blob_ciphertext_header(&live_bytes).map_err(|_| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "surviving Windows blob entry is not a valid age X25519 ciphertext",
+                                )
+                            })?;
+                        if live_stanzas != target_stanza_count {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "surviving Windows blob stanza count does not match target recipient count",
+                            ));
+                        }
+                        let live_pt = seclusor_crypto::decrypt_zeroizing(
+                            &live_bytes,
+                            target_verify_candidates,
+                        )
+                        .map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "surviving Windows blob could not be decrypted by any target-set verification identity",
+                            )
+                        })?;
+                        super::refuse_if_secrets_bundle_document(&live_pt).map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "surviving Windows blob decrypted to a secrets bundle document",
+                            )
+                        })?;
+                        for retired_id in retired_source_identities {
+                            if seclusor_crypto::decrypt_zeroizing(
+                                &live_bytes,
+                                std::slice::from_ref(retired_id),
+                            )
+                            .is_ok()
+                            {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::PermissionDenied,
+                                    "surviving Windows blob is still decryptable by a retired source identity",
+                                ));
+                            }
+                        }
+                        let displaced_pt = seclusor_crypto::decrypt_zeroizing(
+                            &displaced_bytes,
+                            all_identities,
+                        )
+                        .or_else(|_| {
+                            seclusor_crypto::decrypt_zeroizing(
+                                &displaced_bytes,
+                                target_verify_candidates,
+                            )
+                        })
+                        .map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "displaced Windows blob could not be decrypted to verify payload match against surviving blob; preserving both files",
+                            )
+                        })?;
+                        use subtle::ConstantTimeEq as _;
+                        if live_pt.len() != displaced_pt.len()
+                            || live_pt
+                                .as_slice()
+                                .ct_eq(displaced_pt.as_slice())
+                                .unwrap_u8()
+                                != 1
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "surviving Windows blob plaintext does not match displaced blob plaintext; preserving both files",
+                            ));
+                        }
+
+                        delete_open_handle_on_close(&displaced_file)?;
+                        drop(displaced_file);
+                        match open_relative_entry_nofollow(
+                            parent_dir,
+                            &displaced_name,
+                            FILE_READ_ATTRIBUTES,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            FILE_OPEN,
+                            false,
+                        ) {
+                            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                            Ok(_) => {
+                                return Err(io::Error::other(
+                                    "displaced Windows blob entry remained present after handle close",
+                                ));
+                            }
+                            Err(err) => return Err(err),
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -6032,8 +6256,7 @@ fn create_private_backup_file(path: &Path, prior_bytes: &[u8]) -> CliResult<Path
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     seclusor_crypto::acl::reject_writable_directory_acl(parent)?;
-    #[cfg(windows)]
-    windows_dacl::reject_writable_directory_dacl(parent).map_err(CliError::Io)?;
+    let _ = open_dir_nofollow_anchored(parent, "--backup")?;
 
     let ts = utc_compact_timestamp_now();
     let base_name = path
@@ -6041,6 +6264,7 @@ fn create_private_backup_file(path: &Path, prior_bytes: &[u8]) -> CliResult<Path
         .ok_or_else(|| CliError::Message(format!("invalid file path {}", path.display())))?
         .to_string_lossy();
     let backup_path = parent.join(format!("{base_name}.bak-{ts}"));
+    reject_symlink_traversal_in_path(&backup_path, "--backup", true)?;
 
     if fs::symlink_metadata(&backup_path).is_ok() {
         return Err(CliError::Message(format!(
@@ -6052,7 +6276,7 @@ fn create_private_backup_file(path: &Path, prior_bytes: &[u8]) -> CliResult<Path
     #[cfg(unix)]
     {
         // Stage and fsync the 0600 private backup in a temporary file in `parent`
-        // and publish to `backup_path` via no-clobber `persist_noclobber` (`linkat`),
+        // and publish to `backup_path` via no-clobber `RENAME_EXCL` / `RENAME_NOREPLACE`,
         // so a failed write/ACL preparation never leaves an empty `.bak-<ts>` file
         // blocking a same-second retry and never unlinks `backup_path` by pathname.
         atomic_write_private_ciphertext(&backup_path, prior_bytes, None)?;
@@ -6060,6 +6284,18 @@ fn create_private_backup_file(path: &Path, prior_bytes: &[u8]) -> CliResult<Path
     #[cfg(windows)]
     {
         windows_dacl::create_private_backup_file_windows(&backup_path, prior_bytes)?;
+    }
+    let (backup_snap, _) =
+        read_blob_input_for_rekey_with_id(&backup_path, None, BLOB_MAX_CIPHERTEXT_HARD_BYTES, true)
+            .map_err(|err| match err {
+                BlobReadForRekeyError::TooLarge(m) => CliError::Message(m),
+                BlobReadForRekeyError::Other(e) => e,
+            })?;
+    if backup_snap.bytes.as_slice() != prior_bytes {
+        return Err(CliError::Message(format!(
+            "backup verification failed for {}: on-disk backup bytes did not match source ciphertext",
+            backup_path.display()
+        )));
     }
     Ok(backup_path)
 }
@@ -7884,13 +8120,22 @@ pub(crate) fn handle_blob_rekey_batch_with_policy(
             "--write-recipients is only valid with --apply (plan mode writes nothing)".to_string(),
         ));
     }
-
-    #[cfg(windows)]
-    if args.apply {
-        recover_pending_windows_displaced_blobs(&args)?;
+    if args.files.is_empty() && args.dir.is_none() {
+        return Err(CliError::Message(
+            "blob rekey-batch requires at least one FILE or --dir <DIR>".to_string(),
+        ));
+    }
+    if args.recursive && args.dir.is_none() {
+        return Err(CliError::Message(
+            "--recursive requires --dir <DIR>".to_string(),
+        ));
+    }
+    if args.glob.trim().is_empty() {
+        return Err(CliError::Message(
+            "--glob pattern must not be empty".to_string(),
+        ));
     }
 
-    let selected_files = collect_batch_files(&args)?;
     let target_recipients = resolve_recipients(&args.recipients)?;
     let target_strings = recipient_strings(&target_recipients);
     let prior_strings = resolve_prior_recipients(&args.prior_recipients)?;
@@ -7936,6 +8181,19 @@ pub(crate) fn handle_blob_rekey_batch_with_policy(
                 .to_string(),
         ));
     }
+
+    #[cfg(windows)]
+    if args.apply {
+        recover_pending_windows_displaced_blobs(
+            &args,
+            target_recipients.len(),
+            &identities,
+            &target_verify_candidates,
+            &retired_source_identities,
+        )?;
+    }
+
+    let selected_files = collect_batch_files(&args)?;
 
     // Alias checks for batch files, --state, and --write-recipients before any writes.
     for selected in &selected_files {
@@ -8122,6 +8380,10 @@ pub(crate) fn handle_blob_rekey_batch_with_policy(
                         windows_dacl::recover_displaced_blob_windows_entry_in_dir(
                             &parent_dir,
                             leaf_os,
+                            target_recipients.len(),
+                            &identities,
+                            &target_verify_candidates,
+                            &retired_source_identities,
                         )
                         .map_err(|err| BlobReadForRekeyError::Other(CliError::Io(err)))?;
                     }
@@ -8879,14 +9141,30 @@ pub(crate) fn handle_blob_rekey_batch_with_policy(
                 &new_ciphertext,
                 &prior_snapshot,
             )?;
-            let post_commit_bytes =
-                read_file_bounded_zeroizing(blob_path, None, BLOB_MAX_CIPHERTEXT_HARD_BYTES)
-                    .map_err(|err| CliError::PostCommitFailure {
-                        path: path_str.clone(),
-                        step: "re-read verification",
-                        source: Box::new(err),
-                    })?;
-            if post_commit_bytes.as_slice() != new_ciphertext.as_slice() {
+            let (post_commit_snap, post_commit_id) = read_blob_input_for_rekey_with_id(
+                blob_path,
+                None,
+                BLOB_MAX_CIPHERTEXT_HARD_BYTES,
+                true,
+            )
+            .map_err(|err| CliError::PostCommitFailure {
+                path: path_str.clone(),
+                step: "re-read verification",
+                source: Box::new(match err {
+                    BlobReadForRekeyError::TooLarge(m) => CliError::Message(m),
+                    BlobReadForRekeyError::Other(e) => e,
+                }),
+            })?;
+            if post_commit_id == selected.identity {
+                return Err(CliError::PostCommitFailure {
+                    path: path_str.clone(),
+                    step: "re-read identity verification",
+                    source: Box::new(CliError::Message(
+                        "on-disk file identity did not change after atomic replacement".to_string(),
+                    )),
+                });
+            }
+            if post_commit_snap.bytes.as_slice() != new_ciphertext.as_slice() {
                 return Err(CliError::PostCommitFailure {
                     path: path_str.clone(),
                     step: "re-read byte comparison",
@@ -12624,17 +12902,11 @@ mod tests {
             fs::copy(&blob_path, &win_blob_path).unwrap();
             let win_state_path = win_blob_dir.join("state.json");
 
-            // Simulate a crash between displacing `pack.age` to `.seclusor-displaced-pack.age`
+            // Simulate a crash between displacing `pack.age` (which has a normal inherited
+            // parent DACL, without `SE_DACL_PROTECTED`) to `.seclusor-displaced-pack.age`
             // and publishing the new `pack.age`, then run `--apply` with `--dir` discovery:
             let displaced_win_blob = win_blob_dir.join(".seclusor-displaced-pack.age");
             fs::rename(&win_blob_path, &displaced_win_blob).unwrap();
-            {
-                let f = fs::OpenOptions::new()
-                    .access_mode(0x0004_0000 | 0x0008_0000)
-                    .open(&displaced_win_blob)
-                    .unwrap();
-                windows_dacl::restrict_private_file_dacl(&f).unwrap();
-            }
             assert!(!win_blob_path.exists() && displaced_win_blob.exists());
             handle_blob_rekey_batch(BlobRekeyBatchArgs {
                 files: vec![],
@@ -12668,19 +12940,55 @@ mod tests {
                 },
                 passphrase: PassphraseArgs::default(),
             })
-            .expect("Windows --dir apply must recover displaced blob, rekey it, and record displaced_verified=true");
+            .expect("Windows --dir apply must recover inherited-DACL displaced blob, rekey it, and record displaced_verified=true");
             assert!(win_blob_path.exists() && !displaced_win_blob.exists());
 
-            // Re-running `--apply` with explicit `files` and `--state` must hit `already-done`
-            // cleanly and also clean up any validated both-present `.seclusor-displaced-pack.age`.
-            fs::copy(&win_blob_path, &displaced_win_blob).unwrap();
-            {
-                let f = fs::OpenOptions::new()
-                    .access_mode(0x0004_0000 | 0x0008_0000)
-                    .open(&displaced_win_blob)
-                    .unwrap();
-                windows_dacl::restrict_private_file_dacl(&f).unwrap();
-            }
+            // Also verify explicit `FILE` selection recovers a missing leaf when only
+            // `.seclusor-displaced-pack2.age` exists (with an inherited parent DACL).
+            let win_blob2_path = win_blob_dir.join("pack2.age");
+            let displaced_win_blob2 = win_blob_dir.join(".seclusor-displaced-pack2.age");
+            fs::copy(&blob_path, &displaced_win_blob2).unwrap();
+            assert!(!win_blob2_path.exists() && displaced_win_blob2.exists());
+            handle_blob_rekey_batch(BlobRekeyBatchArgs {
+                files: vec![win_blob2_path.clone()],
+                dir: None,
+                glob: "*.age".to_string(),
+                recursive: false,
+                apply: true,
+                state: None,
+                backup: false,
+                fail_fast: false,
+                json: false,
+                write_recipients: None,
+                allow_self_lockout: false,
+                allow_large: false,
+                recipients: RecipientArgs {
+                    recipients: vec![rotated_gen.recipient.clone()],
+                    recipient_files: vec![],
+                    recipient_env_var: None,
+                },
+                prior_recipients: PriorRecipientArgs {
+                    prior_recipients: vec![r.to_string()],
+                    prior_recipient_files: vec![],
+                },
+                identities: IdentityArgs {
+                    identity_files: vec![id_path.clone()],
+                    identity_public_key: None,
+                },
+                verify_identities: VerifyIdentityArgs {
+                    verify_identity_files: vec![rotated_id_path.clone()],
+                    verify_identity_public_key: None,
+                },
+                passphrase: PassphraseArgs::default(),
+            })
+            .expect("Windows explicit FILE apply must recover missing leaf from displaced blob and rekey it");
+            assert!(win_blob2_path.exists() && !displaced_win_blob2.exists());
+            let _ = fs::remove_file(&win_blob2_path);
+
+            // Re-running `--apply` with explicit `files` and `--state` when both the valid
+            // rekeyed `win_blob_path` and the displaced prior ciphertext exist must
+            // authenticate `win_blob_path`, delete `.seclusor-displaced-pack.age`, and hit `already-done`.
+            fs::copy(&blob_path, &displaced_win_blob).unwrap();
             handle_blob_rekey_batch(BlobRekeyBatchArgs {
                 files: vec![win_blob_path.clone()],
                 dir: None,
@@ -12713,8 +13021,57 @@ mod tests {
                 },
                 passphrase: PassphraseArgs::default(),
             })
-            .expect("Windows explicit FILE resume must succeed and clean up both-present displaced blob");
+            .expect("Windows explicit FILE resume must authenticate survivor and clean up displaced blob");
             assert!(win_blob_path.exists() && !displaced_win_blob.exists());
+
+            // If both `win_blob_path` and `.seclusor-displaced-pack.age` exist, but the live
+            // `win_blob_path` was truncated or substituted, recovery MUST NOT delete the
+            // displaced ciphertext or rotate it into an ignored stale name; it must preserve
+            // both files and block batch completion across repeated retries.
+            fs::copy(&blob_path, &displaced_win_blob).unwrap();
+            fs::write(&win_blob_path, b"truncated-or-not-age").unwrap();
+            for _retry in 0..2 {
+                assert!(
+                    handle_blob_rekey_batch(BlobRekeyBatchArgs {
+                        files: vec![],
+                        dir: Some(win_blob_dir.clone()),
+                        glob: "*.age".to_string(),
+                        recursive: false,
+                        apply: true,
+                        state: None,
+                        backup: false,
+                        fail_fast: false,
+                        json: false,
+                        write_recipients: None,
+                        allow_self_lockout: false,
+                        allow_large: false,
+                        recipients: RecipientArgs {
+                            recipients: vec![rotated_gen.recipient.clone()],
+                            recipient_files: vec![],
+                            recipient_env_var: None,
+                        },
+                        prior_recipients: PriorRecipientArgs {
+                            prior_recipients: vec![r.to_string()],
+                            prior_recipient_files: vec![],
+                        },
+                        identities: IdentityArgs {
+                            identity_files: vec![id_path.clone()],
+                            identity_public_key: None,
+                        },
+                        verify_identities: VerifyIdentityArgs {
+                            verify_identity_files: vec![rotated_id_path.clone()],
+                            verify_identity_public_key: None,
+                        },
+                        passphrase: PassphraseArgs::default(),
+                    })
+                    .is_err(),
+                    "unauthenticated surviving live blob must fail recovery across retries"
+                );
+                assert!(
+                    win_blob_path.exists() && displaced_win_blob.exists(),
+                    "both live and displaced blobs must be preserved when survivor authentication fails"
+                );
+            }
             let _ = fs::remove_dir_all(&win_blob_dir);
         }
 
