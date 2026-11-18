@@ -197,10 +197,153 @@ fn validate_unix_dir_owner_and_mode_in_atomic_write(
     Ok(())
 }
 
+/// Validate extended ACLs on an open Unix directory descriptor (`dir_file`) as well
+/// as `dir_path`. On macOS, `acl_get_file("/dev/fd/N", ...)` returns `ENOENT` rather
+/// than the directory's extended ACL, so this helper queries `acl_get_fd_np` directly
+/// on `dir_file.as_raw_fd()` and rejects any `ACL_EXTENDED_ALLOW` entry granting
+/// write, append, delete, delete_child, write_security, or chown to a non-owner.
+#[cfg(unix)]
+pub(crate) fn reject_writable_directory_fd_acl(
+    dir_file: &File,
+    dir_path: &Path,
+) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+
+        type AclT = *mut libc::c_void;
+        type AclEntryT = *mut libc::c_void;
+        type AclPermsetT = *mut libc::c_void;
+        type AclTagT = u32;
+        type AclPermT = u32;
+
+        const ACL_TYPE_EXTENDED: u32 = 0x0000_0100;
+        const ACL_FIRST_ENTRY: libc::c_int = 0;
+        const ACL_NEXT_ENTRY: libc::c_int = -1;
+        const ACL_EXTENDED_ALLOW: AclTagT = 1;
+
+        const ACL_WRITE_DATA: AclPermT = 1 << 2;
+        const ACL_DELETE: AclPermT = 1 << 4;
+        const ACL_APPEND_DATA: AclPermT = 1 << 5;
+        const ACL_DELETE_CHILD: AclPermT = 1 << 6;
+        const ACL_WRITE_SECURITY: AclPermT = 1 << 12;
+        const ACL_CHANGE_OWNER: AclPermT = 1 << 13;
+        const DANGEROUS_PERMS: [AclPermT; 6] = [
+            ACL_WRITE_DATA,
+            ACL_APPEND_DATA,
+            ACL_DELETE,
+            ACL_DELETE_CHILD,
+            ACL_WRITE_SECURITY,
+            ACL_CHANGE_OWNER,
+        ];
+        const ID_TYPE_UID: libc::c_int = 0;
+
+        unsafe extern "C" {
+            fn acl_get_fd_np(fd: libc::c_int, acl_type: u32) -> AclT;
+            fn acl_free(obj_p: *mut libc::c_void) -> libc::c_int;
+            fn acl_get_entry(
+                acl: AclT,
+                entry_id: libc::c_int,
+                entry_p: *mut AclEntryT,
+            ) -> libc::c_int;
+            fn acl_get_tag_type(entry_d: AclEntryT, tag_type_p: *mut AclTagT) -> libc::c_int;
+            fn acl_get_permset(entry_d: AclEntryT, permset_p: *mut AclPermsetT) -> libc::c_int;
+            fn acl_get_perm_np(permset_d: AclPermsetT, perm: AclPermT) -> libc::c_int;
+            fn acl_get_qualifier(entry_d: AclEntryT) -> *mut libc::c_void;
+            fn mbr_uuid_to_id(
+                uu: *const u8,
+                id: *mut libc::uid_t,
+                id_type: *mut libc::c_int,
+            ) -> libc::c_int;
+        }
+
+        struct AclFreeGuard(*mut libc::c_void);
+        impl Drop for AclFreeGuard {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    // SAFETY: `self.0` was allocated by `acl_get_fd_np` or `acl_get_qualifier`.
+                    unsafe {
+                        let _ = acl_free(self.0);
+                    }
+                }
+            }
+        }
+
+        let dir_uid = dir_file.metadata()?.uid();
+        // SAFETY: `dir_file` is a valid open directory descriptor.
+        let acl = unsafe { acl_get_fd_np(dir_file.as_raw_fd(), ACL_TYPE_EXTENDED) };
+        if acl.is_null() {
+            let err = std::io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::ENOENT | libc::ENOTSUP | libc::EOPNOTSUPP | libc::EINVAL) => {}
+                _ => return Err(err),
+            }
+        } else {
+            let _acl_guard = AclFreeGuard(acl);
+            let mut entry: AclEntryT = std::ptr::null_mut();
+            let mut entry_id = ACL_FIRST_ENTRY;
+            loop {
+                // SAFETY: `acl` is valid and `entry` is stack-allocated.
+                let rc = unsafe { acl_get_entry(acl, entry_id, &mut entry) };
+                if rc != 0 {
+                    break;
+                }
+                entry_id = ACL_NEXT_ENTRY;
+                let mut tag: AclTagT = 0;
+                // SAFETY: `entry` was returned by `acl_get_entry`.
+                if unsafe { acl_get_tag_type(entry, &mut tag) } != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if tag != ACL_EXTENDED_ALLOW {
+                    continue;
+                }
+                let mut permset: AclPermsetT = std::ptr::null_mut();
+                // SAFETY: `entry` is a valid ACL entry.
+                if unsafe { acl_get_permset(entry, &mut permset) } != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let has_dangerous = DANGEROUS_PERMS
+                    .iter()
+                    .any(|&perm| unsafe { acl_get_perm_np(permset, perm) } == 1);
+                if !has_dangerous {
+                    continue;
+                }
+                // SAFETY: `entry` is an extended ACL entry (`ACL_EXTENDED_ALLOW`).
+                let qual = unsafe { acl_get_qualifier(entry) };
+                if qual.is_null() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "private file directory ACL entry has null qualifier",
+                    ));
+                }
+                let _qual_guard = AclFreeGuard(qual);
+                let mut mapped_id: libc::uid_t = 0;
+                let mut id_type: libc::c_int = -1;
+                // SAFETY: `qual` points to a 16-byte Darwin `guid_t` / `uuid_t`.
+                let mbr_rc =
+                    unsafe { mbr_uuid_to_id(qual.cast::<u8>(), &mut mapped_id, &mut id_type) };
+                if mbr_rc != 0 || id_type != ID_TYPE_UID || mapped_id != dir_uid {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "private file directory ACL grants non-owner write, delete, or ACL-edit access; inspect with ls -le and remove with chmod -N",
+                    ));
+                }
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = dir_file;
+    }
+    seclusor_crypto::acl::reject_writable_directory_acl(dir_path)
+}
+
 /// Open `dir_path` on Unix via step-by-step `openat(..., O_DIRECTORY | O_NOFOLLOW)`
-/// from `/` and validate ownership (`uid == current_uid || uid == 0`) and mode bits
+/// from `/` and validate ownership (`uid == current_uid || uid == 0`), mode bits
 /// (no `0o022` group/other write bits on the leaf parent directory; sticky root-owned
-/// allowance only on intermediate ancestors) on every traversed component.
+/// allowance only on intermediate ancestors), and descriptor-bound extended ACLs on
+/// the initial `/` root and every traversed component.
 #[cfg(unix)]
 fn open_unix_dir_nofollow_and_validate_ancestors(dir_path: &Path) -> CliResult<File> {
     use std::ffi::CString;
@@ -233,6 +376,15 @@ fn open_unix_dir_nofollow_and_validate_ancestors(dir_path: &Path) -> CliResult<F
     // SAFETY: `root_fd` is a valid newly opened directory FD.
     let mut cur_dir = unsafe { File::from_raw_fd(root_fd) };
     let mut cur_path = PathBuf::from("/");
+    let root_meta = cur_dir.metadata().map_err(CliError::Io)?;
+    validate_unix_dir_owner_and_mode_in_atomic_write(
+        current_uid,
+        root_meta.uid(),
+        root_meta.permissions().mode(),
+        false,
+        &cur_path,
+    )?;
+    reject_writable_directory_fd_acl(&cur_dir, &cur_path).map_err(CliError::Io)?;
 
     for comp in base_path.components() {
         match comp {
@@ -261,11 +413,7 @@ fn open_unix_dir_nofollow_and_validate_ancestors(dir_path: &Path) -> CliResult<F
                     false,
                     &cur_path,
                 )?;
-                let fd_path = PathBuf::from(format!("/dev/fd/{}", cur_dir.as_raw_fd()));
-                seclusor_crypto::acl::reject_writable_directory_acl(&fd_path)
-                    .map_err(CliError::Io)?;
-                seclusor_crypto::acl::reject_writable_directory_acl(&cur_path)
-                    .map_err(CliError::Io)?;
+                reject_writable_directory_fd_acl(&cur_dir, &cur_path).map_err(CliError::Io)?;
             }
             Component::Normal(part) => {
                 cur_path.push(part);
@@ -304,11 +452,7 @@ fn open_unix_dir_nofollow_and_validate_ancestors(dir_path: &Path) -> CliResult<F
                     false,
                     &cur_path,
                 )?;
-                let fd_path = PathBuf::from(format!("/dev/fd/{}", cur_dir.as_raw_fd()));
-                seclusor_crypto::acl::reject_writable_directory_acl(&fd_path)
-                    .map_err(CliError::Io)?;
-                seclusor_crypto::acl::reject_writable_directory_acl(&cur_path)
-                    .map_err(CliError::Io)?;
+                reject_writable_directory_fd_acl(&cur_dir, &cur_path).map_err(CliError::Io)?;
             }
         }
     }
@@ -321,9 +465,7 @@ fn open_unix_dir_nofollow_and_validate_ancestors(dir_path: &Path) -> CliResult<F
         true,
         &cur_path,
     )?;
-    let final_fd_path = PathBuf::from(format!("/dev/fd/{}", cur_dir.as_raw_fd()));
-    seclusor_crypto::acl::reject_writable_directory_acl(&final_fd_path).map_err(CliError::Io)?;
-    seclusor_crypto::acl::reject_writable_directory_acl(&cur_path).map_err(CliError::Io)?;
+    reject_writable_directory_fd_acl(&cur_dir, &cur_path).map_err(CliError::Io)?;
     let path_meta = fs::symlink_metadata(dir_path).map_err(CliError::Io)?;
     if path_meta.file_type().is_symlink()
         && !is_macos_system_root_symlink_in_atomic_write(&cur_path, &path_meta)
@@ -641,6 +783,7 @@ fn atomic_write_with_permissions(
             }
         }
     }
+    #[cfg(not(unix))]
     drop(_cas_guard);
 
     #[cfg(unix)]
@@ -774,63 +917,7 @@ fn atomic_write_with_permissions(
                 )),
             });
         }
-
-        // Re-verify destination namespace binding from root so a moved or replaced
-        // parent/ancestor directory cannot cause completion to be reported for a stale path.
-        let recheck_parent =
-            open_unix_dir_nofollow_and_validate_ancestors(parent).map_err(|err| {
-                CliError::PostCommitFailure {
-                    path: path.display().to_string(),
-                    step: "post-commit ancestor namespace re-verification",
-                    source: Box::new(err),
-                }
-            })?;
-        let parent_meta = parent_dir
-            .metadata()
-            .map_err(|err| CliError::PostCommitFailure {
-                path: path.display().to_string(),
-                step: "post-commit parent metadata check",
-                source: Box::new(CliError::Io(err)),
-            })?;
-        let recheck_parent_meta =
-            recheck_parent
-                .metadata()
-                .map_err(|err| CliError::PostCommitFailure {
-                    path: path.display().to_string(),
-                    step: "post-commit re-opened parent metadata check",
-                    source: Box::new(CliError::Io(err)),
-                })?;
-        let mut recheck_st: libc::stat = unsafe { core::mem::zeroed() };
-        // SAFETY: `recheck_parent` and `target_cstr` are valid.
-        let recheck_rc = unsafe {
-            libc::fstatat(
-                recheck_parent.as_raw_fd(),
-                target_cstr.as_ptr(),
-                &mut recheck_st,
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        };
-        #[allow(clippy::unnecessary_cast)]
-        let recheck_id = (recheck_st.st_dev as u64, recheck_st.st_ino as u64);
-        #[allow(clippy::unnecessary_cast)]
-        let recheck_nlink = recheck_st.st_nlink as u64;
-        if (recheck_parent_meta.dev(), recheck_parent_meta.ino())
-            != (parent_meta.dev(), parent_meta.ino())
-            || recheck_rc != 0
-            || recheck_id != *expected_temp_id
-            || recheck_nlink != 1
-        {
-            return Err(CliError::PostCommitFailure {
-                path: path.display().to_string(),
-                step: "post-commit destination namespace binding check",
-                source: Box::new(CliError::Message(
-                    "destination directory or entry binding changed during publication".to_string(),
-                )),
-            });
-        }
     }
-    #[cfg(unix)]
-    drop(unix_temp_guard);
 
     if let Some((old_mode, new_mode)) = tightened_mode {
         eprintln!(
@@ -852,7 +939,7 @@ fn atomic_write_with_permissions(
             });
         }
         // Parent directory fsync for rename durability — fail loud on error.
-        if let Some(dir) = anchored_parent_dir {
+        if let Some(ref dir) = anchored_parent_dir {
             dir.sync_all().map_err(|err| CliError::PostCommitFailure {
                 path: path.display().to_string(),
                 step: "parent directory sync",
@@ -870,6 +957,89 @@ fn atomic_write_with_permissions(
                 source: Box::new(CliError::Io(err)),
             })?;
         }
+
+        if let (Some(ref parent_dir), Some((_, expected_temp_id, _))) =
+            (&anchored_parent_dir, &unix_temp_guard)
+        {
+            use std::ffi::CString;
+            use std::os::fd::AsRawFd;
+            use std::os::unix::ffi::OsStrExt;
+            use std::os::unix::fs::MetadataExt;
+
+            let target_leaf = path
+                .file_name()
+                .ok_or_else(|| CliError::PostCommitFailure {
+                    path: path.display().to_string(),
+                    step: "post-commit leaf name validation",
+                    source: Box::new(CliError::Message("invalid target filename".to_string())),
+                })?;
+            let target_cstr =
+                CString::new(target_leaf.as_bytes()).map_err(|_| CliError::PostCommitFailure {
+                    path: path.display().to_string(),
+                    step: "post-commit leaf CString",
+                    source: Box::new(CliError::Message("invalid NUL in filename".to_string())),
+                })?;
+
+            // Re-verify destination namespace binding from root AFTER `parent_dir.sync_all()`
+            // while retaining `unix_temp_guard` and `_cas_guard` so a moved or replaced
+            // parent/ancestor directory during publication or sync cannot report completion
+            // for a stale path.
+            let recheck_parent =
+                open_unix_dir_nofollow_and_validate_ancestors(parent).map_err(|err| {
+                    CliError::PostCommitFailure {
+                        path: path.display().to_string(),
+                        step: "post-commit ancestor namespace re-verification",
+                        source: Box::new(err),
+                    }
+                })?;
+            let parent_meta = parent_dir
+                .metadata()
+                .map_err(|err| CliError::PostCommitFailure {
+                    path: path.display().to_string(),
+                    step: "post-commit parent metadata check",
+                    source: Box::new(CliError::Io(err)),
+                })?;
+            let recheck_parent_meta =
+                recheck_parent
+                    .metadata()
+                    .map_err(|err| CliError::PostCommitFailure {
+                        path: path.display().to_string(),
+                        step: "post-commit re-opened parent metadata check",
+                        source: Box::new(CliError::Io(err)),
+                    })?;
+            let mut recheck_st: libc::stat = unsafe { core::mem::zeroed() };
+            // SAFETY: `recheck_parent` and `target_cstr` are valid.
+            let recheck_rc = unsafe {
+                libc::fstatat(
+                    recheck_parent.as_raw_fd(),
+                    target_cstr.as_ptr(),
+                    &mut recheck_st,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            #[allow(clippy::unnecessary_cast)]
+            let recheck_id = (recheck_st.st_dev as u64, recheck_st.st_ino as u64);
+            #[allow(clippy::unnecessary_cast)]
+            let recheck_nlink = recheck_st.st_nlink as u64;
+            if (recheck_parent_meta.dev(), recheck_parent_meta.ino())
+                != (parent_meta.dev(), parent_meta.ino())
+                || recheck_rc != 0
+                || recheck_id != *expected_temp_id
+                || recheck_nlink != 1
+            {
+                return Err(CliError::PostCommitFailure {
+                    path: path.display().to_string(),
+                    step: "post-commit destination namespace binding check",
+                    source: Box::new(CliError::Message(
+                        "destination directory or entry binding changed during publication"
+                            .to_string(),
+                    )),
+                });
+            }
+        }
+
+        drop(unix_temp_guard);
+        drop(_cas_guard);
     }
 
     Ok(())
@@ -2025,6 +2195,11 @@ mod tests {
 
         let writable_dir = tempfile::tempdir().expect("writable dir");
         chmod_add_acl(writable_dir.path(), "user:root allow delete_child");
+        let writable_dir_fd = fs::File::open(writable_dir.path()).expect("open writable_dir");
+        let fd_err = reject_writable_directory_fd_acl(&writable_dir_fd, dir.path()).expect_err(
+            "descriptor-bound ACL check must reject writable_dir_fd even when path is clean",
+        );
+        assert_eq!(fd_err.kind(), std::io::ErrorKind::PermissionDenied);
         let bad_path = writable_dir.path().join("bad.age");
         let err = atomic_write_private_ciphertext(&bad_path, b"age-encryption.org/v1\n", None)
             .expect_err("writable dir ACL must be refused");

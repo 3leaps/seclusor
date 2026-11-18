@@ -2660,10 +2660,13 @@ fn path_matches_optional_target_in_dir(
     let Some(target) = opt_target else {
         return false;
     };
-    let Some(target_leaf) = target.file_name().and_then(|n| n.to_str()) else {
+    let Some(target_leaf) = target.file_name() else {
         return false;
     };
-    if !target_leaf.eq_ignore_ascii_case(leaf_name) {
+    if !windows_dacl::windows_filenames_equal_ordinal_ignore_case(
+        target_leaf,
+        std::ffi::OsStr::new(leaf_name),
+    ) {
         return false;
     }
     let target_parent = target
@@ -2724,6 +2727,24 @@ fn recover_pending_windows_displaced_blobs_in_dir(
         .map_err(CliError::Io)?;
     entries.sort_by_key(|e| e.file_name());
 
+    let matches_dir_selection = |candidate_leaf: &str| -> bool {
+        if filename_glob_matches(glob_pattern, candidate_leaf)
+            || windows_dacl::filename_glob_matches_windows_ordinal_ci(glob_pattern, candidate_leaf)
+        {
+            return true;
+        }
+        let cand_os = std::ffi::OsStr::new(candidate_leaf);
+        entries.iter().any(|e| {
+            let ename = e.file_name();
+            ename.to_str().is_some_and(|s| {
+                !is_skipped_dir_entry_name(s)
+                    && (filename_glob_matches(glob_pattern, s)
+                        || windows_dacl::filename_glob_matches_windows_ordinal_ci(glob_pattern, s))
+                    && windows_dacl::windows_leaf_names_equal_in_dir(&dir_handle, &ename, cand_os)
+            })
+        })
+    };
+
     for entry in &entries {
         let file_name = entry.file_name();
         let Some(name_str) = file_name.to_str() else {
@@ -2740,7 +2761,7 @@ fn recover_pending_windows_displaced_blobs_in_dir(
                         stale_leaf,
                         write_recipients_path,
                     )
-                    && filename_glob_matches(glob_pattern, stale_leaf)
+                    && matches_dir_selection(stale_leaf)
                 {
                     return Err(CliError::Message(format!(
                         "unresolved stale displaced blob entry {} remains in {}; inspect and resolve before running blob rekey-batch --apply",
@@ -2769,7 +2790,7 @@ fn recover_pending_windows_displaced_blobs_in_dir(
             {
                 continue;
             }
-            if filename_glob_matches(glob_pattern, restored_leaf) {
+            if matches_dir_selection(restored_leaf) {
                 windows_dacl::recover_displaced_blob_windows_entry_in_dir(
                     &dir_handle,
                     std::ffi::OsStr::new(restored_leaf),
@@ -2816,6 +2837,134 @@ fn recover_pending_windows_displaced_blobs_in_dir(
 }
 
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn recover_pending_windows_displaced_for_file_in_parent(
+    file: &Path,
+    leaf_os: &std::ffi::OsStr,
+    state_path: Option<&Path>,
+    write_recipients_path: Option<&Path>,
+    target_stanza_count: usize,
+    all_identities: &[Identity],
+    target_verify_candidates: &[Identity],
+    retired_source_identities: &[Identity],
+) -> CliResult<()> {
+    let parent = file
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent_dir = windows_dacl::open_dir_nofollow_anchored_windows(parent, "input")?;
+    let canon_parent = fs::canonicalize(parent).map_err(CliError::Io)?;
+    let canon_leaf_opt = fs::canonicalize(file)
+        .ok()
+        .and_then(|cp| cp.file_name().map(|n| n.to_os_string()));
+    let file_missing = fs::symlink_metadata(file)
+        .err()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+
+    let matches_target_leaf = |cand_leaf: &str| -> bool {
+        let cand_os = std::ffi::OsStr::new(cand_leaf);
+        if windows_dacl::windows_leaf_names_equal_in_dir(&parent_dir, leaf_os, cand_os) {
+            return true;
+        }
+        if let Some(ref canon_leaf) = canon_leaf_opt {
+            if windows_dacl::windows_leaf_names_equal_in_dir(&parent_dir, canon_leaf, cand_os) {
+                return true;
+            }
+        }
+        false
+    };
+
+    let mut entries: Vec<fs::DirEntry> = fs::read_dir(&canon_parent)
+        .map_err(CliError::Io)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(CliError::Io)?;
+    entries.sort_by_key(|e| e.file_name());
+
+    for entry in &entries {
+        if let Some(name_str) = entry.file_name().to_str() {
+            if let Some(stale_rest) = name_str.strip_prefix(".seclusor-stale-displaced-") {
+                if let Some((stale_leaf, _)) = stale_rest.rsplit_once('.') {
+                    if !path_matches_optional_target_in_dir(&canon_parent, stale_leaf, state_path)
+                        && !path_matches_optional_target_in_dir(
+                            &canon_parent,
+                            stale_leaf,
+                            write_recipients_path,
+                        )
+                        && (matches_target_leaf(stale_leaf) || file_missing)
+                    {
+                        return Err(CliError::Message(format!(
+                            "unresolved stale displaced blob entry {} remains in {}; inspect and resolve before running blob rekey-batch --apply",
+                            entry.path().display(),
+                            parent.display()
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    for entry in &entries {
+        if let Some(name_str) = entry.file_name().to_str() {
+            if let Some(restored_leaf) = name_str.strip_prefix(".seclusor-displaced-") {
+                if restored_leaf.is_empty()
+                    || restored_leaf == "."
+                    || restored_leaf == ".."
+                    || restored_leaf.contains('/')
+                    || restored_leaf.contains('\\')
+                    || restored_leaf.contains(':')
+                {
+                    continue;
+                }
+                if path_matches_optional_target_in_dir(&canon_parent, restored_leaf, state_path)
+                    || path_matches_optional_target_in_dir(
+                        &canon_parent,
+                        restored_leaf,
+                        write_recipients_path,
+                    )
+                {
+                    continue;
+                }
+                if matches_target_leaf(restored_leaf) || file_missing {
+                    windows_dacl::recover_displaced_blob_windows_entry_in_dir(
+                        &parent_dir,
+                        std::ffi::OsStr::new(restored_leaf),
+                        target_stanza_count,
+                        all_identities,
+                        target_verify_candidates,
+                        retired_source_identities,
+                    )
+                    .map_err(CliError::Io)?;
+                }
+            }
+        }
+    }
+
+    windows_dacl::recover_displaced_blob_windows_entry_in_dir(
+        &parent_dir,
+        leaf_os,
+        target_stanza_count,
+        all_identities,
+        target_verify_candidates,
+        retired_source_identities,
+    )
+    .map_err(CliError::Io)?;
+    if let Some(ref canon_leaf) = canon_leaf_opt {
+        if canon_leaf.as_os_str() != leaf_os {
+            windows_dacl::recover_displaced_blob_windows_entry_in_dir(
+                &parent_dir,
+                canon_leaf,
+                target_stanza_count,
+                all_identities,
+                target_verify_candidates,
+                retired_source_identities,
+            )
+            .map_err(CliError::Io)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
 fn recover_pending_windows_displaced_blobs(
     args: &BlobRekeyBatchArgs,
     target_stanza_count: usize,
@@ -2845,40 +2994,16 @@ fn recover_pending_windows_displaced_blobs(
             .file_name()
             .filter(|n| !n.is_empty() && *n != "." && *n != "..")
         {
-            let parent = file
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."));
-            let parent_dir = windows_dacl::open_dir_nofollow_anchored_windows(parent, "input")?;
-            if let Some(leaf_str) = leaf_os.to_str() {
-                for entry in fs::read_dir(parent).map_err(CliError::Io)? {
-                    let entry = entry.map_err(CliError::Io)?;
-                    if let Some(name_str) = entry.file_name().to_str() {
-                        if let Some(stale_rest) =
-                            name_str.strip_prefix(".seclusor-stale-displaced-")
-                        {
-                            if let Some((stale_leaf, _)) = stale_rest.rsplit_once('.') {
-                                if stale_leaf.eq_ignore_ascii_case(leaf_str) {
-                                    return Err(CliError::Message(format!(
-                                        "unresolved stale displaced blob entry {} remains in {}; inspect and resolve before running blob rekey-batch --apply",
-                                        entry.path().display(),
-                                        parent.display()
-                                    )));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            windows_dacl::recover_displaced_blob_windows_entry_in_dir(
-                &parent_dir,
+            recover_pending_windows_displaced_for_file_in_parent(
+                file,
                 leaf_os,
+                args.state.as_deref(),
+                args.write_recipients.as_deref(),
                 target_stanza_count,
                 all_identities,
                 target_verify_candidates,
                 retired_source_identities,
-            )
-            .map_err(CliError::Io)?;
+            )?;
         }
     }
 
@@ -3483,6 +3608,86 @@ mod windows_dacl {
             lpFileInformation: *const core::ffi::c_void,
             dwBufferSize: u32,
         ) -> i32;
+        fn CompareStringOrdinal(
+            lpString1: *const u16,
+            cchCount1: i32,
+            lpString2: *const u16,
+            cchCount2: i32,
+            bIgnoreCase: i32,
+        ) -> i32;
+    }
+
+    pub(super) fn windows_filenames_equal_ordinal_ignore_case(
+        a: &std::ffi::OsStr,
+        b: &std::ffi::OsStr,
+    ) -> bool {
+        let a_wide: Vec<u16> = a.encode_wide().collect();
+        let b_wide: Vec<u16> = b.encode_wide().collect();
+        // SAFETY: `a_wide` and `b_wide` are valid UTF-16 slices. `CSTR_EQUAL` is 2.
+        unsafe {
+            CompareStringOrdinal(
+                a_wide.as_ptr(),
+                a_wide.len() as i32,
+                b_wide.as_ptr(),
+                b_wide.len() as i32,
+                1,
+            ) == 2
+        }
+    }
+
+    pub(super) fn windows_leaf_names_equal_in_dir(
+        parent_dir: &File,
+        a: &std::ffi::OsStr,
+        b: &std::ffi::OsStr,
+    ) -> bool {
+        if windows_filenames_equal_ordinal_ignore_case(a, b) {
+            return true;
+        }
+        if let (Ok((id_a, _)), Ok((id_b, _))) = (
+            stat_relative_nofollow(parent_dir, a),
+            stat_relative_nofollow(parent_dir, b),
+        ) {
+            return id_a == id_b;
+        }
+        false
+    }
+
+    pub(super) fn filename_glob_matches_windows_ordinal_ci(pattern: &str, name: &str) -> bool {
+        let p: Vec<char> = pattern.chars().collect();
+        let t: Vec<char> = name.chars().collect();
+        let mut dp = vec![false; t.len() + 1];
+        dp[0] = true;
+        for &pc in &p {
+            if pc == '*' {
+                for j in 1..=t.len() {
+                    dp[j] = dp[j] || dp[j - 1];
+                }
+            } else {
+                for j in (1..=t.len()).rev() {
+                    let chars_eq = if pc == '?' || pc == t[j - 1] {
+                        true
+                    } else {
+                        let mut p_buf = [0u16; 2];
+                        let mut t_buf = [0u16; 2];
+                        let p_slice = pc.encode_utf16(&mut p_buf);
+                        let t_slice = t[j - 1].encode_utf16(&mut t_buf);
+                        // SAFETY: `p_slice` and `t_slice` are valid UTF-16 slices.
+                        unsafe {
+                            CompareStringOrdinal(
+                                p_slice.as_ptr(),
+                                p_slice.len() as i32,
+                                t_slice.as_ptr(),
+                                t_slice.len() as i32,
+                                1,
+                            ) == 2
+                        }
+                    };
+                    dp[j] = dp[j - 1] && chars_eq;
+                }
+                dp[0] = false;
+            }
+        }
+        dp[t.len()]
     }
 
     #[link(name = "ntdll")]
@@ -4197,6 +4402,7 @@ mod windows_dacl {
                 "displaced Windows recipient entry is not a regular file",
             ));
         }
+        validate_trusted_handle_dacl(file)?;
         if open_meta.len() > super::MAX_BATCH_RECIPIENT_FILE_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -5208,7 +5414,6 @@ mod windows_dacl {
                                 ));
                             }
                             validate_displaced(&live_file)?;
-                            drop(live_file);
                             delete_open_handle_on_close(&displaced_file)?;
                             drop(displaced_file);
                             match open_relative_entry_nofollow(
@@ -5221,12 +5426,17 @@ mod windows_dacl {
                             ) {
                                 Err(err) if err.kind() == io::ErrorKind::NotFound => {}
                                 Ok(_) => {
+                                    drop(live_file);
                                     return Err(io::Error::other(
                                         "displaced Windows recovery entry remained present after handle close",
                                     ));
                                 }
-                                Err(err) => return Err(err),
+                                Err(err) => {
+                                    drop(live_file);
+                                    return Err(err);
+                                }
                             }
+                            drop(live_file);
                         } else {
                             rotate_stale_displaced_windows_entry_in_dir(
                                 parent_dir,
@@ -6662,6 +6872,16 @@ fn open_dir_nofollow_anchored(
         // SAFETY: `root_fd` is a valid newly opened file descriptor.
         let mut cur_dir = unsafe { fs::File::from_raw_fd(root_fd) };
         let mut cur_path = PathBuf::from("/");
+        let root_meta = cur_dir.metadata().map_err(CliError::Io)?;
+        validate_unix_directory_owner_and_mode(
+            current_uid,
+            root_meta.uid(),
+            root_meta.permissions().mode(),
+            false,
+            &cur_path,
+        )?;
+        crate::atomic_write::reject_writable_directory_fd_acl(&cur_dir, &cur_path)
+            .map_err(CliError::Io)?;
 
         for comp in base_path.components() {
             match comp {
@@ -6690,9 +6910,8 @@ fn open_dir_nofollow_anchored(
                         false,
                         &cur_path,
                     )?;
-                    let fd_path = PathBuf::from(format!("/dev/fd/{}", cur_dir.as_raw_fd()));
-                    seclusor_crypto::acl::reject_writable_directory_acl(&fd_path)?;
-                    seclusor_crypto::acl::reject_writable_directory_acl(&cur_path)?;
+                    crate::atomic_write::reject_writable_directory_fd_acl(&cur_dir, &cur_path)
+                        .map_err(CliError::Io)?;
                 }
                 Component::Normal(part) => {
                     cur_path.push(part);
@@ -6746,9 +6965,8 @@ fn open_dir_nofollow_anchored(
                         false,
                         &cur_path,
                     )?;
-                    let fd_path = PathBuf::from(format!("/dev/fd/{}", cur_dir.as_raw_fd()));
-                    seclusor_crypto::acl::reject_writable_directory_acl(&fd_path)?;
-                    seclusor_crypto::acl::reject_writable_directory_acl(&cur_path)?;
+                    crate::atomic_write::reject_writable_directory_fd_acl(&cur_dir, &cur_path)
+                        .map_err(CliError::Io)?;
                 }
             }
         }
@@ -6760,8 +6978,8 @@ fn open_dir_nofollow_anchored(
             true,
             dir_path,
         )?;
-        let leaf_fd_path = PathBuf::from(format!("/dev/fd/{}", cur_dir.as_raw_fd()));
-        seclusor_crypto::acl::reject_writable_directory_acl(&leaf_fd_path)?;
+        crate::atomic_write::reject_writable_directory_fd_acl(&cur_dir, &cur_path)
+            .map_err(CliError::Io)?;
         cur_dir
     };
 
@@ -8088,9 +8306,9 @@ fn commit_batch_recipient_refresh(plan: &BatchRecipientRefreshPlan) -> CliResult
 
             let (final_temp_id, final_temp_nlink) =
                 file_identity_and_nlink(&temp_file).map_err(CliError::Io)?;
-            drop(_temp_lock);
-            drop(temp_file);
             if final_temp_id != temp_id || final_temp_nlink != 1 {
+                drop(_temp_lock);
+                drop(temp_file);
                 return Err(CliError::ConcurrentModification {
                     path: plan.user_path.display().to_string(),
                 });
@@ -8107,22 +8325,39 @@ fn commit_batch_recipient_refresh(plan: &BatchRecipientRefreshPlan) -> CliResult
                 )
             };
             if pub_rc != 0 {
-                return Err(CliError::Io(std::io::Error::last_os_error()));
+                let err = std::io::Error::last_os_error();
+                drop(_temp_lock);
+                drop(temp_file);
+                return Err(CliError::Io(err));
             }
             #[allow(clippy::unnecessary_cast)]
             let pub_id = (pub_st.st_dev as u64, pub_st.st_ino as u64);
             #[allow(clippy::unnecessary_cast)]
             let pub_nlink = pub_st.st_nlink as u64;
             if pub_id != temp_id || pub_nlink != 1 {
+                drop(_temp_lock);
+                drop(temp_file);
                 return Err(CliError::ConcurrentModification {
                     path: plan.user_path.display().to_string(),
                 });
             }
-            plan.parent_dir.sync_all().map_err(CliError::Io)?;
-            // Re-verify destination namespace binding after publication so a renamed or
-            // replaced ancestor directory cannot report success for a stale path.
+            if let Err(err) = plan.parent_dir.sync_all() {
+                drop(_temp_lock);
+                drop(temp_file);
+                return Err(CliError::Io(err));
+            }
+            // Re-verify destination namespace binding after publication and `sync_all` while
+            // retaining `_temp_lock` and `temp_file` so a renamed or replaced ancestor
+            // directory cannot report success for a stale path.
             let (recheck_parent_dir, recheck_canon_parent, recheck_parent_id) =
-                open_dir_nofollow_anchored(user_parent, "--write-recipients")?;
+                match open_dir_nofollow_anchored(user_parent, "--write-recipients") {
+                    Ok(v) => v,
+                    Err(err) => {
+                        drop(_temp_lock);
+                        drop(temp_file);
+                        return Err(err);
+                    }
+                };
             let mut recheck_st: libc::stat = unsafe { core::mem::zeroed() };
             // SAFETY: `recheck_parent_dir` and `leaf_cstr` are valid.
             let recheck_rc = unsafe {
@@ -8137,6 +8372,8 @@ fn commit_batch_recipient_refresh(plan: &BatchRecipientRefreshPlan) -> CliResult
             let recheck_id = (recheck_st.st_dev as u64, recheck_st.st_ino as u64);
             #[allow(clippy::unnecessary_cast)]
             let recheck_nlink = recheck_st.st_nlink as u64;
+            drop(_temp_lock);
+            drop(temp_file);
             if recheck_parent_id != plan.parent_id
                 || recheck_canon_parent != plan.canon_parent
                 || recheck_rc != 0
@@ -8309,6 +8546,28 @@ pub(crate) fn handle_blob_rekey_batch_with_policy(
     }
 
     let selected_files = collect_batch_files(&args)?;
+
+    #[cfg(windows)]
+    if args.apply {
+        for selected in &selected_files {
+            if let Some(leaf_os) = selected
+                .path
+                .file_name()
+                .filter(|n| !n.is_empty() && *n != "." && *n != "..")
+            {
+                recover_pending_windows_displaced_for_file_in_parent(
+                    &selected.path,
+                    leaf_os,
+                    args.state.as_deref(),
+                    args.write_recipients.as_deref(),
+                    target_recipients.len(),
+                    &identities,
+                    &target_verify_candidates,
+                    &retired_source_identities,
+                )?;
+            }
+        }
+    }
 
     // Alias checks for batch files, --state, and --write-recipients before any writes.
     for selected in &selected_files {
