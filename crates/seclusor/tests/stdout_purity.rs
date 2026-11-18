@@ -679,3 +679,310 @@ fn blob_rekey_and_verify_stdout_purity_and_process_roundtrip() {
     );
     assert_eq!(String::from_utf8(verify_new.stderr).expect("utf8"), "");
 }
+
+#[test]
+fn blob_rekey_batch_json_stdout_purity_schema_and_single_passphrase_unlock() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let old_id = dir.path().join("old-protected-identity.txt");
+    let new_id = dir.path().join("new-identity.txt");
+    let plain1 = dir.path().join("plain1.txt");
+    let plain2 = dir.path().join("plain2.txt");
+    let blob1 = dir.path().join("one.age");
+    let blob2 = dir.path().join("two.age");
+    let state_file = dir.path().join("rekey-state.json");
+    let recipients_out = dir.path().join("recipients.txt");
+
+    let pp_str = "batch-single-unlock-passphrase-42";
+    fs::write(&plain1, b"SECRET_BATCH_ONE_99").expect("write plain1");
+    fs::write(&plain2, b"SECRET_BATCH_TWO_99").expect("write plain2");
+
+    let bin = env!("CARGO_BIN_EXE_seclusor");
+    let mut gen_old = Command::new(bin)
+        .args([
+            "keys",
+            "age",
+            "identity",
+            "generate",
+            "--output",
+            old_id.to_str().unwrap(),
+            "--passphrase-stdin",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn identity generate");
+    writeln!(gen_old.stdin.as_mut().unwrap(), "{pp_str}").expect("write passphrase");
+    let gen_old_out = gen_old.wait_with_output().expect("wait gen_old");
+    assert!(
+        gen_old_out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&gen_old_out.stderr)
+    );
+    let old_recipient = String::from_utf8(gen_old_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let gen_new = run_seclusor(&[
+        "keys",
+        "age",
+        "identity",
+        "generate",
+        "--output",
+        new_id.to_str().unwrap(),
+    ]);
+    assert!(gen_new.status.success());
+    let new_recipient = String::from_utf8(gen_new.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    for (inp, outp) in [(&plain1, &blob1), (&plain2, &blob2)] {
+        let enc = run_seclusor(&[
+            "secrets",
+            "blob",
+            "encrypt",
+            "--input",
+            inp.to_str().unwrap(),
+            "--output",
+            outp.to_str().unwrap(),
+            "--recipient",
+            &old_recipient,
+        ]);
+        assert!(enc.status.success());
+    }
+    fs::remove_file(&plain1).unwrap();
+    fs::remove_file(&plain2).unwrap();
+
+    // T18 + T19: Run `secrets blob rekey-batch --apply --json` with a single passphrase line on stdin.
+    let mut child = Command::new(bin)
+        .args([
+            "secrets",
+            "--allow-recipient-mismatch",
+            "blob",
+            "rekey-batch",
+            blob1.to_str().unwrap(),
+            blob2.to_str().unwrap(),
+            "--apply",
+            "--json",
+            "--state",
+            state_file.to_str().unwrap(),
+            "--write-recipients",
+            recipients_out.to_str().unwrap(),
+            "--identity-file",
+            old_id.to_str().unwrap(),
+            "--passphrase-stdin",
+            "--recipient",
+            &new_recipient,
+            "--prior-recipient",
+            &old_recipient,
+            "--verify-identity-file",
+            new_id.to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn rekey-batch");
+    writeln!(child.stdin.as_mut().unwrap(), "{pp_str}").expect("write passphrase once");
+    let output = child.wait_with_output().expect("wait rekey-batch");
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout_str = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let stderr_str = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(!stdout_str.contains("SECRET_BATCH_ONE_99"));
+    assert!(!stdout_str.contains("SECRET_BATCH_TWO_99"));
+    assert!(!stderr_str.contains("SECRET_BATCH_ONE_99"));
+    assert!(!stderr_str.contains("SECRET_BATCH_TWO_99"));
+    assert!(!stdout_str.contains(pp_str));
+    assert!(!stderr_str.contains(pp_str));
+
+    let schema: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../schemas/seclusor/v1.1.0/blob-rekey-batch.schema.json"
+    ))
+    .expect("schema json");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout_str).expect("stdout must be pure JSON");
+    assert_eq!(parsed["version"], 1);
+    assert_eq!(parsed["mode"], "apply");
+    assert_eq!(parsed["summary"]["selected"], 2);
+    assert_eq!(parsed["summary"]["rekeyed"], 2);
+    assert_eq!(parsed["summary"]["failed"], 0);
+    for req_key in schema["required"].as_array().unwrap() {
+        assert!(parsed
+            .as_object()
+            .unwrap()
+            .contains_key(req_key.as_str().unwrap()));
+    }
+    assert!(state_file.exists());
+    assert_eq!(
+        fs::read_to_string(&recipients_out).unwrap(),
+        format!("{new_recipient}\n")
+    );
+
+    // If a resumed `in_progress` journal record fails promotion persistence, OR if
+    // `--write-recipients` fails at commit time, `--json` must STILL emit a valid
+    // JSON report on stdout before exiting non-zero.
+    #[cfg(unix)]
+    {
+        use sha2::Digest as _;
+        use std::os::unix::fs::PermissionsExt;
+
+        // 1. Demote one record in the state journal back to `in_progress` (`displaced_verified: true`),
+        // recompute the authentic HMAC-SHA256 `auth_tag`, place the journal inside a `0o500`
+        // read-only directory so promotion persistence fails on resume, and assert valid JSON
+        // on stdout (`summary.failed == 1`, `summary.already_done == 1`) before non-zero exit.
+        let state_ro_dir = dir.path().join("state-ro");
+        fs::create_dir(&state_ro_dir).unwrap();
+        let ro_state_file = state_ro_dir.join("state.json");
+        let raw_journal_str = fs::read_to_string(&state_file).unwrap();
+        let demoted_str =
+            raw_journal_str.replacen("\"status\": \"rekeyed\"", "\"status\": \"in_progress\"", 1);
+        let tag_prefix = "\"auth_tag\": \"";
+        let tag_start = demoted_str.find(tag_prefix).unwrap() + tag_prefix.len();
+        let canonical_str = format!(
+            "{}{}",
+            &demoted_str[..tag_start],
+            &demoted_str[tag_start + 64..]
+        );
+        let raw_id = fs::read_to_string(&new_id).unwrap();
+        let secret_line = raw_id
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with("AGE-SECRET-KEY-"))
+            .unwrap();
+        let mut key_hasher = sha2::Sha256::new();
+        key_hasher.update(b"seclusor.v1.blob-rekey-batch.journal-hmac-key\0");
+        key_hasher.update((secret_line.len() as u64).to_le_bytes());
+        key_hasher.update(secret_line.as_bytes());
+        let auth_key: [u8; 32] = key_hasher.finalize().into();
+        let mut ipad = [0x36u8; 64];
+        let mut opad = [0x5cu8; 64];
+        for i in 0..32 {
+            ipad[i] ^= auth_key[i];
+            opad[i] ^= auth_key[i];
+        }
+        let mut inner = sha2::Sha256::new();
+        inner.update(ipad);
+        inner.update(canonical_str.as_bytes());
+        let inner_digest: [u8; 32] = inner.finalize().into();
+        let mut outer = sha2::Sha256::new();
+        outer.update(opad);
+        outer.update(inner_digest);
+        let tag_bytes: [u8; 32] = outer.finalize().into();
+        let mut auth_tag_hex = String::with_capacity(64);
+        for b in tag_bytes {
+            use std::fmt::Write as _;
+            let _ = write!(&mut auth_tag_hex, "{b:02x}");
+        }
+        let final_journal_str = format!(
+            "{}{}{}",
+            &demoted_str[..tag_start],
+            auth_tag_hex,
+            &demoted_str[tag_start + 64..]
+        );
+        fs::write(&ro_state_file, final_journal_str.as_bytes()).unwrap();
+        fs::set_permissions(&ro_state_file, fs::Permissions::from_mode(0o600)).unwrap();
+        let ro_state_lock = fs::File::open(&ro_state_file).unwrap();
+        unsafe {
+            use std::os::fd::AsRawFd;
+            assert_eq!(
+                libc::flock(ro_state_lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB),
+                0
+            );
+        }
+        fs::set_permissions(&state_ro_dir, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let promo_fail_out = run_seclusor(&[
+            "secrets",
+            "--allow-recipient-mismatch",
+            "blob",
+            "rekey-batch",
+            blob1.to_str().unwrap(),
+            blob2.to_str().unwrap(),
+            "--apply",
+            "--json",
+            "--state",
+            ro_state_file.to_str().unwrap(),
+            "--identity-file",
+            new_id.to_str().unwrap(),
+            "--recipient",
+            &new_recipient,
+            "--prior-recipient",
+            &old_recipient,
+            "--verify-identity-file",
+            new_id.to_str().unwrap(),
+        ]);
+        fs::set_permissions(&state_ro_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        drop(ro_state_lock);
+        assert!(
+            !promo_fail_out.status.success(),
+            "resumed in_progress journal promotion failure must exit non-zero"
+        );
+        let pf_stdout = String::from_utf8(promo_fail_out.stdout).expect("utf8 stdout");
+        let pf_parsed: serde_json::Value = serde_json::from_str(&pf_stdout).expect(
+            "stdout must still contain valid JSON report when resumed journal promotion fails",
+        );
+        assert_eq!(pf_parsed["version"], 1);
+        assert_eq!(pf_parsed["mode"], "apply");
+        assert_eq!(pf_parsed["summary"]["failed"], 1);
+        assert_eq!(pf_parsed["summary"]["already_done"], 1);
+
+        // 2. Test `--write-recipients` commit failure after batch processing:
+        // lock the recipient file with an exclusive flock during batch execution so
+        // `prepare_batch_recipient_refresh` succeeds (read-only open) and
+        // `commit_batch_recipient_refresh` fails with ConcurrentModification.
+        let locked_rcpt = dir.path().join("locked-recipients.txt");
+        fs::write(&locked_rcpt, format!("{old_recipient}\n")).unwrap();
+        let lock_holder = fs::File::open(&locked_rcpt).unwrap();
+        unsafe {
+            use std::os::fd::AsRawFd;
+            assert_eq!(
+                libc::flock(lock_holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB),
+                0
+            );
+        }
+
+        let refresh_fail_out = run_seclusor(&[
+            "secrets",
+            "--allow-recipient-mismatch",
+            "blob",
+            "rekey-batch",
+            blob1.to_str().unwrap(),
+            blob2.to_str().unwrap(),
+            "--apply",
+            "--json",
+            "--state",
+            state_file.to_str().unwrap(),
+            "--write-recipients",
+            locked_rcpt.to_str().unwrap(),
+            "--identity-file",
+            new_id.to_str().unwrap(),
+            "--recipient",
+            &new_recipient,
+            "--prior-recipient",
+            &old_recipient,
+            "--verify-identity-file",
+            new_id.to_str().unwrap(),
+        ]);
+        drop(lock_holder);
+        assert!(
+            !refresh_fail_out.status.success(),
+            "recipient refresh lock contention must exit non-zero"
+        );
+        let rf_stdout = String::from_utf8(refresh_fail_out.stdout).expect("utf8 stdout");
+        let rf_parsed: serde_json::Value = serde_json::from_str(&rf_stdout)
+            .expect("stdout must still contain valid JSON report when --write-recipients fails");
+        assert_eq!(rf_parsed["version"], 1);
+        assert_eq!(rf_parsed["mode"], "apply");
+        assert_eq!(rf_parsed["summary"]["already_done"], 2);
+    }
+}

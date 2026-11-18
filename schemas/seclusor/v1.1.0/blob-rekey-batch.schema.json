@@ -1,0 +1,228 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "seclusor/v1.1.0/blob-rekey-batch",
+  "title": "seclusor Blob Rekey Batch Output Schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "mode",
+    "target_recipients",
+    "files",
+    "summary"
+  ],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 1
+    },
+    "mode": {
+      "type": "string",
+      "enum": [
+        "plan",
+        "apply"
+      ]
+    },
+    "target_recipients": {
+      "type": "array",
+      "description": "Target age X25519 recipient public keys (sorted, unique).",
+      "minItems": 1,
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^age1[0-9a-z]+$"
+      }
+    },
+    "files": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/file_entry"
+      }
+    },
+    "summary": {
+      "$ref": "#/$defs/summary"
+    }
+  },
+  "$defs": {
+    "file_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "status",
+        "opened_with",
+        "stanzas_before",
+        "stanzas_after",
+        "delta",
+        "mode_before",
+        "mode_after",
+        "backup",
+        "sha256_before",
+        "sha256_after",
+        "error"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "affected",
+            "rekeyed",
+            "already-done",
+            "not-openable",
+            "scrypt",
+            "secrets-document",
+            "not-age",
+            "too-large",
+            "prior-mismatch",
+            "error",
+            "failed"
+          ]
+        },
+        "opened_with": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^age1[0-9a-z]+$"
+        },
+        "stanzas_before": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "stanzas_after": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "delta": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/delta"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "mode_before": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-7]{4}$"
+        },
+        "mode_after": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-7]{4}$"
+        },
+        "backup": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "sha256_before": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "sha256_after": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "delta": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "added",
+        "removed"
+      ],
+      "properties": {
+        "added": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^age1[0-9a-z]+$"
+          }
+        },
+        "removed": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^age1[0-9a-z]+$"
+          }
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "selected",
+        "affected",
+        "rekeyed",
+        "already_done",
+        "not_openable",
+        "skipped",
+        "failed"
+      ],
+      "properties": {
+        "selected": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "affected": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "rekeyed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "already_done": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "not_openable": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "skipped": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failed": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}

@@ -19,7 +19,7 @@ fn reject_recipient_mismatch_override(allow_recipient_mismatch: bool) -> CliResu
     if allow_recipient_mismatch {
         return Err(CliError::Message(
             "--allow-recipient-mismatch is only valid for `set`, `import-env`, \
-             `rekey`, `bundle encrypt`, and `blob rekey`"
+             `rekey`, `bundle encrypt`, `blob rekey`, and `blob rekey-batch`"
                 .to_string(),
         ));
     }
