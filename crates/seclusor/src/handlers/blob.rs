@@ -13330,38 +13330,41 @@ mod tests {
             let displaced_win_blob = win_blob_dir.join(".seclusor-displaced-pack.age");
             fs::rename(&win_blob_path, &displaced_win_blob).unwrap();
             assert!(!win_blob_path.exists() && displaced_win_blob.exists());
-            handle_blob_rekey_batch(BlobRekeyBatchArgs {
-                files: vec![],
-                dir: Some(win_blob_dir.clone()),
-                glob: "*.age".to_string(),
-                recursive: false,
-                apply: true,
-                state: Some(win_state_path.clone()),
-                backup: true,
-                fail_fast: false,
-                json: false,
-                write_recipients: None,
-                allow_self_lockout: false,
-                allow_large: false,
-                recipients: RecipientArgs {
-                    recipients: vec![rotated_gen.recipient.clone()],
-                    recipient_files: vec![],
-                    recipient_env_var: None,
+            handle_blob_rekey_batch_with_policy(
+                BlobRekeyBatchArgs {
+                    files: vec![],
+                    dir: Some(win_blob_dir.clone()),
+                    glob: "*.age".to_string(),
+                    recursive: false,
+                    apply: true,
+                    state: Some(win_state_path.clone()),
+                    backup: true,
+                    fail_fast: false,
+                    json: false,
+                    write_recipients: None,
+                    allow_self_lockout: false,
+                    allow_large: false,
+                    recipients: RecipientArgs {
+                        recipients: vec![rotated_gen.recipient.clone()],
+                        recipient_files: vec![],
+                        recipient_env_var: None,
+                    },
+                    prior_recipients: PriorRecipientArgs {
+                        prior_recipients: vec![r.to_string()],
+                        prior_recipient_files: vec![],
+                    },
+                    identities: IdentityArgs {
+                        identity_files: vec![id_path.clone()],
+                        identity_public_key: None,
+                    },
+                    verify_identities: VerifyIdentityArgs {
+                        verify_identity_files: vec![rotated_id_path.clone()],
+                        verify_identity_public_key: None,
+                    },
+                    passphrase: PassphraseArgs::default(),
                 },
-                prior_recipients: PriorRecipientArgs {
-                    prior_recipients: vec![r.to_string()],
-                    prior_recipient_files: vec![],
-                },
-                identities: IdentityArgs {
-                    identity_files: vec![id_path.clone()],
-                    identity_public_key: None,
-                },
-                verify_identities: VerifyIdentityArgs {
-                    verify_identity_files: vec![rotated_id_path.clone()],
-                    verify_identity_public_key: None,
-                },
-                passphrase: PassphraseArgs::default(),
-            })
+                true,
+            )
             .expect("Windows --dir apply must recover inherited-DACL displaced blob, rekey it, and record displaced_verified=true");
             assert!(win_blob_path.exists() && !displaced_win_blob.exists());
 
@@ -13374,209 +13377,8 @@ mod tests {
                 win_blob_dir.join(".SECLUSOR-STALE-DISPLACED-pack.age.123-456-0");
             fs::copy(&blob_path, &stale_upper_marker).unwrap();
             assert!(
-                handle_blob_rekey_batch(BlobRekeyBatchArgs {
-                    files: vec![],
-                    dir: Some(win_blob_dir.clone()),
-                    glob: "*.age".to_string(),
-                    recursive: false,
-                    apply: true,
-                    state: None,
-                    backup: false,
-                    fail_fast: false,
-                    json: false,
-                    write_recipients: None,
-                    allow_self_lockout: false,
-                    allow_large: false,
-                    recipients: RecipientArgs {
-                        recipients: vec![rotated_gen.recipient.clone()],
-                        recipient_files: vec![],
-                        recipient_env_var: None,
-                    },
-                    prior_recipients: PriorRecipientArgs {
-                        prior_recipients: vec![r.to_string()],
-                        prior_recipient_files: vec![],
-                    },
-                    identities: IdentityArgs {
-                        identity_files: vec![id_path.clone()],
-                        identity_public_key: None,
-                    },
-                    verify_identities: VerifyIdentityArgs {
-                        verify_identity_files: vec![rotated_id_path.clone()],
-                        verify_identity_public_key: None,
-                    },
-                    passphrase: PassphraseArgs::default(),
-                })
-                .is_err(),
-                "case-renamed .SECLUSOR-STALE-DISPLACED- marker must refuse --dir --apply"
-            );
-            assert!(
-                handle_blob_rekey_batch(BlobRekeyBatchArgs {
-                    files: vec![win_blob_path.clone()],
-                    dir: None,
-                    glob: "*.age".to_string(),
-                    recursive: false,
-                    apply: true,
-                    state: None,
-                    backup: false,
-                    fail_fast: false,
-                    json: false,
-                    write_recipients: None,
-                    allow_self_lockout: false,
-                    allow_large: false,
-                    recipients: RecipientArgs {
-                        recipients: vec![rotated_gen.recipient.clone()],
-                        recipient_files: vec![],
-                        recipient_env_var: None,
-                    },
-                    prior_recipients: PriorRecipientArgs {
-                        prior_recipients: vec![r.to_string()],
-                        prior_recipient_files: vec![],
-                    },
-                    identities: IdentityArgs {
-                        identity_files: vec![id_path.clone()],
-                        identity_public_key: None,
-                    },
-                    verify_identities: VerifyIdentityArgs {
-                        verify_identity_files: vec![rotated_id_path.clone()],
-                        verify_identity_public_key: None,
-                    },
-                    passphrase: PassphraseArgs::default(),
-                })
-                .is_err(),
-                "case-renamed .SECLUSOR-STALE-DISPLACED- marker must refuse explicit FILE --apply"
-            );
-            let _ = fs::remove_file(&stale_upper_marker);
-
-            let win_blob3_path = win_blob_dir.join("pack3.age");
-            let displaced_upper_blob3 = win_blob_dir.join(".SECLUSOR-DISPLACED-pack3.age");
-            fs::copy(&blob_path, &displaced_upper_blob3).unwrap();
-            assert!(!win_blob3_path.exists() && displaced_upper_blob3.exists());
-            handle_blob_rekey_batch(BlobRekeyBatchArgs {
-                files: vec![],
-                dir: Some(win_blob_dir.clone()),
-                glob: "pack3.age".to_string(),
-                recursive: false,
-                apply: true,
-                state: None,
-                backup: false,
-                fail_fast: false,
-                json: false,
-                write_recipients: None,
-                allow_self_lockout: false,
-                allow_large: false,
-                recipients: RecipientArgs {
-                    recipients: vec![rotated_gen.recipient.clone()],
-                    recipient_files: vec![],
-                    recipient_env_var: None,
-                },
-                prior_recipients: PriorRecipientArgs {
-                    prior_recipients: vec![r.to_string()],
-                    prior_recipient_files: vec![],
-                },
-                identities: IdentityArgs {
-                    identity_files: vec![id_path.clone()],
-                    identity_public_key: None,
-                },
-                verify_identities: VerifyIdentityArgs {
-                    verify_identity_files: vec![rotated_id_path.clone()],
-                    verify_identity_public_key: None,
-                },
-                passphrase: PassphraseArgs::default(),
-            })
-            .expect(
-                "Windows --dir apply must recover missing leaf from .SECLUSOR-DISPLACED- entry",
-            );
-            assert!(win_blob3_path.exists() && !displaced_upper_blob3.exists());
-            let _ = fs::remove_file(&win_blob3_path);
-
-            let win_blob2_path = win_blob_dir.join("pack2.age");
-            let displaced_win_blob2 = win_blob_dir.join(".seclusor-displaced-pack2.age");
-            fs::copy(&blob_path, &displaced_win_blob2).unwrap();
-            assert!(!win_blob2_path.exists() && displaced_win_blob2.exists());
-            handle_blob_rekey_batch(BlobRekeyBatchArgs {
-                files: vec![win_blob2_path.clone()],
-                dir: None,
-                glob: "*.age".to_string(),
-                recursive: false,
-                apply: true,
-                state: None,
-                backup: false,
-                fail_fast: false,
-                json: false,
-                write_recipients: None,
-                allow_self_lockout: false,
-                allow_large: false,
-                recipients: RecipientArgs {
-                    recipients: vec![rotated_gen.recipient.clone()],
-                    recipient_files: vec![],
-                    recipient_env_var: None,
-                },
-                prior_recipients: PriorRecipientArgs {
-                    prior_recipients: vec![r.to_string()],
-                    prior_recipient_files: vec![],
-                },
-                identities: IdentityArgs {
-                    identity_files: vec![id_path.clone()],
-                    identity_public_key: None,
-                },
-                verify_identities: VerifyIdentityArgs {
-                    verify_identity_files: vec![rotated_id_path.clone()],
-                    verify_identity_public_key: None,
-                },
-                passphrase: PassphraseArgs::default(),
-            })
-            .expect("Windows explicit FILE apply must recover missing leaf from displaced blob and rekey it");
-            assert!(win_blob2_path.exists() && !displaced_win_blob2.exists());
-            let _ = fs::remove_file(&win_blob2_path);
-
-            // Re-running `--apply` with explicit `files` and `--state` when both the valid
-            // rekeyed `win_blob_path` and the displaced prior ciphertext exist must
-            // authenticate `win_blob_path`, delete `.seclusor-displaced-pack.age`, and hit `already-done`.
-            fs::copy(&blob_path, &displaced_win_blob).unwrap();
-            handle_blob_rekey_batch(BlobRekeyBatchArgs {
-                files: vec![win_blob_path.clone()],
-                dir: None,
-                glob: "*.age".to_string(),
-                recursive: false,
-                apply: true,
-                state: Some(win_state_path.clone()),
-                backup: false,
-                fail_fast: false,
-                json: false,
-                write_recipients: None,
-                allow_self_lockout: false,
-                allow_large: false,
-                recipients: RecipientArgs {
-                    recipients: vec![rotated_gen.recipient.clone()],
-                    recipient_files: vec![],
-                    recipient_env_var: None,
-                },
-                prior_recipients: PriorRecipientArgs {
-                    prior_recipients: vec![r.to_string()],
-                    prior_recipient_files: vec![],
-                },
-                identities: IdentityArgs {
-                    identity_files: vec![id_path.clone()],
-                    identity_public_key: None,
-                },
-                verify_identities: VerifyIdentityArgs {
-                    verify_identity_files: vec![rotated_id_path.clone()],
-                    verify_identity_public_key: None,
-                },
-                passphrase: PassphraseArgs::default(),
-            })
-            .expect("Windows explicit FILE resume must authenticate survivor and clean up displaced blob");
-            assert!(win_blob_path.exists() && !displaced_win_blob.exists());
-
-            // If both `win_blob_path` and `.seclusor-displaced-pack.age` exist, but the live
-            // `win_blob_path` was truncated or substituted, recovery MUST NOT delete the
-            // displaced ciphertext or rotate it into an ignored stale name; it must preserve
-            // both files and block batch completion across repeated retries.
-            fs::copy(&blob_path, &displaced_win_blob).unwrap();
-            fs::write(&win_blob_path, b"truncated-or-not-age").unwrap();
-            for _retry in 0..2 {
-                assert!(
-                    handle_blob_rekey_batch(BlobRekeyBatchArgs {
+                handle_blob_rekey_batch_with_policy(
+                    BlobRekeyBatchArgs {
                         files: vec![],
                         dir: Some(win_blob_dir.clone()),
                         glob: "*.age".to_string(),
@@ -13607,7 +13409,226 @@ mod tests {
                             verify_identity_public_key: None,
                         },
                         passphrase: PassphraseArgs::default(),
-                    })
+                    },
+                    true,
+                )
+                .is_err(),
+                "case-renamed .SECLUSOR-STALE-DISPLACED- marker must refuse --dir --apply"
+            );
+            assert!(
+                handle_blob_rekey_batch_with_policy(
+                    BlobRekeyBatchArgs {
+                        files: vec![win_blob_path.clone()],
+                        dir: None,
+                        glob: "*.age".to_string(),
+                        recursive: false,
+                        apply: true,
+                        state: None,
+                        backup: false,
+                        fail_fast: false,
+                        json: false,
+                        write_recipients: None,
+                        allow_self_lockout: false,
+                        allow_large: false,
+                        recipients: RecipientArgs {
+                            recipients: vec![rotated_gen.recipient.clone()],
+                            recipient_files: vec![],
+                            recipient_env_var: None,
+                        },
+                        prior_recipients: PriorRecipientArgs {
+                            prior_recipients: vec![r.to_string()],
+                            prior_recipient_files: vec![],
+                        },
+                        identities: IdentityArgs {
+                            identity_files: vec![id_path.clone()],
+                            identity_public_key: None,
+                        },
+                        verify_identities: VerifyIdentityArgs {
+                            verify_identity_files: vec![rotated_id_path.clone()],
+                            verify_identity_public_key: None,
+                        },
+                        passphrase: PassphraseArgs::default(),
+                    },
+                    true,
+                )
+                .is_err(),
+                "case-renamed .SECLUSOR-STALE-DISPLACED- marker must refuse explicit FILE --apply"
+            );
+            let _ = fs::remove_file(&stale_upper_marker);
+
+            let win_blob3_path = win_blob_dir.join("pack3.age");
+            let displaced_upper_blob3 = win_blob_dir.join(".SECLUSOR-DISPLACED-pack3.age");
+            fs::copy(&blob_path, &displaced_upper_blob3).unwrap();
+            assert!(!win_blob3_path.exists() && displaced_upper_blob3.exists());
+            handle_blob_rekey_batch_with_policy(
+                BlobRekeyBatchArgs {
+                    files: vec![],
+                    dir: Some(win_blob_dir.clone()),
+                    glob: "pack3.age".to_string(),
+                    recursive: false,
+                    apply: true,
+                    state: None,
+                    backup: false,
+                    fail_fast: false,
+                    json: false,
+                    write_recipients: None,
+                    allow_self_lockout: false,
+                    allow_large: false,
+                    recipients: RecipientArgs {
+                        recipients: vec![rotated_gen.recipient.clone()],
+                        recipient_files: vec![],
+                        recipient_env_var: None,
+                    },
+                    prior_recipients: PriorRecipientArgs {
+                        prior_recipients: vec![r.to_string()],
+                        prior_recipient_files: vec![],
+                    },
+                    identities: IdentityArgs {
+                        identity_files: vec![id_path.clone()],
+                        identity_public_key: None,
+                    },
+                    verify_identities: VerifyIdentityArgs {
+                        verify_identity_files: vec![rotated_id_path.clone()],
+                        verify_identity_public_key: None,
+                    },
+                    passphrase: PassphraseArgs::default(),
+                },
+                true,
+            )
+            .expect(
+                "Windows --dir apply must recover missing leaf from .SECLUSOR-DISPLACED- entry",
+            );
+            assert!(win_blob3_path.exists() && !displaced_upper_blob3.exists());
+            let _ = fs::remove_file(&win_blob3_path);
+
+            let win_blob2_path = win_blob_dir.join("pack2.age");
+            let displaced_win_blob2 = win_blob_dir.join(".seclusor-displaced-pack2.age");
+            fs::copy(&blob_path, &displaced_win_blob2).unwrap();
+            assert!(!win_blob2_path.exists() && displaced_win_blob2.exists());
+            handle_blob_rekey_batch_with_policy(
+                BlobRekeyBatchArgs {
+                    files: vec![win_blob2_path.clone()],
+                    dir: None,
+                    glob: "*.age".to_string(),
+                    recursive: false,
+                    apply: true,
+                    state: None,
+                    backup: false,
+                    fail_fast: false,
+                    json: false,
+                    write_recipients: None,
+                    allow_self_lockout: false,
+                    allow_large: false,
+                    recipients: RecipientArgs {
+                        recipients: vec![rotated_gen.recipient.clone()],
+                        recipient_files: vec![],
+                        recipient_env_var: None,
+                    },
+                    prior_recipients: PriorRecipientArgs {
+                        prior_recipients: vec![r.to_string()],
+                        prior_recipient_files: vec![],
+                    },
+                    identities: IdentityArgs {
+                        identity_files: vec![id_path.clone()],
+                        identity_public_key: None,
+                    },
+                    verify_identities: VerifyIdentityArgs {
+                        verify_identity_files: vec![rotated_id_path.clone()],
+                        verify_identity_public_key: None,
+                    },
+                    passphrase: PassphraseArgs::default(),
+                },
+                true,
+            )
+            .expect("Windows explicit FILE apply must recover missing leaf from displaced blob and rekey it");
+            assert!(win_blob2_path.exists() && !displaced_win_blob2.exists());
+            let _ = fs::remove_file(&win_blob2_path);
+
+            // Re-running `--apply` with explicit `files` and `--state` when both the valid
+            // rekeyed `win_blob_path` and the displaced prior ciphertext exist must
+            // authenticate `win_blob_path`, delete `.seclusor-displaced-pack.age`, and hit `already-done`.
+            fs::copy(&blob_path, &displaced_win_blob).unwrap();
+            handle_blob_rekey_batch_with_policy(
+                BlobRekeyBatchArgs {
+                    files: vec![win_blob_path.clone()],
+                    dir: None,
+                    glob: "*.age".to_string(),
+                    recursive: false,
+                    apply: true,
+                    state: Some(win_state_path.clone()),
+                    backup: false,
+                    fail_fast: false,
+                    json: false,
+                    write_recipients: None,
+                    allow_self_lockout: false,
+                    allow_large: false,
+                    recipients: RecipientArgs {
+                        recipients: vec![rotated_gen.recipient.clone()],
+                        recipient_files: vec![],
+                        recipient_env_var: None,
+                    },
+                    prior_recipients: PriorRecipientArgs {
+                        prior_recipients: vec![r.to_string()],
+                        prior_recipient_files: vec![],
+                    },
+                    identities: IdentityArgs {
+                        identity_files: vec![id_path.clone()],
+                        identity_public_key: None,
+                    },
+                    verify_identities: VerifyIdentityArgs {
+                        verify_identity_files: vec![rotated_id_path.clone()],
+                        verify_identity_public_key: None,
+                    },
+                    passphrase: PassphraseArgs::default(),
+                },
+                true,
+            )
+            .expect("Windows explicit FILE resume must authenticate survivor and clean up displaced blob");
+            assert!(win_blob_path.exists() && !displaced_win_blob.exists());
+
+            // If both `win_blob_path` and `.seclusor-displaced-pack.age` exist, but the live
+            // `win_blob_path` was truncated or substituted, recovery MUST NOT delete the
+            // displaced ciphertext or rotate it into an ignored stale name; it must preserve
+            // both files and block batch completion across repeated retries.
+            fs::copy(&blob_path, &displaced_win_blob).unwrap();
+            fs::write(&win_blob_path, b"truncated-or-not-age").unwrap();
+            for _retry in 0..2 {
+                assert!(
+                    handle_blob_rekey_batch_with_policy(
+                        BlobRekeyBatchArgs {
+                            files: vec![],
+                            dir: Some(win_blob_dir.clone()),
+                            glob: "*.age".to_string(),
+                            recursive: false,
+                            apply: true,
+                            state: None,
+                            backup: false,
+                            fail_fast: false,
+                            json: false,
+                            write_recipients: None,
+                            allow_self_lockout: false,
+                            allow_large: false,
+                            recipients: RecipientArgs {
+                                recipients: vec![rotated_gen.recipient.clone()],
+                                recipient_files: vec![],
+                                recipient_env_var: None,
+                            },
+                            prior_recipients: PriorRecipientArgs {
+                                prior_recipients: vec![r.to_string()],
+                                prior_recipient_files: vec![],
+                            },
+                            identities: IdentityArgs {
+                                identity_files: vec![id_path.clone()],
+                                identity_public_key: None,
+                            },
+                            verify_identities: VerifyIdentityArgs {
+                                verify_identity_files: vec![rotated_id_path.clone()],
+                                verify_identity_public_key: None,
+                            },
+                            passphrase: PassphraseArgs::default(),
+                        },
+                        true,
+                    )
                     .is_err(),
                     "unauthenticated surviving live blob must fail recovery across retries"
                 );
