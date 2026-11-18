@@ -3739,6 +3739,13 @@ mod windows_dacl {
             EaBuffer: *mut core::ffi::c_void,
             EaLength: u32,
         ) -> i32;
+        fn NtSetInformationFile(
+            FileHandle: *mut core::ffi::c_void,
+            IoStatusBlock: *mut IoStatusBlock,
+            FileInformation: *const core::ffi::c_void,
+            Length: u32,
+            FileInformationClass: u32,
+        ) -> i32;
         fn RtlNtStatusToDosError(Status: i32) -> u32;
     }
 
@@ -3824,7 +3831,7 @@ mod windows_dacl {
     const FILE_LIST_DIRECTORY: u32 = 0x0001;
     const FILE_TRAVERSE: u32 = 0x0020;
     const SYNCHRONIZE: u32 = 0x0010_0000;
-    const FILE_RENAME_INFO_CLASS: u32 = 3;
+    const FILE_RENAME_INFORMATION_CLASS: u32 = 10;
     const FILE_DISPOSITION_INFO_CLASS: u32 = 4;
     const FILE_DISPOSITION_INFO_EX_CLASS: u32 = 21;
     const FILE_DISPOSITION_DELETE: u32 = 0x0000_0001;
@@ -5752,8 +5759,8 @@ mod windows_dacl {
         Ok(cur_dir)
     }
 
-    /// Rename an open `source_file` handle (`DELETE` access) directly to
-    /// `leaf_name` inside `parent_dir` via `SetFileInformationByHandle(FileRenameInfo)`
+    /// Rename an open `source_file` handle (`DELETE | SYNCHRONIZE` access) directly
+    /// to `leaf_name` inside `parent_dir` via `NtSetInformationFile(FileRenameInformation)`
     /// with `RootDirectory = parent_dir.as_raw_handle()` so neither the source
     /// nor the destination ancestor path is ever re-resolved by path.
     fn rename_open_handle_in_dir(
@@ -5769,19 +5776,26 @@ mod windows_dacl {
             replace_if_exists,
         )?;
         let buf_ptr = aligned_buf.as_ptr().cast::<core::ffi::c_void>();
-        // SAFETY: `source_file` is an open handle with `DELETE` access, `parent_dir`
-        // is an open directory handle, and `buf_ptr` points to a valid
-        // `FILE_RENAME_INFO` buffer of `total_bytes` bytes.
-        let ok = unsafe {
-            SetFileInformationByHandle(
+        let mut iosb = IoStatusBlock {
+            status_or_pointer: core::ptr::null_mut(),
+            information: 0,
+        };
+        // SAFETY: `source_file` is an open handle with `DELETE | SYNCHRONIZE` access,
+        // `parent_dir` is an open directory handle, and `buf_ptr` points to a valid
+        // `FILE_RENAME_INFORMATION` buffer of `total_bytes` bytes.
+        let status = unsafe {
+            NtSetInformationFile(
                 source_file.as_raw_handle(),
-                FILE_RENAME_INFO_CLASS,
+                &mut iosb,
                 buf_ptr,
                 total_bytes as u32,
+                FILE_RENAME_INFORMATION_CLASS,
             )
         };
-        if ok == 0 {
-            return Err(io::Error::last_os_error());
+        if status < 0 {
+            // SAFETY: `RtlNtStatusToDosError` converts any NTSTATUS to a Win32 error code.
+            let win_err = unsafe { RtlNtStatusToDosError(status) } as i32;
+            return Err(io::Error::from_raw_os_error(win_err));
         }
         Ok(())
     }
@@ -12402,13 +12416,18 @@ mod tests {
                     CString::new(bystander2_clone.file_name().unwrap().to_str().unwrap()).unwrap();
                 let sub_dir = fs::File::open(&real_sub_clone2).unwrap();
                 unsafe {
-                    // 1. Opening a fresh `O_RDONLY` descriptor on `0o300` `inner_fd` is denied (`EACCES`).
+                    // 1. Opening a fresh `O_RDONLY` descriptor on `0o300` `inner_fd` is denied (`EACCES`)
+                    //    for non-root processes (`geteuid() != 0`).
                     let fresh_read_fd =
                         libc::openat(fd, dot_c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY);
-                    assert_eq!(
-                        fresh_read_fd, -1,
-                        "fresh openat(O_RDONLY) on 0o300 inner_fd must fail with EACCES"
-                    );
+                    if libc::geteuid() != 0 {
+                        assert_eq!(
+                            fresh_read_fd, -1,
+                            "fresh openat(O_RDONLY) on 0o300 inner_fd must fail with EACCES"
+                        );
+                    } else if fresh_read_fd >= 0 {
+                        libc::close(fresh_read_fd);
+                    }
                     // 2. Enumerate `.u-*` using a retained readable descriptor (`dup(fd)` opened
                     //    with `O_RDONLY | O_DIRECTORY` before sealing) via `fdopendir`/`readdir`
                     //    and swap the bystander file into `.u-*`.
